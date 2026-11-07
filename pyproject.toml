@@ -1,0 +1,35 @@
+[project]
+name = "analyst"
+version = "0.1.0"
+description = "Dataset-agnostic AI data analyst library"
+authors = [
+    { name = "Mostafa Arafa", email = "a.mostafa190@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "duckdb==2.0.0",
+    "pandas>=3.1.1",
+    "pyarrow>=26.0.1",
+    "pydantic>=2.14.3",
+    "pydantic-settings>=2.16.2",
+    "pyyaml>=6.0.3",
+    "statsforecast>=2.0.1",
+    "utilsforecast>=0.2.17",
+]
+
+[build-system]
+requires = ["uv_build>=0.12.23,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2.0",
+    "ruff>=0.9.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "taxi: tests that require data/raw NYC taxi files",
+    "slow: long-running tests",
+]
