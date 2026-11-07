@@ -3,7 +3,7 @@
 from difflib import get_close_matches
 
 from analyst.data.engine import Engine
-from analyst.semantic.compiler import _approved, _from_sql
+from analyst.semantic.compiler import _approved, from_sql
 from analyst.semantic.model import SemanticModel
 
 
@@ -16,7 +16,7 @@ def resolve_values(
 ) -> list:
     dim = model.dimension(dimension)
     _approved(dim, dim.name, False)
-    source = _from_sql(model, [dim])
+    source = from_sql(model, [dim])
     rows = engine.execute(f"SELECT DISTINCT {dim.expr} AS value\n{source}")
     distinct = [value for value in rows["value"].to_pylist() if value is not None]
     # Sorting makes ties/suggestions deterministic, irrespective of scan order.

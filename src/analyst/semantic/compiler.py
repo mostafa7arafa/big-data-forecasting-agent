@@ -61,7 +61,7 @@ def _approved(item: MemoryItem, name: str, allow_proposed: bool) -> None:
         raise ValueError(f"{name!r} is {item.status}; only approved items may be used")
 
 
-def _from_sql(
+def from_sql(
     model: SemanticModel, dimensions: list[Dimension], *, allow_proposed: bool = False
 ) -> str:
     # Explicit main avoids a view called cur/cmp being shadowed by our CTEs.
@@ -248,7 +248,7 @@ def compile_query(
     for item in [*metrics, *dimensions, *filter_dimensions]:
         _approved(item, item.name, allow_proposed)
         _identifier(item.name)
-    source = _from_sql(
+    source = from_sql(
         model, dimensions + filter_dimensions, allow_proposed=allow_proposed
     )
     predicates = _metric_predicates(model, metrics, allow_proposed)
