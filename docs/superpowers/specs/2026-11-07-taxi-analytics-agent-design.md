@@ -66,8 +66,8 @@ These come from profiling the full dataset (7 s).
 ## 5. Architecture
 
 ```
- Dashboard (chat + charts + character)
-        │  streaming (LangGraph SDK)
+ Dashboard: Rust + Leptos (WASM), WebGL charts, character
+        │  HTTP + SSE (LangGraph Agent Server API)   │ chart data (downsampled, LOD on zoom)
  ┌──────▼──────────────── Agent harness (LangGraph) ───────────────────────┐
  │  plan ─► analyst (create_agent + middleware) ─► verify ─► answer       │
  │              │ tools                                                     │
@@ -94,7 +94,8 @@ These come from profiling the full dataset (7 s).
 | Model provider | One `get_model(config)` hiding OpenAI, OpenRouter and Anthropic | LangChain chat models |
 | Observability | Traces, cost, latency, experiment comparison | LangSmith |
 | Evals | Golden sets, graders, regression runs | pytest + `langsmith` testing + openevals + custom graders |
-| UI | Chat, charts, plan, query inspection, character | Next.js app [call] (see §8) |
+| Chart data service | Server-side downsampling (M4 / LTTB) and level-of-detail re-queries on zoom | `tsdownsample` (Rust core) or DuckDB `lttb` extension |
+| UI | Chat, charts, plan, query inspection, review queue, character | Rust + Leptos (WASM) [owner] (see §8) |
 
 ### 5.2 Agent graph
 
@@ -279,7 +280,7 @@ src/analyst/
 datasets/nyc_taxi/  dataset.yaml (files, views, cutoff)  memory/ (semantic.yaml, quirks.yaml, series.yaml,
                     context_facts.yaml, verified_queries.yaml, lessons.md, recap.md, profile.json)
 evals/              datasets/*.jsonl  graders/  test_*.py
-web/                Next.js dashboard
+web/                Rust + Leptos dashboard (own Cargo workspace)
 docker/  scripts/  docs/  langgraph.json  pyproject.toml  Makefile  .env.example  README.md
 ```
 
@@ -290,12 +291,27 @@ The README leads with an architecture diagram, the results table, a GIF and the 
 - **Shape:**
   - a chat pane;
   - a visible plan;
-  - chart cards (Plotly) with history, forecast, 80/95 bands and a last-year overlay;
+  - chart cards with history, forecast, 80/95 bands and a last-year overlay;
   - a verification chip per answer;
   - "Query details" showing SQL, code and handles;
   - a backtest scorecard per forecast.
 - **Character:** an original character that represents the brand, animated in the UI and used in the README and video. It must not resemble Blobby. Name and design are to be decided in the design phase.
-- **Front end** [call]: Next.js + React, streaming from the LangGraph server via `@langchain/langgraph-sdk` (`useStream`). This replaces the archived `agent-chat-ui`. Frontend design uses the "impeccable" design skills [owner], to be installed before UI work.
+- **Front end: Rust + Leptos, compiled to WebAssembly** [owner]. The agent is an isolated Python service, and the web app is a separate client that talks to it over HTTP and streaming [owner]. The client speaks the LangGraph Agent Server's REST + SSE API (threads, runs, streaming events) through a small typed Rust client module. That replaces the archived `agent-chat-ui` and the JS-only `useStream`. Frontend design uses the "impeccable" design skills [owner], to be installed before UI work; they apply to the HTML/CSS layer.
+
+**Large-data charts** [owner: rendering must not lag with millions of points]. The fix comes in three layers:
+1. **Never ship raw points.** The chart contract is a JSON or Arrow payload produced on the server, never raw query results:
+   - series are downsampled to roughly the chart's pixel width using **M4** (keeps first/last/min/max per pixel column, so spikes and gaps survive) or **LTTB**;
+   - the payload states the original row count and the method used.
+2. **Level of detail on zoom.** Zoom and pan request the visible range again from the chart data service at full detail where it fits. This works like Reflex `xy`.
+3. **GPU rendering.** Charts render through **WebGL** from typed arrays, not per-point objects. Long chats stay smooth: off-screen charts are virtualized and frozen to images, and only visible charts hold GPU buffers.
+
+**Performance budgets**, which become tests:
+- A 1M-point scatter, or a downsampled 10M-row series, renders in < 200 ms and pans or zooms at ≥ 50 fps on the owner's laptop.
+- A chat with 30 charts scrolls without dropped frames.
+
+**Left to the builder:** a Rust-native WebGL renderer versus a JS WebGL chart library bridged through `wasm-bindgen`, chosen by a spike against these budgets. Rust-native is preferred if it meets them in reasonable effort.
+
+**Toolchain:** the Rust toolchain is not installed yet. Install `rustup`, the `wasm32-unknown-unknown` target and `cargo-leptos` at build time. CSR vs SSR in Leptos is the builder's call, as long as the budgets hold.
 - **Demo video:** a ~2 minute screen recording of the hero question end to end, plus a context-size and eval-results segment [owner: video; format is a call].
 
 ## 9. Build order
@@ -321,5 +337,5 @@ The existing code (`src/taxi_forecast_agent/sql_tool.py`, `forecast_tool.py`, `s
 - Exact middleware thresholds, prompt wording, and preview and summary sizes.
 - The semantic-layer YAML schema and the compiler internals.
 - The sandbox exec mechanism (Jupyter kernel vs a small exec server), provided state persists.
-- Chart library details beyond "Plotly-compatible spec".
+- The chart renderer (Rust-native vs bridged JS WebGL library) within the §8 performance budgets, plus the chart payload schema details.
 - Test tooling details beyond pytest + LangSmith.
