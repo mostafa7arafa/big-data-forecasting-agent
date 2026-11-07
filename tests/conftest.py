@@ -54,6 +54,67 @@ def _hourly_rows() -> tuple[list[tuple], list[tuple]]:
     return january, february
 
 
+def _write_events_memory(dataset_dir: Path) -> None:
+    memory = dataset_dir / "memory"
+    memory.mkdir()
+    (memory / "semantic.yaml").write_text(
+        """\
+table: events
+time_dimension:
+  name: event_time
+  column: ts
+  grains: [hour, day, week, month]
+joins:
+  - name: region
+    table: regions
+    "on": events.region_id = region.region_id
+dimensions:
+  - name: area
+    expr: region.area
+    join: region
+    synonyms: [zone_group]
+  - name: region_id
+    expr: region_id
+filters:
+  - name: positive_qty
+    expr: qty > 0
+metrics:
+  - name: total_amount
+    expr: sum(amount)
+  - name: event_count
+    expr: count(*)
+  - name: positive_amount
+    expr: sum(amount)
+    filters: [positive_qty]
+  - name: draft_metric
+    expr: count(*)
+    status: proposed
+"""
+    )
+    (memory / "quirks.yaml").write_text(
+        """\
+quirks:
+  - kind: gap
+    start: 2024-01-20
+    end: 2024-01-21
+    treatment: impute
+"""
+    )
+    (memory / "context_facts.yaml").write_text("context_facts: []\n")
+    (memory / "series.yaml").write_text(
+        """\
+series:
+  - name: daily_events
+    metric: event_count
+    dimensions: []
+    freq: D
+    season_lengths: [7]
+    recommended_models: []
+"""
+    )
+    (memory / "recap.md").write_text("Synthetic hourly events.\n")
+
+
 def _write_parquet(path: Path, rows: list[tuple], *, note: bool) -> None:
     columns = list(zip(*rows, strict=True))
     arrays = [
@@ -94,5 +155,6 @@ lookups:
   - {name: regions, file: data/regions.csv}
 """
     )
+    _write_events_memory(dataset_dir)
     settings = Settings(repo_root=root, datasets_dir=root / "datasets")
     return load_dataset("events", settings)

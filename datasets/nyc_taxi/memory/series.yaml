@@ -1,0 +1,19 @@
+series:
+  - name: daily_trips
+    metric: trips
+    dimensions: []
+    freq: D
+    season_lengths: [7, 365]
+    recommended_models: []
+  - name: daily_trips_by_borough
+    metric: trips
+    dimensions: [pickup_borough]
+    freq: D
+    season_lengths: [7, 365]
+    recommended_models: []
+  - name: monthly_trips_by_borough
+    metric: trips
+    dimensions: [pickup_borough]
+    freq: MS
+    season_lengths: [12]
+    recommended_models: []

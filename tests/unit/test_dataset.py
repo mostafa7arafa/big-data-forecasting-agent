@@ -77,7 +77,7 @@ def test_synthetic_fixture_loads(synthetic_dataset):
     assert synthetic_dataset.lookups[0].name == "regions"
     assert synthetic_dataset.dir == root / "datasets" / "events"
     assert synthetic_dataset.memory_dir == synthetic_dataset.dir / "memory"
-    assert not synthetic_dataset.memory_dir.exists()
+    assert synthetic_dataset.memory_dir.is_dir()
 
     january = pq.read_table(root / "data" / "events_2024-01.parquet")
     february = pq.read_table(root / "data" / "events_2024-02.parquet")
