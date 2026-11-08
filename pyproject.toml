@@ -28,6 +28,7 @@ dev = [
 ]
 
 [tool.pytest.ini_options]
+pythonpath = ["."]
 testpaths = ["tests"]
 markers = [
     "taxi: tests that require data/raw NYC taxi files",
