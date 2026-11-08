@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from typing import Literal
 
 import pyarrow as pa
 
@@ -12,10 +14,33 @@ from analyst.config import get_settings
 from analyst.data.dataset import DatasetConfig
 from analyst.data.engine import Coverage, Engine
 from analyst.data.results import ResultStore, SummaryCard
+from analyst.forecasting.core import forecast as run_forecast
+from analyst.forecasting.core import prepare_series
+from analyst.forecasting.models import DEFAULTS
 from analyst.memory.files import load_memory
 from analyst.semantic.compiler import FilterSpec, MetricQuery, compile_query, from_sql
 from analyst.semantic.model import Memory, SemanticModel
 from analyst.semantic.resolve import resolve_values
+
+_FORECAST_COLUMNS = (
+    "unique_id",
+    "ds",
+    "yhat",
+    "lo_80",
+    "hi_80",
+    "lo_95",
+    "hi_95",
+)
+_SCORE_FIELDS = (
+    "mae",
+    "mase",
+    "relative_mae",
+    "coverage_80",
+    "coverage_95",
+    "scaled_crps",
+)
+_BASELINE_NOTE = "no model beat the seasonal baseline"
+_BACKTEST_SERIES_LIMIT = 5
 
 _DESCRIBE_TARGETS = (
     "metrics",
@@ -109,6 +134,140 @@ class DataService:
             return _describe_coverage(self.engine)
         choices = ", ".join(_DESCRIBE_TARGETS)
         raise ValueError(f"unknown describe target {target!r}; valid: {choices}")
+
+    def forecast(
+        self,
+        handle_id: str,
+        *,
+        time_col: str = "period",
+        value_col: str,
+        id_col: str | None = None,
+        freq: Literal["D", "MS"],
+        horizon: int | None = None,
+        levels: tuple[int, int] = (80, 95),
+    ) -> SummaryCard:
+        if horizon is None:
+            horizon = DEFAULTS[freq]["horizon"]
+        table = self.store.load(handle_id)
+        _require_columns(
+            table.column_names,
+            [time_col, value_col, *([id_col] if id_col else [])],
+        )
+        if id_col is None:
+            periods = table.column(time_col).to_pylist()
+            if len(periods) != len(set(periods)):
+                raise ValueError("handle has multiple rows per period; pass id_col")
+        input_card = self.store.card(handle_id)
+        t0 = time.perf_counter()
+        prepared = prepare_series(
+            table.to_pandas(),
+            freq=freq,
+            data_end=self.engine.coverage().end,
+            quirks=self.memory.quirks,
+            id_col=id_col,
+            time_col=time_col,
+            value_col=value_col,
+        )
+        run = run_forecast(
+            prepared,
+            freq=freq,
+            horizon=horizon,
+            levels=levels,
+            n_jobs=1,
+        )
+        elapsed_s = time.perf_counter() - t0
+        notes = list(run.adjustments)
+        if not run.backtest.beats_baseline and _BASELINE_NOTE not in notes:
+            notes.append(_BASELINE_NOTE)
+        frame = run.forecast.loc[:, list(_FORECAST_COLUMNS)]
+        forecast_table = pa.Table.from_pandas(frame, preserve_index=False)
+        source = json.dumps(
+            {
+                "input_handle": handle_id,
+                "freq": freq,
+                "horizon": horizon,
+                "value_col": value_col,
+                "id_col": id_col,
+                "time_col": time_col,
+                "levels": list(levels),
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        kept = _kept_scores(run.backtest.scores, run.model)
+        backtest_card = self.store.save(
+            pa.Table.from_pandas(kept, preserve_index=False),
+            produced_by="backtest",
+            source=source + ":backtest",
+            governed=input_card.governed,
+            elapsed_s=elapsed_s,
+        )
+        meta = {
+            "model": run.model,
+            "origin": run.origin.isoformat(),
+            "horizon": horizon,
+            "freq": freq,
+            "beats_baseline": bool(run.backtest.beats_baseline),
+            "backtest_handle": backtest_card.handle_id,
+            "backtest_summary": _backtest_summary(kept, run.model),
+            "input_handle": handle_id,
+        }
+        if kept["unique_id"].nunique() <= _BACKTEST_SERIES_LIMIT:
+            meta["backtest"] = _backtest_rows(kept)
+        return self.store.save(
+            forecast_table,
+            produced_by="forecast",
+            source=source,
+            governed=input_card.governed,
+            elapsed_s=elapsed_s,
+            notes=notes,
+            meta=meta,
+        )
+
+
+def _require_columns(columns: list[str], required: list[str]) -> None:
+    missing = [name for name in required if name not in columns]
+    if missing:
+        available = ", ".join(columns)
+        unknown = ", ".join(missing)
+        raise ValueError(f"unknown column(s): {unknown}; columns: {available}")
+
+
+def _kept_scores(scores, best_model: str):
+    columns = ["unique_id", "model", *_SCORE_FIELDS]
+    return scores.loc[scores["model"].isin([best_model, "SeasonalNaive"]), columns].reset_index(
+        drop=True
+    )
+
+
+def _backtest_summary(kept, best_model: str) -> dict:
+    best = kept.loc[kept["model"] == best_model]
+    baseline = kept.loc[kept["model"] == "SeasonalNaive"]
+
+    def mean(frame, column: str) -> float:
+        return round(float(frame[column].mean()), 4)
+
+    return {
+        "best_model": best_model,
+        "mean_relative_mae": mean(best, "relative_mae"),
+        "mean_mase": mean(best, "mase"),
+        "mean_coverage_80": mean(best, "coverage_80"),
+        "mean_coverage_95": mean(best, "coverage_95"),
+        "baseline_mean_mase": mean(baseline, "mase"),
+    }
+
+
+def _backtest_rows(kept) -> list[dict]:
+    rows: list[dict] = []
+    for record in kept.to_dict(orient="records"):
+        rows.append(
+            {
+                "unique_id": str(record["unique_id"]),
+                "model": str(record["model"]),
+                **{field: round(float(record[field]), 4) for field in _SCORE_FIELDS},
+            }
+        )
+    return rows
 
 
 def _describe_metrics(model: SemanticModel) -> str:

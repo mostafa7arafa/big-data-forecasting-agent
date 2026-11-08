@@ -66,6 +66,82 @@ def test_stats(tmp_path):
     assert stats.mean == pytest.approx((1 + 2 + 5) / 3)
 
 
+def test_render_meta_capped():
+    from analyst.data.results import SummaryCard
+
+    card = SummaryCard(
+        handle_id="r_meta",
+        rows=1,
+        columns=[("a", "int64")],
+        preview="| a |\n|---|\n| 1 |",
+        stats=[],
+        produced_by="forecast",
+        source="x",
+        governed=True,
+        elapsed_s=0.1,
+        meta={"blob": "x" * 5000},
+    )
+    rendered = card.render()
+    assert len(rendered) <= 4096
+    assert "preview:" in rendered
+    assert "| 1 |" in rendered
+    meta_line = next(line for line in rendered.splitlines() if line.startswith("meta:"))
+    suffix = " …(meta truncated)"
+    assert meta_line.endswith(suffix)
+    assert len(meta_line) == 1000 + len(suffix)
+
+
+def test_render_meta_short_keys_survive_cap():
+    from analyst.data.results import SummaryCard
+
+    card = SummaryCard(
+        handle_id="r_meta_order",
+        rows=1,
+        columns=[("a", "int64")],
+        preview="| a |\n|---|\n| 1 |",
+        stats=[],
+        produced_by="forecast",
+        source="x",
+        governed=True,
+        elapsed_s=0.1,
+        meta={"a_long": ["row"] * 400, "z_short": 1},
+    )
+    rendered = card.render()
+    meta_line = next(line for line in rendered.splitlines() if line.startswith("meta:"))
+    assert '"z_short": 1' in meta_line
+    assert meta_line.endswith(" …(meta truncated)")
+
+
+def test_display_rounding_preview_and_stats(tmp_path):
+    table = pa.table(
+        {
+            "n": pa.array([2, 3], type=pa.int64()),
+            "big": pa.array([1.236, 8.1], type=pa.float64()),
+            "small": pa.array([0.00123456, 0.000123456], type=pa.float64()),
+        }
+    )
+    store = ResultStore(tmp_path)
+    card = store.save(
+        table,
+        produced_by="run_sql",
+        source="select rounded",
+        governed=True,
+        elapsed_s=0.0,
+    )
+    rendered = card.render()
+    assert "1.24" in rendered
+    assert "8.10" in rendered
+    assert "0.001235" in rendered
+    assert "0.0001235" in rendered
+    assert "1.236" not in rendered
+    assert "0.00123456" not in rendered
+    assert "0.000123456" not in rendered
+    assert "2.00" not in rendered
+    loaded = store.load(card.handle_id)
+    assert loaded.column("big").to_pylist() == pytest.approx([1.236, 8.1])
+    assert loaded.column("n").to_pylist() == [2, 3]
+
+
 def test_render_capped(tmp_path):
     cols = {f"c{i}": [float(i)] * 10 for i in range(200)}
     table = pa.table(cols)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +16,8 @@ _RENDER_BUDGET = 4096
 _PREVIEW_ROWS = 10
 _TRUNC_SUFFIX = "\n…(truncated)"
 _PREVIEW_LABEL = "preview:\n"
+_META_LINE_LIMIT = 1000
+_META_SUFFIX = " …(meta truncated)"
 
 
 class ColumnStats(BaseModel):
@@ -104,7 +107,10 @@ class SummaryCard(BaseModel):
         if self.notes:
             lines.append(f"notes: {', '.join(self.notes)}")
         if self.meta:
-            lines.append(f"meta: {json.dumps(self.meta, sort_keys=True)}")
+            meta_line = f"meta: {json.dumps(_meta_by_value_length(self.meta))}"
+            if len(meta_line) > _META_LINE_LIMIT:
+                meta_line = meta_line[:_META_LINE_LIMIT] + _META_SUFFIX
+            lines.append(meta_line)
         return "\n".join(lines) + "\n\n"
 
     def _render_stats(self, stats: list[ColumnStats]) -> str:
@@ -113,12 +119,20 @@ class SummaryCard(BaseModel):
         out = ["stats:"]
         for s in stats:
             numeric = _is_numeric_type_str(s.type)
+            integer = _is_integer_type_str(s.type)
             if numeric:
                 out.append(
-                    f"  {s.name} nulls={s.nulls} min={s.min} max={s.max} mean={s.mean}"
+                    f"  {s.name} nulls={s.nulls} "
+                    f"min={_format_stat_value(s.min, as_int=integer)} "
+                    f"max={_format_stat_value(s.max, as_int=integer)} "
+                    f"mean={_format_stat_value(s.mean, as_int=False)}"
                 )
             else:
-                out.append(f"  {s.name} nulls={s.nulls} min={s.min} max={s.max}")
+                out.append(
+                    f"  {s.name} nulls={s.nulls} "
+                    f"min={_format_stat_value(s.min, as_int=False)} "
+                    f"max={_format_stat_value(s.max, as_int=False)}"
+                )
         return "\n".join(out) + "\n\n"
 
 
@@ -294,11 +308,59 @@ def _column_stats(table: pa.Table, name: str) -> ColumnStats:
 
 def _preview_markdown(table: pa.Table, max_rows: int) -> str:
     slice_table = table.slice(0, min(max_rows, table.num_rows))
-    df = slice_table.to_pandas()
+    df = _format_preview_frame(slice_table.to_pandas())
     try:
         return df.to_markdown(index=False)
     except ImportError:
         return _pipe_markdown(df)
+
+
+def _meta_by_value_length(meta: dict) -> dict:
+    """Shortest serialized values first so the render cap keeps them."""
+    return {
+        key: meta[key]
+        for key in sorted(meta, key=lambda key: (len(json.dumps(meta[key])), key))
+    }
+
+
+def _format_preview_frame(df: pd.DataFrame) -> pd.DataFrame:
+    formatted = df.copy()
+    for name in formatted.columns:
+        series = formatted[name]
+        if pd.api.types.is_float_dtype(series):
+            formatted[name] = series.map(_format_display_float)
+    return formatted
+
+
+def _format_display_float(value: object) -> str:
+    if value is None or (isinstance(value, float) and math.isnan(value)):
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except TypeError:
+        return str(value)
+    number = float(value)
+    if math.isnan(number):
+        return ""
+    if abs(number) >= 1:
+        return f"{number:.2f}"
+    return f"{number:.4g}"
+
+
+def _format_stat_value(value: object, *, as_int: bool) -> str:
+    if isinstance(value, float):
+        if math.isnan(value):
+            return "nan"
+        if as_int and value.is_integer():
+            return str(int(value))
+        return _format_display_float(value)
+    return str(value)
+
+
+def _is_integer_type_str(type_str: str) -> bool:
+    head = type_str.lower().split("[", 1)[0]
+    return head.startswith(("int", "uint"))
 
 
 def _pipe_markdown(df: pd.DataFrame) -> str:
