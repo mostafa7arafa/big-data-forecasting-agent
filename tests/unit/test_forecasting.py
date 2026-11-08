@@ -67,6 +67,17 @@ def test_candidates_daily_include_mstl_and_baseline():
     }
 
 
+def test_arima_convergence_warning_is_filtered():
+    import warnings
+
+    with warnings.catch_warnings(record=True) as recorded:
+        warnings.warn_explicit(
+            "possible convergence problem: minimize gave code 2]", UserWarning,
+            filename="statsforecast/arima.py", lineno=479, module="statsforecast.arima",
+        )
+    assert not recorded
+
+
 def test_monthly_candidates():
     models = candidate_models("MS")
     assert [str(m) for m in models] == [
@@ -537,6 +548,40 @@ class RefitFailingBaseline(SeasonalNaive):
 def test_baseline_refit_failure_propagates():
     with pytest.raises(RuntimeError, match="baseline refit failure"):
         forecast(daily(100), freq="D", horizon=28, models=[RefitFailingBaseline(7)])
+
+
+@pytest.mark.parametrize(
+    "relative,mase_scores,ets_relative,ets_mase,expected",
+    [
+        ([0.5, 0.5], [2.0, 2.0], 0.8, 0.1, "HistoricAverage"),
+        ([1.1, 1.1], [0.1, 0.1], 1.2, 0.2, "SeasonalNaive"),
+        ([1.0, 1.0], [0.1, 0.1], 1.0, 0.2, "SeasonalNaive"),
+        ([0.5, 0.5], [2.0, 2.0], 0.5, 0.1, "AutoETS"),
+        ([0.1, 1.5], [2.0, 2.0], 0.7, 3.0, "AutoETS"),
+    ],
+)
+def test_selection_uses_relative_mae_not_mase(monkeypatch, relative, mase_scores, ets_relative, ets_mase, expected):
+    from analyst.forecasting import core
+
+    def evaluated(window, **kwargs):
+        return pd.DataFrame([
+            {"unique_id": uid, "metric": metric, "SeasonalNaive": baseline,
+             "HistoricAverage": candidate,
+             "AutoETS": 10 * ets_relative if metric == "mae" else ets_mase if metric == "mase" else baseline}
+            for uid, ratio, scale in zip(["a", "b"], relative, mase_scores, strict=True)
+            for metric, baseline, candidate in [
+                ("mae", 10.0, 10.0 * ratio), ("mase", 1.0, scale),
+                ("coverage_level80", 0.8, 0.8), ("coverage_level95", 0.95, 0.95),
+                ("scaled_crps", 0.2, 0.2),
+            ]
+        ])
+
+    monkeypatch.setattr(core, "evaluate", evaluated)
+    result = forecast(daily(100, ids=("a", "b")), freq="D", horizon=28, models=[HistoricAverage(), AutoETS(7)])
+    assert result.model == result.backtest.best_model == expected
+    assert result.backtest.beats_baseline == (expected != "SeasonalNaive")
+    if expected == "SeasonalNaive":
+        assert "no model beat the seasonal baseline" in result.adjustments
 
 
 def test_only_impute_quirks_are_changed():

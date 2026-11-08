@@ -30,6 +30,9 @@ dev = [
 [tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["tests"]
+filterwarnings = [
+    'ignore:^possible convergence problem\x3a minimize gave code [0-9]+\]$:UserWarning:statsforecast.arima',
+]
 markers = [
     "taxi: tests that require data/raw NYC taxi files",
     "slow: long-running tests",

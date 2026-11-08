@@ -29,6 +29,7 @@ Freq = Literal["D", "MS"]
 class PreparedSeries:
     df: pd.DataFrame
     adjustments: list[str]
+    imputed_points: int = 0
 
 
 @dataclass
@@ -139,6 +140,7 @@ def prepare_series(
     if np.isinf(frame.y).any():
         raise ValueError("series values must be finite")
     all_adjustments, frames = [], []
+    imputed_points = 0
     multiple_ids = frame.unique_id.nunique() > 1
     for uid, group in frame.groupby("unique_id", sort=False):
         adjustments = []
@@ -189,6 +191,7 @@ def prepare_series(
                     adjustments.append(
                         f"imputed {mask.sum()} {unit} {dates.min().date()}..{dates.max().date()} (known gap)"
                     )
+        imputed_points += int(group.y.isna().sum())
         group["y"] = group.y.interpolate(method="time", limit_direction="both")
         if group.y.isna().any():
             raise ValueError(f"cannot impute series {uid!r}: no observed values")
@@ -197,7 +200,7 @@ def prepare_series(
         frames.append(group.reset_index()[["unique_id", "ds", "y"]])
         prefix = f"[{uid}] " if multiple_ids else ""
         all_adjustments.extend(prefix + message for message in adjustments)
-    return PreparedSeries(pd.concat(frames, ignore_index=True), all_adjustments)
+    return PreparedSeries(pd.concat(frames, ignore_index=True), all_adjustments, imputed_points)
 
 
 def _supported_models(series, models, horizon, n_windows):
@@ -387,14 +390,13 @@ def _fit_failure(series, model, error):
 
 
 def _report(scores, windows, horizon, adjustments):
-    means = scores.groupby("model").mase.mean()
-    # Prefer the baseline on ties, including all-infinite MASE.
+    means = scores.groupby("model")[["relative_mae", "mase"]].mean()
+    contenders = means.loc[(means.index != "SeasonalNaive") & (means.relative_mae < 1)]
     best = (
-        "SeasonalNaive"
-        if means["SeasonalNaive"] == means.min()
-        else str(means.idxmin())
+        str(contenders.sort_values(["relative_mae", "mase"], kind="stable").index[0])
+        if not contenders.empty else "SeasonalNaive"
     )
-    beats = bool(scores.loc[scores.model == best, "relative_mae"].mean() < 1)
+    beats = best != "SeasonalNaive"
     return BacktestReport(scores, best, beats, windows, horizon, list(adjustments))
 
 
@@ -425,7 +427,7 @@ def forecast(
     models=None,
     n_jobs=1,
 ) -> ForecastRun:
-    """Select by backtest MASE, refit the winner, and retain all adjustments."""
+    """Select by mean relative MAE (MASE tie-break), then refit the winner."""
     report = backtest(
         series, freq=freq, horizon=horizon, models=models, levels=levels, n_jobs=n_jobs
     )
@@ -456,6 +458,8 @@ def forecast(
     adjustments = list(series.adjustments)
     for message in working.adjustments:
         _record(adjustments, message)
+    if not report.beats_baseline:
+        _record(adjustments, "no model beat the seasonal baseline")
     names = {report.best_model: "yhat"}
     for level in (80, 95):
         for side in ("lo", "hi"):

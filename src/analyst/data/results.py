@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 from pathlib import Path
 from typing import Any
 
@@ -102,7 +103,7 @@ class SummaryCard(BaseModel):
             f"columns: {col_summary}",
             f"produced_by: {self.produced_by}",
             f"governed: {self.governed}",
-            f"elapsed_s: {self.elapsed_s}",
+            f"elapsed_s: {self.elapsed_s:.2f}",
         ]
         if self.notes:
             lines.append(f"notes: {', '.join(self.notes)}")
@@ -185,17 +186,27 @@ class ResultStore:
     def exists(self, handle_id: str) -> bool:
         return self._parquet_path(handle_id, fail=False).is_file()
 
+    def _validate_handle_id(self, handle_id: str) -> None:
+        if not is_result_handle_id(handle_id):
+            raise KeyError(f"unknown result handle {handle_id}")
+
     def _parquet_path(self, handle_id: str, *, fail: bool = True) -> Path:
+        self._validate_handle_id(handle_id)
         path = self._root / f"{handle_id}.parquet"
         if fail and not path.is_file():
             raise KeyError(f"unknown result handle {handle_id}")
         return path
 
     def _card_path(self, handle_id: str) -> Path:
+        self._validate_handle_id(handle_id)
         path = self._root / f"{handle_id}.card.json"
         if not path.is_file():
             raise KeyError(f"unknown result handle {handle_id}")
         return path
+
+
+def is_result_handle_id(value: str) -> bool:
+    return re.fullmatch(r"r_[0-9a-f]{10}", value) is not None
 
 
 def _make_handle(source: str, produced_by: str, meta: dict) -> str:

@@ -24,6 +24,21 @@ def run(engine, model, **kwargs):
     return engine.execute(compile_query(model, MetricQuery(**kwargs)))
 
 
+@pytest.mark.parametrize("compare", [None, "previous_period"])
+def test_descending_order_with_deterministic_ties(engine, model, compare):
+    query = MetricQuery(
+        metrics=["event_count"], dimensions=["region_id"], order_by="event_count",
+        order_desc=True, limit=3, compare_to=compare,
+        time_range=(date(2024, 2, 1), date(2024, 3, 1)),
+    )
+    sql = compile_query(model, query)
+    assert '"event_count" DESC NULLS LAST' in sql
+    actual = engine.execute(sql)
+    assert actual.column("region_id").to_pylist() == [1, 2, 3]
+    counts = actual.column("event_count").to_pylist()
+    assert counts == sorted(counts, reverse=True)
+
+
 def test_total_metric(engine, model):
     assert run(engine, model, metrics=["total_amount"]).equals(
         engine.execute("SELECT sum(amount) AS total_amount FROM events")

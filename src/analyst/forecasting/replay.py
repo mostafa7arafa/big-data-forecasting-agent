@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass, field
 from datetime import date
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -87,6 +88,7 @@ def replay(
     value_col: str,
     min_share: float = 0.01,
     n_jobs: int = 1,
+    store_root: Path | None = None,
 ) -> ReplayReport:
     """Fit each id/model in isolation, scoring raw held-out observations only.
 
@@ -99,14 +101,16 @@ def replay(
         raise ValueError(f"unsupported frequency: {freq!r}")
     if horizon < 1 or not 0 <= min_share <= 1:
         raise ValueError("horizon must be positive and min_share must be in [0, 1]")
-    full = DataService(dataset, cutoff=None)
+    full = DataService(dataset, cutoff=None,
+                       store_root=store_root / "full" if store_root is not None else None)
     truth = _query_frame(full, query, id_col, value_col)
     data_end = pd.Timestamp(full.engine.coverage().end)
     rows, dropped_ids, failed_fits = [], [], []
     horizons = {}
     season = DEFAULTS[freq]["season"]
     for cutoff in cutoffs:
-        service = DataService(dataset, cutoff=cutoff)
+        service = DataService(dataset, cutoff=cutoff,
+                              store_root=store_root / cutoff.isoformat() if store_root is not None else None)
         frame = _query_frame(service, query, id_col, value_col)
         totals = frame.groupby("unique_id").y.sum()
         shares = totals / totals.sum()

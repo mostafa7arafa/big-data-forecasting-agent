@@ -43,15 +43,10 @@ CASES = [
     pytest.param("q003", MetricQuery(
         metrics=["avg_fare"], time_range=(date(2024, 1, 1), date(2025, 1, 1)),
     ), id="q003"),
-    # Closest available request: order_by is ascending only, so this returns the
-    # bottom five instead of the top five. No reversal after LIMIT can fix it.
     pytest.param("q004", MetricQuery(
         metrics=["trips"], dimensions=["pickup_zone_name"],
-        time_range=(date(2025, 1, 1), date(2026, 1, 1)), order_by="trips", limit=5,
-    ), id="q004", marks=pytest.mark.xfail(
-        reason="MetricQuery.order_by supports ascending only; cannot request top-5 descending trips",
-        strict=True, raises=AssertionError,
-    )),
+        time_range=(date(2025, 1, 1), date(2026, 1, 1)), order_by="trips", order_desc=True, limit=5,
+    ), id="q004"),
     pytest.param("q005", MetricQuery(
         metrics=["trips"], dimensions=["payment_type"],
         time_range=(date(2023, 1, 1), date(2024, 1, 1)),
@@ -97,5 +92,8 @@ def test_semantic_vs_gold(service, golden, question_id, query):
     # depend on incidental compiler projection order or extra comparison columns.
     actual = actual.select(expected.column_names)
     tolerance = golden[question_id]["tolerance"]
-    grade = result_set_match(actual, expected, rel_tol=tolerance["rel"] if tolerance else 0)
+    grade = result_set_match(
+        actual, expected, rel_tol=tolerance["rel"] if tolerance else 0,
+        ignore_order=question_id != "q004",
+    )
     assert grade.score, grade.comment

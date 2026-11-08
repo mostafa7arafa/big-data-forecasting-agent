@@ -89,6 +89,7 @@ class SeriesSpec(MemoryItem):
     freq: Literal["D", "MS"]
     season_lengths: list[int] = Field(default_factory=list)
     recommended_models: list[str] = Field(default_factory=list)
+    recommended_models_status: Literal["approved", "proposed"] | None = None
 
 
 class ContextFact(MemoryItem):

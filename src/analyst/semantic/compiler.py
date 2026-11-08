@@ -35,6 +35,7 @@ class MetricQuery(BaseModel):
     compare_to: Literal["previous_period", "same_period_last_year"] | None = None
     share: bool = False
     order_by: str | None = None
+    order_desc: bool = False
     limit: int | None = Field(default=None, ge=0, strict=True)
 
     @model_validator(mode="after")
@@ -342,9 +343,15 @@ def compile_query(
             for dim in dimensions
         )
         sql += "\nLEFT JOIN cmp ON " + (" AND ".join(on) if on else "TRUE")
-    order = [q.order_by] if q.order_by is not None else [name for name, _ in keys]
+    order = []
+    if q.order_by is not None:
+        direction = "DESC" if q.order_desc else "ASC"
+        order.append(f"{_identifier(q.order_by)} {direction} NULLS LAST")
+    order.extend(
+        f"{_identifier(name)} ASC NULLS LAST" for name, _ in keys if name != q.order_by
+    )
     if order:
-        sql += "\nORDER BY " + ", ".join(_identifier(name) for name in order)
+        sql += "\nORDER BY " + ", ".join(order)
     if q.limit is not None:
         sql += f"\nLIMIT {q.limit}"
     return sql

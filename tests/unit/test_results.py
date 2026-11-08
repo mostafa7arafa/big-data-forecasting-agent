@@ -142,6 +142,14 @@ def test_display_rounding_preview_and_stats(tmp_path):
     assert loaded.column("n").to_pylist() == [2, 3]
 
 
+def test_elapsed_display_rounding_preserves_storage(tmp_path):
+    store = ResultStore(tmp_path)
+    card = store.save(pa.table({"x": [1]}), produced_by="run_sql", source="elapsed",
+                      governed=False, elapsed_s=1.236789)
+    assert "elapsed_s: 1.24\n" in card.render()
+    assert store.card(card.handle_id).elapsed_s == 1.236789
+
+
 def test_render_capped(tmp_path):
     cols = {f"c{i}": [float(i)] * 10 for i in range(200)}
     table = pa.table(cols)
@@ -182,6 +190,28 @@ def test_unknown_handle(tmp_path):
         store.load(handle)
     with pytest.raises(KeyError, match=f"unknown result handle {handle}"):
         store.card(handle)
+
+
+@pytest.mark.parametrize("method", ["load", "card", "exists"])
+@pytest.mark.parametrize("handle", ["../x", "absolute", "r_ABCDEF1234", "r_1234567890\n"])
+def test_invalid_handle_rejected(tmp_path, method, handle):
+    store = ResultStore(tmp_path / "store")
+    if handle == "absolute":
+        handle = str(tmp_path / "outside")
+    # Put real artifacts at the escaped location: rejecting missing files alone
+    # would not prove that the store enforces its identifier boundary.
+    if handle == "../x" or handle.startswith("/"):
+        import pyarrow.parquet as pq
+
+        escaped = tmp_path / "store" / f"{handle}.parquet"
+        pq.write_table(pa.table({"secret": [42]}), escaped)
+        (escaped.with_suffix(".card.json")).write_text("{}")
+    with pytest.raises(KeyError, match="unknown result handle"):
+        getattr(store, method)(handle)
+
+
+def test_unknown_valid_handle_does_not_exist(tmp_path):
+    assert not ResultStore(tmp_path).exists("r_deadbeef00")
 
 
 def test_empty_table_saves(tmp_path):

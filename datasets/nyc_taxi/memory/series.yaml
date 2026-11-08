@@ -12,8 +12,7 @@ series:
   - HistoricAverage
   - MSTL
   - SeasonalNaive
-  source: profile
-  status: proposed
+  recommended_models_status: proposed
 - name: daily_trips_by_borough
   metric: trips
   dimensions:
@@ -34,5 +33,4 @@ series:
   - AutoARIMA
   - AutoETS
   - SeasonalNaive
-  source: profile
-  status: proposed
+  recommended_models_status: proposed

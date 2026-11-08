@@ -160,7 +160,7 @@ def main():
     selected = lineup(report)
     for item in mapping["series"]:
         if item["name"] == spec.name:
-            item.update(recommended_models=selected, source="profile", status="proposed")
+            item.update(recommended_models=selected, recommended_models_status="proposed")
             break
     path.write_text(yaml.safe_dump(mapping, sort_keys=False))
     print(f"{spec.name}: {', '.join(selected)} ({elapsed:.3f}s)", flush=True)

@@ -238,7 +238,7 @@ def _fake_run(ids, *, beats_baseline, adjustments, mae=1.23456789):
 def _one_series_handle(svc):
     table = pa.table(
         {
-            "period": [date(2024, 1, 1)],
+            "period": [date(2024, 2, 29)],
             "total_amount": [10.0],
         }
     )
@@ -256,7 +256,7 @@ def test_forecast_many_series_render_within_budget(synthetic_dataset, tmp_path, 
     ids = [f"s{i:02d}" for i in range(10)]
     table = pa.table(
         {
-            "period": [date(2024, 1, 1)] * len(ids),
+            "period": [date(2024, 2, 29)] * len(ids),
             "area": ids,
             "total_amount": [float(i + 1) for i in range(len(ids))],
         }
@@ -323,6 +323,67 @@ def test_forecast_grouped_without_id_col(synthetic_dataset, tmp_path):
         ValueError, match=r"handle has multiple rows per period; pass id_col"
     ):
         svc.forecast(card.handle_id, value_col="total_amount", freq="D")
+
+
+@pytest.mark.parametrize(
+    "grain,freq,cutoff,end,expected",
+    [
+        ("day", "D", None, date(2024, 2, 1), "2024-02-29"),
+        ("month", "MS", None, date(2024, 2, 1), "2024-02-01"),
+        ("day", "D", date(2024, 2, 15), date(2024, 2, 1), "2024-02-15"),
+    ],
+)
+def test_forecast_rejects_earlier_handle_end(synthetic_dataset, tmp_path, grain, freq, cutoff, end, expected):
+    svc = DataService(synthetic_dataset, cutoff=cutoff, store_root=tmp_path)
+    card = svc.query_metrics(MetricQuery(
+        metrics=["total_amount"], grain=grain, time_range=(date(2024, 1, 1), end),
+    ))
+    with pytest.raises(ValueError, match=f"handle ends .* but data runs to {expected}; re-query without an earlier end"):
+        svc.forecast(card.handle_id, value_col="total_amount", freq=freq, horizon=1)
+
+
+def test_forecast_accepts_last_complete_month_at_partial_cutoff(synthetic_dataset, tmp_path, monkeypatch):
+    svc = DataService(synthetic_dataset, cutoff=date(2024, 2, 15), store_root=tmp_path)
+    card = svc.query_metrics(MetricQuery(metrics=["total_amount"], grain="month"))
+
+    def fake(series, **kwargs):
+        assert series.df.ds.max() == pd.Timestamp("2024-01-01")
+        return _fake_run(["series"], beats_baseline=True, adjustments=series.adjustments)
+
+    monkeypatch.setattr("analyst.data.service.run_forecast", fake)
+    result = svc.forecast(card.handle_id, value_col="total_amount", freq="MS", horizon=1)
+    assert "dropped partial period 2024-02-01" in result.notes
+
+
+def test_forecast_notes_shorter_id(synthetic_dataset, tmp_path, monkeypatch):
+    svc = DataService(synthetic_dataset, store_root=tmp_path)
+    card = svc.store.save(
+        pa.table({"period": [date(2024, 2, 28), date(2024, 2, 29)],
+                  "area": ["short", "full"], "total_amount": [10.0, 20.0]}),
+        produced_by="run_sql", source="unequal ends", governed=False, elapsed_s=0,
+    )
+
+    def fake(series, **kwargs):
+        return _fake_run(["short", "full"], beats_baseline=True, adjustments=series.adjustments)
+
+    monkeypatch.setattr("analyst.data.service.run_forecast", fake)
+    result = svc.forecast(card.handle_id, id_col="area", value_col="total_amount", freq="D", horizon=1)
+    assert result.notes.count("short ends 2024-02-28, before the series end 2024-02-29") == 1
+
+
+@pytest.mark.parametrize("grain,freq", [("month", "D"), ("day", "MS"), ("hour", "D"), ("week", "D"), (None, "D")])
+def test_forecast_rejects_incompatible_query_grain(synthetic_dataset, tmp_path, grain, freq):
+    svc = DataService(synthetic_dataset, store_root=tmp_path)
+    card = svc.query_metrics(MetricQuery(metrics=["total_amount"], grain=grain))
+    with pytest.raises(ValueError, match="day.*D.*month.*MS"):
+        svc.forecast(card.handle_id, value_col="total_amount", freq=freq, horizon=1)
+
+
+def test_forecast_rejects_sparse_raw_handle(synthetic_dataset, tmp_path):
+    svc = DataService(synthetic_dataset, store_root=tmp_path)
+    card = svc.run_sql("SELECT CAST(date_trunc('month', ts) AS DATE) AS period, sum(amount) AS total_amount FROM events GROUP BY 1 UNION ALL SELECT DATE '2024-02-29', 10.0")
+    with pytest.raises(ValueError, match="aggregate to the right grain first"):
+        svc.forecast(card.handle_id, value_col="total_amount", freq="D", horizon=1)
 
 
 def test_forecast_bad_column(synthetic_dataset, tmp_path):

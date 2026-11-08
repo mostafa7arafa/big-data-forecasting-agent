@@ -140,6 +140,13 @@ def test_describe_unknown_target(synthetic_dataset, tmp_path):
         svc.describe("not_a_target")
 
 
+@pytest.mark.parametrize("target", ["../x", "/tmp/outside", "r_deadbeef00"])
+def test_describe_rejects_unknown_or_invalid_handle(synthetic_dataset, tmp_path, target):
+    svc = DataService(synthetic_dataset, store_root=tmp_path / "store")
+    with pytest.raises(ValueError, match="unknown describe target"):
+        svc.describe(target)
+
+
 def test_handles_isolated_by_cutoff(synthetic_dataset, tmp_path, monkeypatch):
     from analyst.config import Settings
 

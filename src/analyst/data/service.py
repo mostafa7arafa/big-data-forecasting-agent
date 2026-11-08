@@ -8,12 +8,13 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Literal
 
+import pandas as pd
 import pyarrow as pa
 
 from analyst.config import get_settings
 from analyst.data.dataset import DatasetConfig
 from analyst.data.engine import Coverage, Engine
-from analyst.data.results import ResultStore, SummaryCard
+from analyst.data.results import ResultStore, SummaryCard, is_result_handle_id
 from analyst.forecasting.core import forecast as run_forecast
 from analyst.forecasting.core import prepare_series
 from analyst.forecasting.models import DEFAULTS
@@ -111,7 +112,7 @@ class DataService:
         )
 
     def describe(self, target: str) -> str:
-        if self.store.exists(target):
+        if is_result_handle_id(target) and self.store.exists(target):
             return self.store.card(target).render()
         if target == "metrics":
             return _describe_metrics(self.memory.semantic)
@@ -149,6 +150,10 @@ class DataService:
         if horizon is None:
             horizon = DEFAULTS[freq]["horizon"]
         table = self.store.load(handle_id)
+        input_card = self.store.card(handle_id)
+        query_meta = input_card.meta.get("query")
+        if query_meta is not None and {"day": "D", "month": "MS"}.get(query_meta.get("grain")) != freq:
+            raise ValueError("forecast supports query grain/frequency pairs day→D and month→MS only")
         _require_columns(
             table.column_names,
             [time_col, value_col, *([id_col] if id_col else [])],
@@ -157,7 +162,6 @@ class DataService:
             periods = table.column(time_col).to_pylist()
             if len(periods) != len(set(periods)):
                 raise ValueError("handle has multiple rows per period; pass id_col")
-        input_card = self.store.card(handle_id)
         t0 = time.perf_counter()
         prepared = prepare_series(
             table.to_pandas(),
@@ -168,6 +172,26 @@ class DataService:
             time_col=time_col,
             value_col=value_col,
         )
+        if query_meta is None and prepared.imputed_points > 0.2 * len(prepared.df):
+            raise ValueError("more than 20% of series points were imputed; aggregate to the right grain first")
+        data_end = pd.Timestamp(self.engine.coverage().end)
+        complete_end = data_end.to_period("D" if freq == "D" else "M").start_time
+        boundary = (
+            complete_end + pd.offsets.MonthEnd(0) if freq == "MS" else complete_end
+        ) + pd.Timedelta(hours=23)
+        if data_end < boundary:
+            complete_end -= pd.tseries.frequencies.to_offset(freq)
+        series_end = prepared.df.ds.max()
+        if series_end < complete_end:
+            raise ValueError(
+                f"handle ends {series_end.date()} but data runs to {complete_end.date()}; "
+                "re-query without an earlier end (forecast origin must be the end of data)"
+            )
+        for uid, end in prepared.df.groupby("unique_id").ds.max().items():
+            if end < series_end:
+                prepared.adjustments.append(
+                    f"{uid} ends {end.date()}, before the series end {series_end.date()}"
+                )
         run = run_forecast(
             prepared,
             freq=freq,

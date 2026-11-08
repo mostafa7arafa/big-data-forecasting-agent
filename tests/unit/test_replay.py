@@ -18,10 +18,11 @@ QUERY = MetricQuery(metrics=["total_amount"], dimensions=["area"], grain="day")
 
 
 @pytest.fixture(scope="module")
-def daily_report(synthetic_dataset):
+def daily_report(synthetic_dataset, tmp_path_factory):
     return replay(
         synthetic_dataset, QUERY, cutoffs=CUTOFFS, freq="D", horizon=7,
         id_col="area", value_col="total_amount", n_jobs=1,
+        store_root=tmp_path_factory.mktemp("replay"),
     )
 
 
@@ -37,7 +38,7 @@ def test_replay_scores_all_models_each_cutoff(daily_report):
     assert {"mase", "coverage_80", "coverage_95"} <= set(rows.columns)
 
 
-def test_truth_not_visible_to_forecast(synthetic_dataset, monkeypatch):
+def test_truth_not_visible_to_forecast(synthetic_dataset, monkeypatch, tmp_path):
     import analyst.forecasting.replay as module
 
     original = module.fit_predict
@@ -52,7 +53,7 @@ def test_truth_not_visible_to_forecast(synthetic_dataset, monkeypatch):
     monkeypatch.setattr(module, "fit_predict", checked)
     report = replay(
         synthetic_dataset, QUERY, cutoffs=CUTOFFS[:1], freq="D", horizon=7,
-        id_col="area", value_col="total_amount", n_jobs=1,
+        id_col="area", value_col="total_amount", n_jobs=1, store_root=tmp_path,
     )
     assert seen
     assert (report.rows.train_end < pd.Timestamp(CUTOFFS[0]) + pd.Timedelta(days=1)).all()
@@ -80,7 +81,7 @@ def test_missing_id_prevents_cutoff_win():
     assert lineup(ReplayReport(rows.drop(index=1)), min_wins=1) == ["SeasonalNaive"]
 
 
-def test_failed_fit_and_min_share(synthetic_dataset, monkeypatch):
+def test_failed_fit_and_min_share(synthetic_dataset, monkeypatch, tmp_path):
     import analyst.forecasting.replay as module
 
     def fake(series, *, horizon, models, **kwargs):
@@ -98,7 +99,7 @@ def test_failed_fit_and_min_share(synthetic_dataset, monkeypatch):
     monkeypatch.setattr(module, "fit_predict", fake)
     report = replay(
         synthetic_dataset, QUERY, cutoffs=CUTOFFS[:1], freq="D", horizon=7,
-        id_col="area", value_col="total_amount", min_share=0.5,
+        id_col="area", value_col="total_amount", min_share=0.5, store_root=tmp_path,
     )
     assert len(report.dropped_ids) == 1
     assert report.dropped_ids[0]["unique_id"] == "North"
@@ -111,7 +112,7 @@ def test_failed_fit_and_min_share(synthetic_dataset, monkeypatch):
     assert (report.rows.loc[report.rows.model != "AutoETS", "coverage_80"] == 1).all()
 
 
-def test_scores_use_training_scale_and_raw_truth(synthetic_dataset, monkeypatch):
+def test_scores_use_training_scale_and_raw_truth(synthetic_dataset, monkeypatch, tmp_path):
     import analyst.forecasting.replay as module
     from analyst.data.service import DataService
 
@@ -131,9 +132,9 @@ def test_scores_use_training_scale_and_raw_truth(synthetic_dataset, monkeypatch)
     monkeypatch.setattr(module, "fit_predict", fake)
     report = replay(
         synthetic_dataset, QUERY, cutoffs=CUTOFFS[:1], freq="D", horizon=7,
-        id_col="area", value_col="total_amount",
+        id_col="area", value_col="total_amount", store_root=tmp_path / "replay",
     )
-    svc = DataService(synthetic_dataset)
+    svc = DataService(synthetic_dataset, store_root=tmp_path / "truth")
     truth = svc.store.load(svc.query_metrics(QUERY).handle_id).to_pandas()
     truth["period"] = pd.to_datetime(truth.period)
     truth = truth.loc[(truth.period > pd.Timestamp(CUTOFFS[0])) &
@@ -151,24 +152,24 @@ def test_scores_use_training_scale_and_raw_truth(synthetic_dataset, monkeypatch)
             assert row.forecast_mean == (0 if row.model == "SeasonalNaive" else 100)
 
 
-def test_horizon_capped_by_truth(synthetic_dataset, monkeypatch):
+def test_horizon_capped_by_truth(synthetic_dataset, monkeypatch, tmp_path):
     import analyst.forecasting.replay as module
 
     monkeypatch.setattr(module, "candidate_models", lambda freq: candidate_models(freq)[-2:-1])
     report = replay(
         synthetic_dataset, QUERY, cutoffs=[date(2024, 2, 27)], freq="D", horizon=7,
-        id_col="area", value_col="total_amount",
+        id_col="area", value_col="total_amount", store_root=tmp_path,
     )
     assert report.horizons == {date(2024, 2, 27): 2}
     assert (report.rows.horizon == 2).all()
 
 
-def test_monthly_july_horizon_is_two(synthetic_dataset, monkeypatch):
+def test_monthly_july_horizon_is_two(synthetic_dataset, monkeypatch, tmp_path):
     import analyst.forecasting.replay as module
 
     cutoff = date(2026, 7, 31)
 
-    def service(dataset, *, cutoff=None):
+    def service(dataset, *, cutoff=None, store_root=None):
         end = datetime(2026, 9, 30, 23) if cutoff is None else datetime(2026, 7, 31, 23)
         return SimpleNamespace(
             engine=SimpleNamespace(coverage=lambda: SimpleNamespace(end=end)),
@@ -185,7 +186,7 @@ def test_monthly_july_horizon_is_two(synthetic_dataset, monkeypatch):
     monkeypatch.setattr(module, "candidate_models", lambda freq: candidate_models(freq)[-2:-1])
     report = replay(
         synthetic_dataset, MetricQuery(metrics=["total_amount"], grain="month"),
-        cutoffs=[cutoff], freq="MS", horizon=3, id_col=None, value_col="total_amount",
+        cutoffs=[cutoff], freq="MS", horizon=3, id_col=None, value_col="total_amount", store_root=tmp_path,
     )
     assert report.horizons == {cutoff: 2}
     assert not report.failed_fits
@@ -227,8 +228,14 @@ def test_script_publishes_report_and_preserves_other_series(synthetic_dataset, t
     assert updated["extra"] == mapping["extra"]
     selected = updated["series"][0]
     assert selected["recommended_models"] == ["A", "SeasonalNaive"]
-    assert selected["source"] == "profile"
-    assert selected["status"] == "proposed"
+    assert selected.get("source") == mapping["series"][0].get("source")
+    assert selected.get("status") == mapping["series"][0].get("status")
+    assert selected["recommended_models_status"] == "proposed"
+    from analyst.semantic.model import SeriesSpec
+
+    restored = SeriesSpec.model_validate(selected)
+    assert restored.recommended_models_status == "proposed"
+    assert restored.status == "approved"
     text = (tmp_path / "docs/results/model_replay_daily_events.md").read_text()
     assert "0.900" in text
     assert "Daily evaluation: 1 series × 28 points per cutoff." in text
@@ -277,7 +284,7 @@ def test_baseline_note_is_computed_from_predictions_and_truth():
     assert "Total scored points: 6" in text
 
 
-def test_missing_truth_is_checked_before_fitting(synthetic_dataset, monkeypatch):
+def test_missing_truth_is_checked_before_fitting(synthetic_dataset, monkeypatch, tmp_path):
     import analyst.forecasting.replay as module
 
     original = module._query_frame
@@ -295,4 +302,4 @@ def test_missing_truth_is_checked_before_fitting(synthetic_dataset, monkeypatch)
     monkeypatch.setattr(module, "fit_predict", unexpected_fit)
     with pytest.raises(ValueError, match="missing/nonfinite held-out truth"):
         replay(synthetic_dataset, QUERY, cutoffs=CUTOFFS[:1], freq="D", horizon=7,
-               id_col="area", value_col="total_amount")
+               id_col="area", value_col="total_amount", store_root=tmp_path)

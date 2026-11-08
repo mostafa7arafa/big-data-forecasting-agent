@@ -4,7 +4,7 @@ Run date: 2026-11-08
 Dataset: nyc_taxi
 Series: monthly_trips_by_borough
 Cutoffs: 2025-07-31, 2026-01-31, 2026-07-31
-Wall-clock time: 7.798 seconds
+Wall-clock time: 8.064 seconds
 
 ## How to read this
 
