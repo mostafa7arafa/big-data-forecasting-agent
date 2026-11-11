@@ -5,6 +5,7 @@ description = "Dataset-agnostic AI data analyst library"
 authors = [
     { name = "Mostafa Arafa", email = "a.mostafa190@gmail.com" }
 ]
+license = "MIT"
 requires-python = ">=3.12"
 dependencies = [
     "duckdb==2.0.0",

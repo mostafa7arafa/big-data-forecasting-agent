@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 400" width="960" height="400" font-family="Inter, -apple-system, Segoe UI, Helvetica, Arial, sans-serif">
+<title>Manhattan monthly taxi trips: actuals and an AutoETS forecast made with data cut off at 2026-07-31</title>
+<rect width="960" height="400" rx="12" fill="#ffffff"/>
+<text x="64" y="32" font-size="18" font-weight="600" fill="#0b0b0b">Time-travel test: forecast made on 2026-07-31, scored against what really happened</text>
+<text x="64" y="54" font-size="13" fill="#52514e">Manhattan monthly yellow-taxi trips · the engine hides every row after the cutoff · AutoETS, chosen by backtest vs SeasonalNaive</text>
+<line x1="64" x2="810" y1="301.7" y2="301.7" stroke="#e6e5e1" stroke-width="1"/>
+<text x="56" y="305.7" font-size="12" text-anchor="end" fill="#8a8984">2.5M</text>
+<line x1="64" x2="810" y1="224.4" y2="224.4" stroke="#e6e5e1" stroke-width="1"/>
+<text x="56" y="228.4" font-size="12" text-anchor="end" fill="#8a8984">3.0M</text>
+<line x1="64" x2="810" y1="147.2" y2="147.2" stroke="#e6e5e1" stroke-width="1"/>
+<text x="56" y="151.2" font-size="12" text-anchor="end" fill="#8a8984">3.5M</text>
+<line x1="64" x2="810" y1="70.0" y2="70.0" stroke="#e6e5e1" stroke-width="1"/>
+<text x="56" y="74.0" font-size="12" text-anchor="end" fill="#8a8984">4.0M</text>
+<text x="64.0" y="370" font-size="12" fill="#8a8984">2023</text>
+<text x="262.9" y="370" font-size="12" fill="#8a8984">2024</text>
+<text x="461.9" y="370" font-size="12" fill="#8a8984">2025</text>
+<text x="660.8" y="370" font-size="12" fill="#8a8984">2026</text>
+<line x1="760.3" x2="760.3" y1="64" y2="348" stroke="#8a8984" stroke-width="1.5" stroke-dasharray="4 4"/>
+<text x="754.3" y="78" font-size="12" text-anchor="end" fill="#52514e">cutoff →</text>
+<polygon points="760.3,210.5 776.8,230.8 793.4,136.3 810.0,103.8 810.0,158.7 793.4,187.0 776.8,277.3 760.3,210.5" fill="#eb6834" fill-opacity="0.18"/>
+<polyline fill="none" stroke="#2a78d6" stroke-width="2" stroke-linejoin="round" points="64.0,268.4 80.6,285.7 97.2,222.3 113.7,240.2 130.3,210.5 146.9,239.6 163.5,296.5 180.0,309.2 196.6,303.2 213.2,207.0 229.8,229.6 246.4,220.0 262.9,279.0 279.5,269.1 296.1,193.7 312.7,204.8 329.2,178.7 345.8,204.7 362.4,274.0 379.0,290.3 395.6,196.6 412.1,166.1 428.7,188.6 445.3,185.7 461.9,210.7 478.4,199.9 495.0,135.0 511.6,156.2 528.2,84.3 544.8,124.0 561.3,182.5 577.9,231.5 594.5,126.6 611.1,98.1 627.6,130.5 644.2,115.2 660.8,196.5 677.4,238.4 694.0,163.9 710.5,176.4 727.1,141.4 743.7,164.8 760.3,210.5"/>
+<polyline fill="none" stroke="#eb6834" stroke-width="2" stroke-dasharray="6 4" points="760.3,210.5 776.8,254.1 793.4,161.7 810.0,131.3"/>
+<circle cx="776.8" cy="254.1" r="4" fill="#eb6834" stroke="#ffffff" stroke-width="2"/>
+<circle cx="793.4" cy="161.7" r="4" fill="#eb6834" stroke="#ffffff" stroke-width="2"/>
+<circle cx="810.0" cy="131.3" r="4" fill="#eb6834" stroke="#ffffff" stroke-width="2"/>
+<circle cx="776.8" cy="240.7" r="5" fill="#ffffff" stroke="#2a78d6" stroke-width="2.5"/>
+<circle cx="793.4" cy="165.4" r="5" fill="#ffffff" stroke="#2a78d6" stroke-width="2.5"/>
+<text x="196.6" y="323.2" font-size="11" text-anchor="middle" fill="#8a8984">4-day data gap</text>
+<text x="824" y="110" font-size="13" font-weight="600" fill="#0b0b0b">Aug: -3.0%</text>
+<text x="824" y="127" font-size="11" fill="#52514e">2.81M vs 2.89M</text>
+<text x="824" y="154" font-size="13" font-weight="600" fill="#0b0b0b">Sep: +0.7%</text>
+<text x="824" y="171" font-size="11" fill="#52514e">3.41M vs 3.38M</text>
+<text x="824" y="212" font-size="11" fill="#52514e">both inside the</text>
+<text x="824" y="226" font-size="11" fill="#52514e">80% interval</text>
+<line x1="64" x2="86" y1="382" y2="382" stroke="#2a78d6" stroke-width="2"/><text x="92" y="386" font-size="12" fill="#52514e">Actual (what the model saw)</text>
+<circle cx="282" cy="382" r="5" fill="#ffffff" stroke="#2a78d6" stroke-width="2.5"/><text x="294" y="386" font-size="12" fill="#52514e">Actual after cutoff (hidden)</text>
+<line x1="474" x2="496" y1="382" y2="382" stroke="#eb6834" stroke-width="2" stroke-dasharray="6 4"/><text x="502" y="386" font-size="12" fill="#52514e">Forecast + 80% interval</text>
+</svg>
