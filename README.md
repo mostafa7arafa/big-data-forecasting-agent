@@ -13,6 +13,7 @@
 ![StatsForecast](https://img.shields.io/badge/StatsForecast-2.0-1f6feb)
 ![uv](https://img.shields.io/badge/built%20with-uv-DE5FE9)
 ![Ruff](https://img.shields.io/badge/lint-ruff-D7FF64?logo=ruff&logoColor=black)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 ![Status](https://img.shields.io/badge/status-core%20done%20%C2%B7%20agent%20in%20progress-orange)
 
 </div>
@@ -221,5 +222,5 @@ docs/              spec, plans, research, results
 Spec first, then a plan, then implementation by agents with independent review. Each task was built by a delegated coding agent (Cursor, or Pi running a Codex model). A separate model reviewed each task for spec compliance and code quality, and an opus-level review and CodeRabbit covered the whole branch before merge. Every judgment call is recorded with its cost if wrong in [`docs/superpowers/plans/2026-11-08-plan-a-followups.md`](docs/superpowers/plans/2026-11-08-plan-a-followups.md).
 
 <div align="center">
-<sub>Data: <a href="https://www.nyc.gov/site/tlc/about/tlc-trip-record-data.page">NYC TLC Trip Record Data</a> · built by <a href="https://github.com/mostafa7arafa">Mostafa Arafa</a></sub>
+<sub>Data: <a href="https://www.nyc.gov/site/tlc/about/tlc-trip-record-data.page">NYC TLC Trip Record Data</a> · built by <a href="https://github.com/mostafa7arafa">Mostafa Arafa</a> · <a href="LICENSE">MIT License</a></sub>
 </div>
