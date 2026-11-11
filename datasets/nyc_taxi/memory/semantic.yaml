@@ -1,0 +1,71 @@
+table: trips
+time_dimension:
+  name: pickup_time
+  column: tpep_pickup_datetime
+  grains: [hour, day, week, month]
+# Quote the key "on". YAML 1.1 reads a bare on as boolean true.
+joins:
+  - name: pickup_zone
+    table: zones
+    "on": trips.PULocationID = pickup_zone.LocationID
+  - name: dropoff_zone
+    table: zones
+    "on": trips.DOLocationID = dropoff_zone.LocationID
+dimensions:
+  - name: pickup_borough
+    expr: pickup_zone.Borough
+    join: pickup_zone
+    synonyms: [borough]
+    description: Borough of the pickup zone
+  - name: pickup_zone_name
+    expr: pickup_zone.Zone
+    join: pickup_zone
+    synonyms: [zone, neighborhood]
+    description: Taxi zone name of the pickup
+  - name: dropoff_borough
+    expr: dropoff_zone.Borough
+    join: dropoff_zone
+    description: Borough of the dropoff zone
+  - name: hour
+    expr: hour(tpep_pickup_datetime)
+    description: Hour of day of the pickup
+  - name: weekday
+    expr: dayname(tpep_pickup_datetime)
+    description: Weekday name of the pickup
+  - name: payment_type
+    expr: "CASE payment_type WHEN 1 THEN 'Credit card' WHEN 2 THEN 'Cash' WHEN 3 THEN 'No charge' WHEN 4 THEN 'Dispute' ELSE 'Other' END"
+    description: Payment type; codes other than 1-4 are Other
+filters:
+  - name: valid_trip
+    expr: fare_amount > 0 AND trip_distance > 0
+    description: Drop non-positive fare or distance
+  - name: known_zone
+    expr: PULocationID NOT IN (264, 265)
+    description: Drop unknown pickup zones
+metrics:
+  - name: trips
+    expr: count(*)
+    description: Trip count, including dirty rows
+  - name: revenue
+    expr: sum(total_amount)
+    filters: [valid_trip]
+    unit: USD
+    description: Sum of total_amount on valid trips
+  - name: avg_fare
+    expr: avg(fare_amount)
+    filters: [valid_trip]
+    unit: USD
+    description: Average fare_amount on valid trips
+  - name: avg_distance
+    expr: avg(trip_distance)
+    filters: [valid_trip]
+    unit: miles
+    description: Average trip_distance on valid trips
+  - name: tip_rate
+    expr: sum(tip_amount)/nullif(sum(fare_amount),0)
+    filters: [valid_trip]
+    description: Tip amount divided by fare amount on valid trips
+  - name: congestion_fees
+    expr: sum(cbd_congestion_fee)
+    unit: USD
+    description: Sum of cbd_congestion_fee, including rows where the fee is null

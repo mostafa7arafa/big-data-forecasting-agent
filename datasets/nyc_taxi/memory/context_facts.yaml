@@ -1,0 +1,140 @@
+context_facts:
+  - date: 2023-01-02
+    label: "New Year's Day (observed)"
+    kind: holiday
+  - date: 2023-01-16
+    label: "Martin Luther King Jr. Day"
+    kind: holiday
+  - date: 2023-02-20
+    label: "Washington's Birthday"
+    kind: holiday
+  - date: 2023-05-29
+    label: "Memorial Day"
+    kind: holiday
+  - date: 2023-06-19
+    label: "Juneteenth"
+    kind: holiday
+  - date: 2023-07-04
+    label: "Independence Day"
+    kind: holiday
+  - date: 2023-09-04
+    label: "Labor Day"
+    kind: holiday
+  - date: 2023-09-21
+    end: 2023-09-24
+    label: "known data gap"
+    kind: data
+  - date: 2023-10-09
+    label: "Columbus Day"
+    kind: holiday
+  - date: 2023-11-10
+    label: "Veterans Day (observed)"
+    kind: holiday
+  - date: 2023-11-23
+    label: "Thanksgiving Day"
+    kind: holiday
+  - date: 2023-12-25
+    label: "Christmas Day"
+    kind: holiday
+  - date: 2024-01-01
+    label: "New Year's Day"
+    kind: holiday
+  - date: 2024-01-15
+    label: "Martin Luther King Jr. Day"
+    kind: holiday
+  - date: 2024-02-19
+    label: "Washington's Birthday"
+    kind: holiday
+  - date: 2024-05-27
+    label: "Memorial Day"
+    kind: holiday
+  - date: 2024-06-19
+    label: "Juneteenth"
+    kind: holiday
+  - date: 2024-07-04
+    label: "Independence Day"
+    kind: holiday
+  - date: 2024-09-02
+    label: "Labor Day"
+    kind: holiday
+  - date: 2024-10-14
+    label: "Columbus Day"
+    kind: holiday
+  - date: 2024-11-11
+    label: "Veterans Day"
+    kind: holiday
+  - date: 2024-11-28
+    label: "Thanksgiving Day"
+    kind: holiday
+  - date: 2024-12-25
+    label: "Christmas Day"
+    kind: holiday
+  - date: 2025-01-01
+    label: "New Year's Day"
+    kind: holiday
+  - date: 2025-01-05
+    label: "Manhattan congestion pricing starts"
+    kind: policy
+  - date: 2025-01-20
+    label: "Martin Luther King Jr. Day"
+    kind: holiday
+  - date: 2025-02-17
+    label: "Washington's Birthday"
+    kind: holiday
+  - date: 2025-05-26
+    label: "Memorial Day"
+    kind: holiday
+  - date: 2025-06-19
+    label: "Juneteenth"
+    kind: holiday
+  - date: 2025-07-04
+    label: "Independence Day"
+    kind: holiday
+  - date: 2025-09-01
+    label: "Labor Day"
+    kind: holiday
+  - date: 2025-10-13
+    label: "Columbus Day"
+    kind: holiday
+  - date: 2025-11-11
+    label: "Veterans Day"
+    kind: holiday
+  - date: 2025-11-27
+    label: "Thanksgiving Day"
+    kind: holiday
+  - date: 2025-12-25
+    label: "Christmas Day"
+    kind: holiday
+  - date: 2026-01-01
+    label: "New Year's Day"
+    kind: holiday
+  - date: 2026-01-19
+    label: "Martin Luther King Jr. Day"
+    kind: holiday
+  - date: 2026-02-16
+    label: "Washington's Birthday"
+    kind: holiday
+  - date: 2026-05-25
+    label: "Memorial Day"
+    kind: holiday
+  - date: 2026-06-19
+    label: "Juneteenth"
+    kind: holiday
+  - date: 2026-07-03
+    label: "Independence Day (observed)"
+    kind: holiday
+  - date: 2026-09-07
+    label: "Labor Day"
+    kind: holiday
+  - date: 2026-10-12
+    label: "Columbus Day"
+    kind: holiday
+  - date: 2026-11-11
+    label: "Veterans Day"
+    kind: holiday
+  - date: 2026-11-26
+    label: "Thanksgiving Day"
+    kind: holiday
+  - date: 2026-12-25
+    label: "Christmas Day"
+    kind: holiday

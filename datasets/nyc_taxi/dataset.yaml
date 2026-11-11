@@ -1,0 +1,8 @@
+name: nyc_taxi
+description: NYC TLC yellow taxi trip records
+files: data/raw/yellow_tripdata_*.parquet
+table: trips
+time_column: tpep_pickup_datetime
+valid_time_range: [2023-01-01, 2026-10-01]
+lookups:
+  - {name: zones, file: data/raw/taxi_zone_lookup.csv}

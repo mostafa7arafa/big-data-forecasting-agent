@@ -1,5 +1,7 @@
-data/
+/data/
+.superpowers/
 .venv/
 __pycache__/
 .pytest_cache/
 *.pyc
+.claude/settings.local.json

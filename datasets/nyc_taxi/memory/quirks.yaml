@@ -1,0 +1,23 @@
+# request_source date: Engine query
+# select min(tpep_pickup_datetime) from trips where request_source is not null
+# on yellow_tripdata_2026-06..09 (earlier files have no such column) returned
+# 2026-06-01 00:00, so the first non-null month is 2026-06.
+quirks:
+  - kind: gap
+    start: 2023-09-21
+    end: 2023-09-24
+    treatment: impute
+    description: known data gap
+  - kind: anomaly
+    start: 2026-02-23
+    treatment: flag
+    description: "unusually low (≈26k trips); cause not in data"
+  - kind: schema_change
+    start: 2025-01-05
+    description: cbd_congestion_fee added
+  - kind: schema_change
+    start: 2026-06-01
+    description: request_source added
+  - kind: data_issue
+    start: 2023-01-01
+    description: "176 rows outside window; ~2.5% fare/distance ≤ 0; 0.4% unknown zone"
