@@ -12,7 +12,7 @@ import pytest
 from analyst.config import Settings
 from analyst.data.dataset import DatasetConfig, load_dataset
 from analyst.data.service import DataService
-from analyst.forecasting.core import BacktestReport, ForecastRun
+from analyst.forecasting.core import BacktestReport, ForecastRun, prepare_series
 from analyst.forecasting.models import DEFAULTS, candidate_models
 from analyst.semantic.compiler import MetricQuery, compile_query
 
@@ -162,6 +162,39 @@ def test_forecast_from_query_handle(daily_by_area):
         freq="D",
     )
     assert again.handle_id == forecast_card.handle_id
+
+
+def test_forecast_passes_additive_from_metric_metadata(
+    synthetic_dataset, tmp_path, monkeypatch
+):
+    svc = DataService(synthetic_dataset, store_root=tmp_path / "store")
+    card = svc.query_metrics(
+        MetricQuery(metrics=["total_amount"], dimensions=["area"], grain="day")
+    )
+    flags: list[bool] = []
+
+    def capture(df, **kwargs):
+        flags.append(kwargs.get("additive"))
+        return prepare_series(df, **kwargs)
+
+    monkeypatch.setattr("analyst.data.service.prepare_series", capture)
+    monkeypatch.setattr(
+        "analyst.data.service.run_forecast",
+        lambda series, **kwargs: _fake_run(
+            ["North", "South"], beats_baseline=True, adjustments=[]
+        ),
+    )
+    svc.forecast(
+        card.handle_id, id_col="area", value_col="total_amount", freq="D", horizon=1
+    )
+    assert flags[-1] is True
+
+    raw = svc.run_sql(
+        "SELECT CAST(ts AS DATE) AS period, sum(amount) AS total_amount "
+        "FROM events GROUP BY 1"
+    )
+    svc.forecast(raw.handle_id, value_col="total_amount", freq="D", horizon=1)
+    assert flags[-1] is False
 
 
 def test_forecast_governed_propagates(daily_by_area):

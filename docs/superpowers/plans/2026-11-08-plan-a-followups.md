@@ -55,7 +55,15 @@ Plan A (data and forecasting core) merged from branch `feat/plan-a-data-core`. T
 - Task 3: minor (deferred): set python_enable_replacements=false; validator CTE scope wider than DuckDB (harmless); validate dataset/table/lookup names are plain identifiers in load_dataset; current_setting reveals data paths
 - Task 4: minor (deferred): _is_numeric_type_str substring "int" matches list<int64>; preview separator detection uses "|---" in line; save() not atomic across parquet+card; wide tables drop stats
 - Task 5: minor (deferred): models lack extra="forbid" (YAML typos silently dropped — matters for LLM-drafted calibration in Plan C); no cross-reference validation (metric.filters/dimension.join/series refs); data_issue facts lumped into one quirk; only observed day stored for weekend holidays; recap wording on 176 rows
-- Task 6: minor (deferred): see task-6-review.md minors (8) — e.g. share_pct semantics, compiler size
+- Task 6: minor (deferred), 8 items from the task review:
+  1. neq/not_in and NULLs: settled by ruling (NULLs kept)
+  2. share of non-additive metrics: settled by ruling (error)
+  3. dimension values present only in the comparison period are dropped from compare_to results. Plan B: state it as an answer caveat
+  4. time column is unqualified in compiled SQL (ambiguous if a joined table has the same column). Plan C
+  5. alias capture inside scalar subqueries in metric exprs. Plan C
+  6. filters can't declare the joins they need. Plan C
+  7. resolve.py imports private compiler helpers. Plan B
+  8. YoY without a grain is undocumented. Plan B
 - Task 7: minor (deferred): limit can drop partial period from result; compare_to windows before data start not flagged; describe dimension output no width guard; _period_threshold raises for hour (guarded)
 - Task 8: minor (deferred): multi-id series with missing trailing periods forecast from own last date while origin is global; scaled CRPS from 4 quantiles; adjustment wording differs daily vs monthly; ARIMA convergence warnings in tests
 - Task 9: minor (deferred): 523 AutoARIMA convergence warnings in test output; repeated forecast call recomputes backtest
@@ -64,3 +72,4 @@ Plan A (data and forecasting core) merged from branch `feat/plan-a-data-core`. T
 - Task 11: minor (deferred): _parse_bound via float() loses precision for BIGINT/HUGEINT > 2^53; monthly no-gaps test weak (short series)
 - Task 11: minor (deferred): _is_numeric/_is_integer substring-match type names; one join-overlap query per key × main-column pair
 - Task 12: minor (deferred): grader default rel_tol=1e-6 loosens integer counts unless caller maps tolerance null→exact (only the integration test does); no check that frozen parquet still matches current gold_sql; 6-sig-digit sort key can misalign near-equal rows; build_gold leaves orphan parquets
+- PR #1 CodeRabbit round: minor (deferred): unit tests other than test_config can still pick up a developer .env's ANALYST_ARTIFACTS_DIR (add an autouse conftest fixture that disables env_file); service/replay import private _is_additive/_metric_additive

@@ -7,7 +7,12 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_prefix="ANALYST_", extra="ignore")
+    model_config = SettingsConfigDict(
+        env_prefix="ANALYST_",
+        env_file=".env",
+        env_ignore_empty=True,
+        extra="ignore",
+    )
 
     repo_root: Path = Field(default_factory=lambda: Path(__file__).resolve().parents[2])
     datasets_dir: Path | None = None

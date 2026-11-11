@@ -1,10 +1,10 @@
 # Model replay: daily_trips
 
-Run date: 2026-11-08
+Run date: 2026-11-12
 Dataset: nyc_taxi
 Series: daily_trips
 Cutoffs: 2025-07-31, 2026-01-31, 2026-07-31
-Wall-clock time: 9.822 seconds
+Wall-clock time: 11.174 seconds
 
 ## How to read this
 

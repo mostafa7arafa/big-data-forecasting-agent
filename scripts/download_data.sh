@@ -23,11 +23,31 @@ export -f fetch
 
 fetch "$BASE/misc/taxi_zone_lookup.csv" "$DIR/taxi_zone_lookup.csv"
 
+advance_month() {
+  local ym
+  ym=$1
+  local y=${ym:0:4}
+  local m=${ym:5:2}
+  m=$((10#$m + 1))
+  if (( m > 12 )); then
+    m=1
+    y=$((y + 1))
+  fi
+  printf '%04d-%02d' "$y" "$m"
+}
+
 months=()
-d="$START-01"
-while [[ "${d:0:7}" < "$END" || "${d:0:7}" == "$END" ]]; do
-  months+=("${d:0:7}")
-  d=$(date -d "$d +1 month" +%F)
+ym="$START"
+iter=0
+while :; do
+  months+=("$ym")
+  [[ "$ym" == "$END" ]] && break
+  ym=$(advance_month "$ym")
+  iter=$((iter + 1))
+  if (( iter >= 1000 )); then
+    echo "month list exceeded 1000 iterations (START=$START END=$END)" >&2
+    exit 1
+  fi
 done
 
 printf '%s\n' "${months[@]}" |

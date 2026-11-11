@@ -67,8 +67,8 @@ def _series_record(series, message):
     _record(series.adjustments, prefix + message)
 
 
-def _monthly_gaps(group, quirks, adjustments):
-    """Scale observed monthly totals using the union of inclusive known-gap days."""
+def _monthly_gaps(group, quirks, adjustments, *, additive: bool):
+    """Adjust months overlapping known gaps: scale additive totals, else interpolate."""
     for month in group.index:
         month_end = month + pd.offsets.MonthEnd(0)
         dates = set()
@@ -94,12 +94,17 @@ def _monthly_gaps(group, quirks, adjustments):
             adjustments.append(
                 f"imputed {month:%Y-%m} (known gap: {len(dates)} days {description})"
             )
-        else:
+        elif additive:
             group.loc[month, "y"] *= month.days_in_month / (
                 month.days_in_month - len(dates)
             )
             adjustments.append(
                 f"scaled {month:%Y-%m} for {len(dates)} known-gap days ({description})"
+            )
+        else:
+            group.loc[month, "y"] = np.nan
+            adjustments.append(
+                f"imputed {month:%Y-%m} by interpolation (known gap; metric not additive)"
             )
 
 
@@ -112,13 +117,15 @@ def prepare_series(
     id_col: str | None,
     time_col: str,
     value_col: str,
+    additive: bool = False,
 ) -> PreparedSeries:
     """Normalize, complete the calendar, and interpolate each series independently.
 
     Boundary gaps use the nearest observed value (no extrapolated trend). An
     entirely missing series cannot be imputed and is rejected. Only approved
-    impute quirks apply. Monthly totals are scaled by their observed-day fraction;
-    whole missing months are interpolated. Input is copied.
+    impute quirks apply. Additive monthly metrics are scaled by observed-day fraction;
+    non-additive metrics use interpolation across known gaps. Whole missing months are
+    interpolated. Input is copied.
     """
     _check_freq(freq)
     data_end = pd.Timestamp(data_end)
@@ -177,7 +184,7 @@ def prepare_series(
                 f"imputed {len(dates)} missing values {dates.min().date()}..{dates.max().date()}"
             )
         if freq == "MS":
-            _monthly_gaps(group, quirks, adjustments)
+            _monthly_gaps(group, quirks, adjustments, additive=additive)
         else:
             for quirk in quirks:
                 start, end = (

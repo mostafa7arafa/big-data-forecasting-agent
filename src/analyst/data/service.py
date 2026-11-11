@@ -19,7 +19,13 @@ from analyst.forecasting.core import forecast as run_forecast
 from analyst.forecasting.core import prepare_series
 from analyst.forecasting.models import DEFAULTS
 from analyst.memory.files import load_memory
-from analyst.semantic.compiler import FilterSpec, MetricQuery, compile_query, from_sql
+from analyst.semantic.compiler import (
+    FilterSpec,
+    MetricQuery,
+    _is_additive,
+    compile_query,
+    from_sql,
+)
 from analyst.semantic.model import Memory, SemanticModel
 from analyst.semantic.resolve import resolve_values
 
@@ -163,6 +169,7 @@ class DataService:
             if len(periods) != len(set(periods)):
                 raise ValueError("handle has multiple rows per period; pass id_col")
         t0 = time.perf_counter()
+        additive = query_meta is not None and _metric_additive(self.memory, value_col)
         prepared = prepare_series(
             table.to_pandas(),
             freq=freq,
@@ -171,6 +178,7 @@ class DataService:
             id_col=id_col,
             time_col=time_col,
             value_col=value_col,
+            additive=additive,
         )
         if query_meta is None and prepared.imputed_points > 0.2 * len(prepared.df):
             raise ValueError("more than 20% of series points were imputed; aggregate to the right grain first")
@@ -247,6 +255,16 @@ class DataService:
             notes=notes,
             meta=meta,
         )
+
+
+def _metric_additive(memory: Memory, value_col: str) -> bool:
+    semantic = getattr(memory, "semantic", None)
+    if semantic is None:
+        return False
+    for metric in semantic.metrics:
+        if metric.name == value_col:
+            return _is_additive(metric.expr)
+    return False
 
 
 def _require_columns(columns: list[str], required: list[str]) -> None:

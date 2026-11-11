@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 
 from analyst.data.dataset import DatasetConfig
-from analyst.data.service import DataService
+from analyst.data.service import DataService, _metric_additive
 from analyst.forecasting.core import PreparedSeries, fit_predict, prepare_series
 from analyst.forecasting.models import DEFAULTS, candidate_models
 from analyst.semantic.compiler import MetricQuery
@@ -133,8 +133,14 @@ def replay(
         if frame.empty:
             raise ValueError(f"no ids remain at cutoff {cutoff}; reduce min_share")
         prepared = prepare_series(
-            frame, freq=freq, data_end=service.engine.coverage().end,
-            quirks=service.memory.quirks, id_col="unique_id", time_col="ds", value_col="y",
+            frame,
+            freq=freq,
+            data_end=service.engine.coverage().end,
+            quirks=service.memory.quirks,
+            id_col="unique_id",
+            time_col="ds",
+            value_col="y",
+            additive=_metric_additive(service.memory, value_col),
         )
         for uid, train in prepared.df.groupby("unique_id", sort=False):
             train = train.sort_values("ds")

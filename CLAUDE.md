@@ -4,8 +4,9 @@ An AI data analyst over ~162M NYC taxi trips (DuckDB over Parquet) that answers 
 
 ## Read first
 - Spec (binding): `docs/superpowers/specs/2026-11-07-taxi-analytics-agent-design.md`
-- Current plan: `docs/superpowers/plans/2026-11-07-plan-a-data-and-forecasting-core.md` (Plan A; Plans B–D get written after A lands)
-- Progress ledger (gitignored, the recovery map): `.superpowers/sdd/2026-11-07-plan-a-data-and-forecasting-core/progress.md` — tasks with `Task N: complete` are DONE; every `Ruling:` line is a decision to report to the owner
+- Plan A (data and forecasting core, done): `docs/superpowers/plans/2026-11-07-plan-a-data-and-forecasting-core.md`
+- Plan A rulings and the deferred items that seed Plans B–D: `docs/superpowers/plans/2026-11-08-plan-a-followups.md`
+- While a plan runs, its progress ledger (gitignored, the recovery map) lives at `.superpowers/sdd/<plan-name>/progress.md` — tasks with `Task N: complete` are DONE; every `Ruling:` line is a decision to report to the owner
 - Research: `docs/research/01-04`; web dashboard brief (separate later session): `docs/superpowers/briefs/web-dashboard-brief.md`
 
 ## How we work

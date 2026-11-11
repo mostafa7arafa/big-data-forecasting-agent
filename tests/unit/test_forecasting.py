@@ -331,7 +331,7 @@ def monthly_frame():
     )
 
 
-def prepare_monthly(df, quirks):
+def prepare_monthly(df, quirks, *, additive=True):
     return prepare_series(
         df,
         freq="MS",
@@ -340,6 +340,7 @@ def prepare_monthly(df, quirks):
         time_col="ds",
         value_col="y",
         quirks=quirks,
+        additive=additive,
     )
 
 
@@ -352,6 +353,19 @@ def test_monthly_gap_quirk_scaled_pro_rata():
     assert (
         "scaled 2023-09 for 4 known-gap days (2023-09-21..2023-09-24)"
         in result.adjustments
+    )
+
+
+def test_monthly_gap_quirk_non_additive_interpolated():
+    quirk = Quirk(
+        kind="gap", start=date(2023, 9, 21), end=date(2023, 9, 24), treatment="impute"
+    )
+    result = prepare_monthly(monthly_frame(), [quirk], additive=False)
+    assert result.df.loc[1, "y"] == 100.0
+    assert any(
+        "imputed 2023-09 by interpolation (known gap; metric not additive)"
+        in note
+        for note in result.adjustments
     )
 
 
