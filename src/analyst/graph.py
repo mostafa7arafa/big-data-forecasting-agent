@@ -267,7 +267,7 @@ def build_graph(
             resolve_model(spec),
             tools=DATA_TOOLS,
             middleware=[
-                *analyst_middleware(settings),
+                *analyst_middleware(settings, model=model),
                 AsyncSubAgentMiddleware(async_subagents=[WORKER]),
                 BackgroundGuard(settings.max_background_tasks),
                 *extra,

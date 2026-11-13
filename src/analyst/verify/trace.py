@@ -11,6 +11,7 @@ import pyarrow.types as pat
 from analyst.background import is_background_notification
 from analyst.data.results import ResultStore
 from analyst.errors import UnknownNameError
+from analyst.middleware.compaction import is_compaction_summary
 from analyst.verify.numbers import StatedNumber, intervals, matches
 
 MAX_CELLS = 2000
@@ -147,7 +148,7 @@ def collect_handles(messages, store: ResultStore) -> dict[str, HandleInfo]:
                         loaded.levels,
                     )
             continue
-        if is_background_notification(message):
+        if is_background_notification(message) or is_compaction_summary(message):
             for line in _HANDLES_LINE.findall(_text(message)):
                 for hid in _HANDLE_ID.findall(line):
                     if hid in found:
