@@ -6,7 +6,7 @@ Protocol (newline-delimited JSON over stdin/stdout):
 Exactly one response line per request line, even when user code raises, exits or
 writes to stderr. User stdout/stderr are captured and never reach the protocol stream.
 
-Globals persist between requests. Helpers pre-bound: load(handle_id), save(df, name).
+Globals persist between requests. Pre-bound: pd, np, load(handle_id), save(df, name).
 A bare final expression behaves like a REPL: DataFrames print head(10) plus shape,
 any other non-None value prints its repr.
 
@@ -22,6 +22,7 @@ import re
 import sys
 import traceback
 
+import numpy as np
 import pandas as pd
 
 CAP = 4096
@@ -53,6 +54,8 @@ class Session:
         self._counts: dict[str, int] = {}
         self.ns: dict = {
             "__name__": "__sandbox__",
+            "pd": pd,
+            "np": np,
             "load": self.load,
             "save": self.save,
         }

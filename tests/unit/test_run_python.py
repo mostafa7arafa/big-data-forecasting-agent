@@ -126,9 +126,7 @@ def test_many_columns_truncated_and_content_capped(svc, monkeypatch):
     install(monkeypatch, [ExecResult(True, "z" * 9000, None, [f])])
     msg = invoke("pass")
     assert len(msg.content) <= 4096
-    assert "(+22 more)" in msg.content and msg.content.rstrip().splitlines()[
-        -1
-    ].startswith("handle:")
+    assert "(+22 more)" in msg.content and "handle: r_" in msg.content
 
 
 def test_user_exception_is_error_with_traceback(svc, monkeypatch):
@@ -228,3 +226,22 @@ def test_tool_in_worker_allowlist():
     from analyst import worker
 
     assert "run_python" in worker.WORKER_PROMPT
+
+
+def test_small_frame_rows_echoed_full_precision(svc, monkeypatch):
+    v = 0.08283779943279351
+    f = frame(svc, "c", pa.table({"measure": ["m"], "correlation": [v]}))
+    install(monkeypatch, [ExecResult(True, "", None, [f])])
+    msg = invoke("pass")
+    assert f'  {{"measure": "m", "correlation": {v!r}}}' in msg.content
+    big = frame(svc, "big", pa.table({"x": list(range(6))}), "big.parquet")
+    install(monkeypatch, [ExecResult(True, "", None, [big])])
+    assert '{"x"' not in invoke("pass.").content
+
+
+@pytest.mark.parametrize("restarted", [False, True])
+def test_failed_result_unlinks_staged_frames(svc, monkeypatch, restarted):
+    f = frame(svc, "s", pa.table({"x": [1]}))
+    install(monkeypatch, [ExecResult(False, "", "boom", [f], restarted=restarted)])
+    assert invoke("pass").status == "error"
+    assert not f.path.exists()

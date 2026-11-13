@@ -21,9 +21,12 @@ def stub_for(message: ToolMessage) -> str:
     artifact = message.artifact if isinstance(message.artifact, dict) else {}
     many = artifact.get("handles")
     if not artifact.get("handle_id") and isinstance(many, list):
-        ids = [a["handle_id"] for a in many if isinstance(a, dict) and a.get("handle_id")]
-        if ids:
-            return f"[cleared] {', '.join(ids)} (run_python); call describe('<handle>') to see it again"
+        entries = [a for a in many if isinstance(a, dict) and a.get("handle_id")]
+        if entries:
+            labels = ", ".join(
+                f"{a['handle_id']} ({a.get('produced_by') or 'unknown'})" for a in entries
+            )
+            return f"[cleared] {labels}; call describe('<handle>') to see it again"
     handle_id = artifact.get("handle_id")
     if not handle_id:
         return DEFAULT_STUB

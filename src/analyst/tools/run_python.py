@@ -1,6 +1,7 @@
 """CodeAct tool: run model-written Python in the per-thread sandbox."""
 
 import hashlib
+import json
 import time
 
 import pyarrow.parquet as pq
@@ -22,6 +23,7 @@ from analyst.tools._common import (
 
 MAX_CODE_CHARS = 20_000
 MAX_CARD_COLUMNS = 8
+MAX_ECHO_ROWS = 5
 _LOST = "variables were lost; reload handles with load()"
 _CODE_ERROR_HINT = (
     "fix the code and run it again; variables from earlier cells are still defined"
@@ -77,6 +79,10 @@ def _ingest(
             f"handle: {card.handle_id}  rows: {table.num_rows}  "
             f"columns: {_columns(table.column_names)}"
         )
+        if table.num_rows <= MAX_ECHO_ROWS:
+            # Full precision, so the model can cite values exactly as stored.
+            for row in table.to_pylist():
+                lines.append("  " + json.dumps(row, default=str))
         artifacts.append(
             {
                 "handle_id": card.handle_id,

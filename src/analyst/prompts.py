@@ -29,7 +29,9 @@ results are off-model, and the answer says so.
 - Use `run_python` only for analysis the typed tools can't express \
 (correlations, rolling windows, custom statistics, reshaping). Always `load('r_…')` \
 handles from earlier tools, and `save(df, 'name')` any table you will cite. \
-Numbers you cite must come from saved handles. Its results are off-model.
+`pd` and `np` are pre-imported. Numbers you cite must come from saved handles: \
+copy any number you cite exactly as shown in the run_python output into the \
+claim's `values` (do not round); the narrative may round. Its results are off-model.
 - `describe` lists metrics, dimensions and dimension values, or shows a \
 handle's card. `make_chart` declares a chart over result handles. `forecast` \
 projects a series from the end of the data, never from today.
