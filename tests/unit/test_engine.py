@@ -177,3 +177,34 @@ def test_malformed_ast_raises_query_error(synthetic_dataset, ast):
     engine._con = connection
     with pytest.raises(QueryError):
         engine._validate_sql("select 1")
+
+
+def test_columns_runs_on_a_cursor_inside_the_gate(synthetic_dataset, monkeypatch):
+    from contextlib import contextmanager
+
+    import analyst.data.engine as engine_module
+
+    engine = Engine(synthetic_dataset)
+    entered: list[str] = []
+
+    class Gate:
+        @contextmanager
+        def slot(self):
+            entered.append("slot")
+            yield
+
+    class Con:
+        def __init__(self, con):
+            self._con = con
+
+        def cursor(self):
+            entered.append("cursor")
+            return self._con.cursor()
+
+        def sql(self, *args, **kwargs):
+            raise AssertionError("columns() must use a per-call cursor")
+
+    monkeypatch.setattr(engine_module, "get_gate", lambda: Gate())
+    engine._con = Con(engine._con)
+    assert ("note", "VARCHAR") in engine.columns()
+    assert entered == ["slot", "cursor"]

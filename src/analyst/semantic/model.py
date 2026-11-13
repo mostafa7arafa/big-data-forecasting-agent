@@ -5,6 +5,8 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
+from analyst.errors import UnknownNameError
+
 
 class MemoryItem(BaseModel):
     source: Literal["profile", "llm", "owner", "feedback"] = "owner"
@@ -81,6 +83,11 @@ class Quirk(MemoryItem):
     description: str = ""
     treatment: Literal["impute", "flag", "exclude"] | None = None
 
+    @property
+    def id(self) -> str:
+        """Stable id, e.g. ``gap:2023-09-21``: kind plus start date."""
+        return f"{self.kind}:{self.start.isoformat()}"
+
 
 class SeriesSpec(MemoryItem):
     name: str
@@ -98,6 +105,14 @@ class ContextFact(MemoryItem):
     label: str
     kind: Literal["holiday", "policy", "data"]
 
+    @property
+    def id(self) -> str:
+        """Stable citation id, e.g. ``policy:2025-01-05``: kind plus date.
+
+        Claims cite this id (``fact_ids``) instead of the prose label.
+        """
+        return f"{self.kind}:{self.date.isoformat()}"
+
 
 class Memory(BaseModel):
     semantic: SemanticModel
@@ -105,6 +120,25 @@ class Memory(BaseModel):
     series: list[SeriesSpec]
     context_facts: list[ContextFact]
     recap: str
+
+    def as_of(self, cutoff: date | None) -> "Memory":
+        """The memory as it stood at ``cutoff``.
+
+        Dated items whose start/date falls after the cutoff are dropped; an
+        item that starts before it is kept even when it ends later. The recap
+        is free prose and cannot be date-filtered, so it is emptied.
+        """
+        if cutoff is None:
+            return self
+        return self.model_copy(
+            update={
+                "quirks": [item for item in self.quirks if item.start <= cutoff],
+                "context_facts": [
+                    item for item in self.context_facts if item.date <= cutoff
+                ],
+                "recap": "",
+            }
+        )
 
 
 def _match[T: Dimension | Metric](items: list[T], name: str, kind: str) -> T:
@@ -114,4 +148,7 @@ def _match[T: Dimension | Metric](items: list[T], name: str, kind: str) -> T:
         if any(label.casefold() == needle for label in labels):
             return item
     available = ", ".join(item.name for item in items)
-    raise KeyError(f"unknown {kind} {name!r}; available: {available}")
+    raise UnknownNameError(
+        f"unknown {kind} {name!r}; available: {available}",
+        hint=f"call describe('{kind}s')",
+    )

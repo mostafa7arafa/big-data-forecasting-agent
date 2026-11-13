@@ -11,6 +11,7 @@ from typing import Literal, Self
 
 from pydantic import BaseModel, Field, model_validator
 
+from analyst.errors import InvalidRequestError
 from analyst.semantic.model import Dimension, MemoryItem, Metric, SemanticModel
 
 
@@ -22,7 +23,7 @@ class FilterSpec(BaseModel):
     @model_validator(mode="after")
     def _arity(self) -> Self:
         if self.op in {"eq", "neq"} and len(self.values) != 1:
-            raise ValueError("eq/neq filters require exactly one value")
+            raise InvalidRequestError("eq/neq filters require exactly one value")
         return self
 
 
@@ -32,7 +33,18 @@ class MetricQuery(BaseModel):
     filters: list[FilterSpec] = Field(default_factory=list)
     grain: Literal["hour", "day", "week", "month"] | None = None
     time_range: tuple[date, date] | None = None
-    compare_to: Literal["previous_period", "same_period_last_year"] | None = None
+    compare_to: Literal["previous_period", "same_period_last_year"] | None = Field(
+        default=None,
+        description=(
+            "previous_period compares with the immediately preceding equal-length "
+            "range. same_period_last_year compares with the range about one year "
+            "earlier: shifted 364 days for hour/day grain and 52 weeks for week "
+            "grain (weekday-aligned, so Jan 1-2 compares with the same weekdays, "
+            "not the same dates), and 12 months (same calendar dates) for month "
+            "grain or no grain; with no grain, the whole time_range is compared "
+            "with the same range one year earlier, as one total."
+        ),
+    )
     share: bool = False
     order_by: str | None = None
     order_desc: bool = False
@@ -41,13 +53,13 @@ class MetricQuery(BaseModel):
     @model_validator(mode="after")
     def _range(self) -> Self:
         if self.time_range is not None and self.time_range[0] >= self.time_range[1]:
-            raise ValueError("time_range must have start before end")
+            raise InvalidRequestError("time_range must have start before end")
         return self
 
 
 def _identifier(name: str) -> str:
     if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
-        raise ValueError(f"invalid SQL identifier: {name!r}")
+        raise InvalidRequestError(f"invalid SQL identifier: {name!r}")
     return f'"{name}"'
 
 
@@ -57,9 +69,11 @@ def _literal(value: str | int) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
-def _approved(item: MemoryItem, name: str, allow_proposed: bool) -> None:
+def approved(item: MemoryItem, name: str, allow_proposed: bool) -> None:
     if item.status != "approved" and not allow_proposed:
-        raise ValueError(f"{name!r} is {item.status}; only approved items may be used")
+        raise InvalidRequestError(
+            f"{name!r} is {item.status}; only approved items may be used"
+        )
 
 
 def from_sql(
@@ -71,9 +85,9 @@ def from_sql(
     joins = {join.name: join for join in model.joins}
     for name in sorted(required):
         if name not in joins:
-            raise ValueError(f"unknown join {name!r}")
+            raise InvalidRequestError(f"unknown join {name!r}")
         join = joins[name]
-        _approved(join, join.name, allow_proposed)
+        approved(join, join.name, allow_proposed)
         sql += (
             f"\nLEFT JOIN main.{_identifier(join.table)} AS {_identifier(join.name)}"
             f" ON {join.on}"
@@ -134,7 +148,7 @@ def _previous_period_shift(start: date, end: date, grain: str | None) -> str:
     if (grain == "month" and unit != "MONTH") or (
         grain == "week" and (unit == "MONTH" or (unit == "DAY" and days % 7))
     ):
-        raise ValueError(f"previous_period range must align to whole {grain}s")
+        raise InvalidRequestError(f"previous_period range must align to whole {grain}s")
     return f"INTERVAL {amount} {unit}"
 
 
@@ -147,9 +161,12 @@ def _metric_predicates(
         parts = []
         for name in metric.filters:
             if name not in filters:
-                raise ValueError(f"unknown metric filter {name!r}")
+                raise InvalidRequestError(
+                    f"unknown metric filter {name!r}",
+                    hint="call describe('metrics')",
+                )
             item = filters[name]
-            _approved(item, name, allow_proposed)
+            approved(item, name, allow_proposed)
             parts.append(f"({item.expr})")
         predicates[metric.name] = " AND ".join(parts)
     return predicates
@@ -240,14 +257,17 @@ def compile_query(
 ) -> str:
     """Return a single SELECT, with canonical model names as output aliases."""
     if q.compare_to and q.time_range is None:
-        raise ValueError("compare_to requires time_range")
+        raise InvalidRequestError("compare_to requires time_range")
     if q.grain and q.grain not in model.time_dimension.grains:
-        raise ValueError(f"unsupported grain {q.grain!r}")
+        raise InvalidRequestError(
+            f"unsupported grain {q.grain!r}",
+            hint="call describe('dimensions') for the supported grains",
+        )
     metrics = [model.metric(name) for name in q.metrics]
     dimensions = [model.dimension(name) for name in q.dimensions]
     filter_dimensions = [model.dimension(spec.dimension) for spec in q.filters]
     for item in [*metrics, *dimensions, *filter_dimensions]:
-        _approved(item, item.name, allow_proposed)
+        approved(item, item.name, allow_proposed)
         _identifier(item.name)
     source = from_sql(
         model, dimensions + filter_dimensions, allow_proposed=allow_proposed
@@ -256,7 +276,7 @@ def compile_query(
     if q.share:
         for metric in metrics:
             if not _is_additive(metric.expr):
-                raise ValueError(
+                raise InvalidRequestError(
                     "share is only defined for additive metrics (sum/count): "
                     + metric.name
                 )
@@ -272,9 +292,9 @@ def compile_query(
     for name in output:
         _identifier(name)
     if len({name.casefold() for name in output}) != len(output):
-        raise ValueError("duplicate output column names")
+        raise InvalidRequestError("duplicate output column names")
     if q.order_by is not None and q.order_by not in output:
-        raise ValueError(f"order_by must be an output column: {', '.join(output)}")
+        raise InvalidRequestError(f"order_by must be an output column: {', '.join(output)}")
 
     where = [
         _filter_sql(spec, dim)

@@ -1,5 +1,6 @@
 """Dataset-independent, engine-enforced cutoff replay of every candidate model."""
 
+import warnings
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
@@ -22,6 +23,7 @@ class ReplayReport:
     horizons: dict[date, int] = field(default_factory=dict)
     dropped_ids: list[dict] = field(default_factory=list)
     failed_fits: list[dict] = field(default_factory=list)
+    adjustments: list[str] = field(default_factory=list)
 
 
 def cutoff_scores(report: ReplayReport) -> pd.DataFrame:
@@ -106,6 +108,7 @@ def replay(
     truth = _query_frame(full, query, id_col, value_col)
     data_end = pd.Timestamp(full.engine.coverage().end)
     rows, dropped_ids, failed_fits = [], [], []
+    arima_warnings = 0
     horizons = {}
     season = DEFAULTS[freq]["season"]
     for cutoff in cutoffs:
@@ -163,10 +166,19 @@ def replay(
                     **dict.fromkeys(SCORE_COLUMNS, np.nan),
                 }
                 try:
-                    predictions = fit_predict(
-                        PreparedSeries(train, prepared.adjustments), freq=freq,
-                        horizon=fit_horizon, models=[model], levels=(80, 95), n_jobs=n_jobs,
-                    ).set_index("ds").reindex(dates)
+                    with warnings.catch_warnings(record=True) as caught:
+                        warnings.simplefilter("always")
+                        predictions = fit_predict(
+                            PreparedSeries(train, prepared.adjustments), freq=freq,
+                            horizon=fit_horizon, models=[model], levels=(80, 95), n_jobs=n_jobs,
+                        ).set_index("ds").reindex(dates)
+                    for w in caught:
+                        if "possible convergence problem" in str(w.message):
+                            arima_warnings += 1
+                        else:
+                            warnings.warn_explicit(
+                                w.message, w.category, w.filename, w.lineno
+                            )
                     forecast_columns = [name, *[f"{name}-{side}-{level}"
                                                for level in (80, 95) for side in ("lo", "hi")]]
                     if not np.isfinite(predictions[forecast_columns].to_numpy(dtype=float)).all():
@@ -191,7 +203,10 @@ def replay(
             for row in id_rows:
                 row["relative_mae"] = _ratio(row["mae"], baseline, perfect=1.0)
             rows.extend(id_rows)
+    # Suppressed above to keep output readable; reported here as one adjustment.
+    adjustments = [f"AutoARIMA: {arima_warnings} convergence warnings"] if arima_warnings else []
     return ReplayReport(pd.DataFrame(rows, columns=[
         "cutoff", "unique_id", "model", *SCORE_COLUMNS, "train_end", "horizon",
         "scored_points", "forecast_mean", "actual_mean",
-    ]), horizons=horizons, dropped_ids=dropped_ids, failed_fits=failed_fits)
+    ]), horizons=horizons, dropped_ids=dropped_ids, failed_fits=failed_fits,
+        adjustments=adjustments)

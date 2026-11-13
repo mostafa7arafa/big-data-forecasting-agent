@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -14,11 +15,14 @@ import pyarrow as pa
 from analyst.config import get_settings
 from analyst.data.dataset import DatasetConfig
 from analyst.data.engine import Coverage, Engine
+from analyst.data.gate import get_gate
 from analyst.data.results import ResultStore, SummaryCard, is_result_handle_id
+from analyst.errors import InvalidRequestError, UnknownNameError
+from analyst.forecasting.core import ProgressFn, prepare_series
 from analyst.forecasting.core import forecast as run_forecast
-from analyst.forecasting.core import prepare_series
-from analyst.forecasting.models import DEFAULTS
+from analyst.forecasting.models import DEFAULTS, candidate_models
 from analyst.memory.files import load_memory
+from analyst.memory.knowledge import describe_dimensions, describe_metrics
 from analyst.semantic.compiler import (
     FilterSpec,
     MetricQuery,
@@ -48,6 +52,21 @@ _SCORE_FIELDS = (
 )
 _BASELINE_NOTE = "no model beat the seasonal baseline"
 _BACKTEST_SERIES_LIMIT = 5
+_FORECAST_LEVELS = (80, 95)
+_VALUE_LIMIT = 50
+# Same id-share rule as analyst.forecasting.replay.min_share.
+_MIN_HEADLINE_SHARE = 0.01
+_HEADLINE_RULE = "ids with ≥ 1% share of total"
+# Seconds per (series id x backtest window); rough single-core estimates.
+_WINDOW_COST_S = {"D": 0.6, "MS": 0.05}
+
+_forecast_locks: dict[str, threading.Lock] = {}
+_forecast_locks_guard = threading.Lock()
+
+
+def _forecast_lock(key: str) -> threading.Lock:
+    with _forecast_locks_guard:
+        return _forecast_locks.setdefault(key, threading.Lock())
 
 _DESCRIBE_TARGETS = (
     "metrics",
@@ -121,9 +140,9 @@ class DataService:
         if is_result_handle_id(target) and self.store.exists(target):
             return self.store.card(target).render()
         if target == "metrics":
-            return _describe_metrics(self.memory.semantic)
+            return describe_metrics(self.memory.semantic)
         if target == "dimensions":
-            return _describe_dimensions(self.memory.semantic)
+            return describe_dimensions(self.memory.semantic)
         if target.startswith("dimension:"):
             name = target.split(":", 1)[1]
             try:
@@ -132,15 +151,120 @@ class DataService:
                 )
             except KeyError as exc:
                 available = ", ".join(d.name for d in self.memory.semantic.dimensions)
-                raise ValueError(
-                    f"unknown dimension {name!r}; valid dimensions: {available}"
+                raise InvalidRequestError(
+                    f"unknown dimension {name!r}; valid dimensions: {available}",
+                    hint="call describe('dimensions')",
                 ) from exc
         if target == "schema":
             return _describe_schema(self.engine)
         if target == "coverage":
             return _describe_coverage(self.engine)
         choices = ", ".join(_DESCRIBE_TARGETS)
-        raise ValueError(f"unknown describe target {target!r}; valid: {choices}")
+        raise InvalidRequestError(
+            f"unknown describe target {target!r}; valid: {choices}",
+            hint=f"call describe('metrics') with one of: {choices}",
+        )
+
+    def _forecast_source(
+        self,
+        handle_id: str,
+        *,
+        freq: str,
+        horizon: int,
+        value_col: str,
+        id_col: str | None,
+        time_col: str,
+        levels,
+    ) -> tuple[str, list | None]:
+        """Cache key plus the candidate models it was built from."""
+        query_meta = self.store.card(handle_id).meta.get("query")
+        models, names, candidates_source = self._candidates(
+            value_col=value_col, id_col=id_col, freq=freq, query_meta=query_meta
+        )
+        source = json.dumps(
+            {
+                "input_handle": handle_id,
+                "freq": freq,
+                "horizon": horizon,
+                "value_col": value_col,
+                "id_col": id_col,
+                "time_col": time_col,
+                "levels": sorted(levels),
+                "candidates": names,
+                "candidates_source": candidates_source,
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        return source, models
+
+    def forecast_is_cached(
+        self,
+        handle_id: str,
+        *,
+        value_col: str,
+        id_col: str | None,
+        freq: Literal["D", "MS"],
+        horizon: int | None = None,
+        time_col: str = "period",
+    ) -> bool:
+        if horizon is None:
+            horizon = DEFAULTS[freq]["horizon"]
+        try:
+            source, _ = self._forecast_source(
+                handle_id,
+                freq=freq,
+                horizon=horizon,
+                value_col=value_col,
+                id_col=id_col,
+                time_col=time_col,
+                levels=_FORECAST_LEVELS,
+            )
+        except UnknownNameError:
+            return False
+        return self.store.lookup("forecast", source) is not None
+
+    def estimate_forecast_s(
+        self, handle_id: str, *, id_col: str | None, freq: Literal["D", "MS"]
+    ) -> float:
+        """Rough wall-clock seconds for an uncached forecast of this handle."""
+        n_ids = 1
+        if id_col is not None:
+            table = self.store.load(handle_id)
+            _require_columns(table.column_names, [id_col])
+            n_ids = max(len(set(table.column(id_col).to_pylist())), 1)
+        windows = DEFAULTS[freq]["n_windows"]
+        return n_ids * windows * _WINDOW_COST_S[freq]
+
+    def _candidates(
+        self,
+        *,
+        value_col: str,
+        id_col: str | None,
+        freq: str,
+        query_meta: dict | None,
+    ) -> tuple[list | None, list[str], str]:
+        """Models for the matching series spec, else the defaults."""
+        defaults = candidate_models(freq)
+        if id_col is None:
+            dims: list[str] = []
+        elif query_meta is not None and id_col not in query_meta.get("dimensions", []):
+            return None, [str(m) for m in defaults], "default"
+        else:
+            dims = [id_col]
+        for spec in self.memory.series:
+            if spec.metric != value_col or spec.freq != freq or spec.dimensions != dims:
+                continue
+            wanted = set(spec.recommended_models)
+            chosen = [m for m in defaults if str(m) in wanted and str(m) != "SeasonalNaive"]
+            if not chosen:
+                break
+            ordered = [m for name in spec.recommended_models for m in chosen if str(m) == name]
+            baseline = next(m for m in defaults if str(m) == "SeasonalNaive")
+            models = [*dict.fromkeys(ordered), baseline]
+            status = spec.recommended_models_status or "proposed"
+            return models, [str(m) for m in models], f"series:{spec.name} ({status})"
+        return None, [str(m) for m in defaults], "default"
 
     def forecast(
         self,
@@ -152,14 +276,69 @@ class DataService:
         freq: Literal["D", "MS"],
         horizon: int | None = None,
         levels: tuple[int, int] = (80, 95),
+        progress: ProgressFn | None = None,
+        budget_s: float | None = None,
     ) -> SummaryCard:
+        if sorted(levels) != list(_FORECAST_LEVELS):
+            raise InvalidRequestError(
+                "forecast levels must be (80, 95)",
+                hint="omit levels; intervals are always 80% and 95%",
+            )
         if horizon is None:
             horizon = DEFAULTS[freq]["horizon"]
+        source, models = self._forecast_source(
+            handle_id,
+            freq=freq,
+            horizon=horizon,
+            value_col=value_col,
+            id_col=id_col,
+            time_col=time_col,
+            levels=levels,
+        )
+        cached = self.store.lookup("forecast", source)
+        if cached is not None:
+            return cached
+        with _forecast_lock(f"{self.store._root}\0{source}"):
+            cached = self.store.lookup("forecast", source)
+            if cached is not None:
+                return cached
+            return self._compute_forecast(
+                handle_id,
+                source=source,
+                models=models,
+                time_col=time_col,
+                value_col=value_col,
+                id_col=id_col,
+                freq=freq,
+                horizon=horizon,
+                levels=levels,
+                progress=progress,
+                budget_s=budget_s,
+            )
+
+    def _compute_forecast(
+        self,
+        handle_id: str,
+        *,
+        source: str,
+        models: list | None,
+        time_col: str,
+        value_col: str,
+        id_col: str | None,
+        freq: Literal["D", "MS"],
+        horizon: int,
+        levels: tuple[int, int],
+        progress: ProgressFn | None,
+        budget_s: float | None,
+    ) -> SummaryCard:
         table = self.store.load(handle_id)
         input_card = self.store.card(handle_id)
         query_meta = input_card.meta.get("query")
         if query_meta is not None and {"day": "D", "month": "MS"}.get(query_meta.get("grain")) != freq:
-            raise ValueError("forecast supports query grain/frequency pairs day→D and month→MS only")
+            raise InvalidRequestError(
+                "forecast supports query grain/frequency pairs day→D and month→MS only",
+                hint="query at day grain for freq D, month grain for freq MS",
+            )
         _require_columns(
             table.column_names,
             [time_col, value_col, *([id_col] if id_col else [])],
@@ -167,7 +346,10 @@ class DataService:
         if id_col is None:
             periods = table.column(time_col).to_pylist()
             if len(periods) != len(set(periods)):
-                raise ValueError("handle has multiple rows per period; pass id_col")
+                raise InvalidRequestError(
+                    "handle has multiple rows per period; pass id_col",
+                    hint="pass id_col so each id is forecast as its own series",
+                )
         t0 = time.perf_counter()
         additive = query_meta is not None and _metric_additive(self.memory, value_col)
         prepared = prepare_series(
@@ -181,7 +363,10 @@ class DataService:
             additive=additive,
         )
         if query_meta is None and prepared.imputed_points > 0.2 * len(prepared.df):
-            raise ValueError("more than 20% of series points were imputed; aggregate to the right grain first")
+            raise InvalidRequestError(
+                "more than 20% of series points were imputed; aggregate to the right grain first",
+                hint="aggregate to the right grain first, or query a wider time range",
+            )
         data_end = pd.Timestamp(self.engine.coverage().end)
         complete_end = data_end.to_period("D" if freq == "D" else "M").start_time
         boundary = (
@@ -191,7 +376,7 @@ class DataService:
             complete_end -= pd.tseries.frequencies.to_offset(freq)
         series_end = prepared.df.ds.max()
         if series_end < complete_end:
-            raise ValueError(
+            raise InvalidRequestError(
                 f"handle ends {series_end.date()} but data runs to {complete_end.date()}; "
                 "re-query without an earlier end (forecast origin must be the end of data)"
             )
@@ -200,39 +385,47 @@ class DataService:
                 prepared.adjustments.append(
                     f"{uid} ends {end.date()}, before the series end {series_end.date()}"
                 )
-        run = run_forecast(
-            prepared,
-            freq=freq,
-            horizon=horizon,
-            levels=levels,
-            n_jobs=1,
+        _, candidate_names, candidates_source = self._candidates(
+            value_col=value_col, id_col=id_col, freq=freq, query_meta=query_meta
         )
+        if budget_s is None:
+            budget_s = get_settings().forecast_budget_s
+        # Fitting counts against the process-wide concurrency cap.
+        with get_gate().slot():
+            run = run_forecast(
+                prepared,
+                freq=freq,
+                horizon=horizon,
+                levels=levels,
+                models=models,
+                n_jobs=1,
+                progress=progress,
+                budget_s=budget_s,
+            )
         elapsed_s = time.perf_counter() - t0
         notes = list(run.adjustments)
         if not run.backtest.beats_baseline and _BASELINE_NOTE not in notes:
             notes.append(_BASELINE_NOTE)
         frame = run.forecast.loc[:, list(_FORECAST_COLUMNS)]
         forecast_table = pa.Table.from_pandas(frame, preserve_index=False)
-        source = json.dumps(
-            {
-                "input_handle": handle_id,
-                "freq": freq,
-                "horizon": horizon,
-                "value_col": value_col,
-                "id_col": id_col,
-                "time_col": time_col,
-                "levels": list(levels),
-            },
-            separators=(",", ":"),
-            sort_keys=True,
-        )
         kept = _kept_scores(run.backtest.scores, run.model)
+        headline_ids = _headline_ids(table, id_col=id_col, value_col=value_col)
+        headline_kept = kept.loc[kept["unique_id"].map(str).isin(set(headline_ids))]
+        # A budget-truncated run is returned but never served from the cache.
+        complete = run.backtest.windows_used >= run.backtest.windows
+        # The evaluated windows are part of the handle identity, so a partial
+        # run and a later complete retry never overwrite each other.
         backtest_card = self.store.save(
             pa.Table.from_pandas(kept, preserve_index=False),
             produced_by="backtest",
             source=source + ":backtest",
             governed=input_card.governed,
             elapsed_s=elapsed_s,
+            meta={
+                "windows_used": int(run.backtest.windows_used),
+                "windows": int(run.backtest.windows),
+            },
+            index=complete,
         )
         meta = {
             "model": run.model,
@@ -241,8 +434,17 @@ class DataService:
             "freq": freq,
             "beats_baseline": bool(run.backtest.beats_baseline),
             "backtest_handle": backtest_card.handle_id,
-            "backtest_summary": _backtest_summary(kept, run.model),
+            "backtest_summary": _backtest_summary(
+                headline_kept if len(headline_kept) else kept, run.model
+            ),
             "input_handle": handle_id,
+            "cutoff": self.engine.cutoff.isoformat() if self.engine.cutoff else None,
+            "data_end": data_end.isoformat(),
+            "windows_used": int(run.backtest.windows_used),
+            "candidates": candidate_names,
+            "candidates_source": candidates_source,
+            "headline_ids": headline_ids,
+            "headline_rule": _HEADLINE_RULE,
         }
         if kept["unique_id"].nunique() <= _BACKTEST_SERIES_LIMIT:
             meta["backtest"] = _backtest_rows(kept)
@@ -254,6 +456,7 @@ class DataService:
             elapsed_s=elapsed_s,
             notes=notes,
             meta=meta,
+            index=complete,
         )
 
 
@@ -272,7 +475,10 @@ def _require_columns(columns: list[str], required: list[str]) -> None:
     if missing:
         available = ", ".join(columns)
         unknown = ", ".join(missing)
-        raise ValueError(f"unknown column(s): {unknown}; columns: {available}")
+        raise InvalidRequestError(
+            f"unknown column(s): {unknown}; columns: {available}",
+            hint="use the output column names of the handle",
+        )
 
 
 def _kept_scores(scores, best_model: str):
@@ -312,32 +518,6 @@ def _backtest_rows(kept) -> list[dict]:
     return rows
 
 
-def _describe_metrics(model: SemanticModel) -> str:
-    lines: list[str] = []
-    for metric in model.metrics:
-        parts = [metric.name]
-        if metric.synonyms:
-            parts.append(f"synonyms={metric.synonyms}")
-        if metric.unit:
-            parts.append(f"unit={metric.unit}")
-        if metric.description:
-            parts.append(metric.description)
-        lines.append(": ".join(parts))
-    return "\n".join(lines)
-
-
-def _describe_dimensions(model: SemanticModel) -> str:
-    lines: list[str] = []
-    for dimension in model.dimensions:
-        parts = [dimension.name]
-        if dimension.synonyms:
-            parts.append(f"synonyms={dimension.synonyms}")
-        if dimension.description:
-            parts.append(dimension.description)
-        lines.append(": ".join(parts))
-    return "\n".join(lines)
-
-
 def _describe_dimension_values(
     engine: Engine, model: SemanticModel, name: str
 ) -> str:
@@ -345,10 +525,16 @@ def _describe_dimension_values(
     source = from_sql(model, [dimension])
     sql = (
         f"SELECT {dimension.expr} AS value, count(*) AS n\n{source}\n"
-        "GROUP BY 1\nORDER BY n DESC\nLIMIT 50"
+        f"GROUP BY 1\nORDER BY n DESC\nLIMIT {_VALUE_LIMIT}"
     )
     table = engine.execute(sql)
     lines = [f"{row['value']}\t{row['n']}" for row in table.to_pylist()]
+    if table.num_rows >= _VALUE_LIMIT:
+        total = engine.execute(
+            f"SELECT count(DISTINCT {dimension.expr}) AS n\n{source}"
+        )[0][0].as_py()
+        if total > _VALUE_LIMIT:
+            lines.insert(0, f"showing {_VALUE_LIMIT} of {total} values")
     return "\n".join(lines)
 
 
@@ -370,6 +556,21 @@ def _format_bound(dt: datetime) -> str:
     if dt.hour == 0 and dt.minute == 0 and dt.second == 0 and dt.microsecond == 0:
         return dt.date().isoformat()
     return dt.strftime("%Y-%m-%d %H:%M")
+
+
+def _headline_ids(
+    table: pa.Table, *, id_col: str | None, value_col: str
+) -> list[str]:
+    """Ids whose total is at least 1% of the headline total."""
+    if id_col is None:
+        return ["series"]
+    frame = table.select([id_col, value_col]).to_pandas()
+    totals = frame.groupby(id_col)[value_col].sum()
+    shares = totals / totals.sum()
+    headline = totals[shares >= _MIN_HEADLINE_SHARE]
+    # A degenerate total (all zero/negative) cannot rank ids; keep every id.
+    wanted = headline.index if not headline.empty else totals.index
+    return [str(uid) for uid in wanted]
 
 
 def _coverage_notes(
@@ -405,7 +606,54 @@ def _coverage_notes(
                 f"(data ends {_format_bound(cov.end)})"
             )
             extra["partial_last_period"] = period_label
+    if (
+        q.time_range is not None
+        and q.grain in {"week", "month"}
+        and table.num_rows > 0
+        and "period" in table.column_names
+    ):
+        start, end = q.time_range
+        first_period = _min_period(table.column("period"))
+        last_period = _max_period(table.column("period"))
+        if first_period is not None and datetime.combine(
+            start, datetime.min.time()
+        ) > _period_start(first_period, q.grain):
+            notes.append(
+                f"{_grain_label(first_period, q.grain)} is partial: "
+                f"time_range starts {start.isoformat()}"
+            )
+        if last_period is not None and datetime.combine(
+            end, datetime.min.time()
+        ) <= _period_threshold(last_period, q.grain):
+            notes.append(
+                f"{_grain_label(last_period, q.grain)} is partial: "
+                f"time_range ends {end.isoformat()}"
+            )
     return notes, extra
+
+
+def _min_period(column: pa.ChunkedArray) -> date | datetime | None:
+    values = [v for v in column.to_pylist() if v is not None]
+    if not values:
+        return None
+    return min(values)
+
+
+def _period_start(period: date | datetime, grain: str) -> datetime:
+    if isinstance(period, datetime):
+        period = period.date()
+    if grain == "month":
+        return datetime(period.year, period.month, 1)
+    if grain == "week":
+        monday = period - timedelta(days=period.weekday())
+        return datetime.combine(monday, datetime.min.time())
+    return datetime.combine(period, datetime.min.time())
+
+
+def _grain_label(period: date | datetime, grain: str) -> str:
+    if grain == "month":
+        return f"{period:%Y-%m}"
+    return _period_label(period)
 
 
 def _max_period(column: pa.ChunkedArray) -> date | datetime | None:
@@ -436,7 +684,7 @@ def _period_threshold(period: date | datetime, grain: str) -> datetime:
     elif grain == "day":
         next_start = period + timedelta(days=1)
     else:
-        raise ValueError(f"unsupported grain {grain!r}")
+        raise InvalidRequestError(f"unsupported grain {grain!r}")
     return datetime.combine(next_start, datetime.min.time()) - timedelta(hours=1)
 
 

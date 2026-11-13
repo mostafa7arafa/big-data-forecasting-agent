@@ -1,6 +1,7 @@
 """Read-only, bounded SQL access to a configured dataset."""
 
 import json
+import os
 import re
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -9,10 +10,15 @@ from threading import Timer
 import duckdb
 import pyarrow as pa
 
+from analyst.config import get_settings
 from analyst.data.dataset import DatasetConfig
+from analyst.data.gate import get_gate
+from analyst.errors import AnalystError
+
+VIEWS_HINT = "use only the dataset views listed by describe('schema')"
 
 
-class QueryError(Exception):
+class QueryError(AnalystError):
     """A rejected, failed, or resource-limited query."""
 
 
@@ -82,13 +88,17 @@ class Engine:
         self._con.execute(f"SET allowed_directories=[{directories}]")
         self._con.execute("SET enable_external_access=false")
         self._con.execute("SET memory_limit='8GB'")
+        # threads is database-wide: split the cores across gated queries.
+        threads = max(2, (os.cpu_count() or 2) // get_settings().max_concurrent_queries)
+        self._con.execute(f"SET threads={threads}")
         self._con.execute("SET lock_configuration=true")
 
-    def _validate_sql(self, sql: str) -> None:
+    def _validate_sql(self, sql: str, con: duckdb.DuckDBPyConnection | None = None) -> None:
+        con = con or self._con
         message = "query may only read the dataset views: " + ", ".join(self._view_names)
         try:
             # Fully consume this result before executing the user's relation.
-            rows = self._con.execute("SELECT json_serialize_sql(?)", [sql]).fetchall()
+            rows = con.execute("SELECT json_serialize_sql(?)", [sql]).fetchall()
             ast = json.loads(rows[0][0])
             if ast.get("error"):
                 raise QueryError(ast["error_message"].splitlines()[0])
@@ -103,7 +113,7 @@ class Engine:
                     for entry in node.get("cte_map", {}).get("map", []):
                         name = entry["key"]
                         if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
-                            raise QueryError(message)
+                            raise QueryError(message, hint=VIEWS_HINT)
                         cte_names.append(name.casefold())
                     visible_tables = visible_tables.union(cte_names)
 
@@ -117,30 +127,40 @@ class Engine:
                                 for key in ("schema_name", "catalog_name")
                             )
                         ):
-                            raise QueryError(message)
+                            raise QueryError(message, hint=VIEWS_HINT)
                     elif (
                         node.get("type") == "TABLE_FUNCTION"
                         and node["function"]["function_name"].casefold()
                         not in {"range", "generate_series", "unnest"}
                     ):
-                        raise QueryError(message)
+                        raise QueryError(message, hint=VIEWS_HINT)
                     pending.extend((child, visible_tables) for child in node.values())
                 elif isinstance(node, list):
                     pending.extend((child, visible_tables) for child in node)
         except (KeyError, TypeError, AttributeError, IndexError, ValueError) as exc:
             # Fail closed if the serializer's AST shape is unexpected.
-            raise QueryError(message) from exc
+            raise QueryError(message, hint=VIEWS_HINT) from exc
 
     def execute(self, sql: str) -> pa.Table:
-        timer = Timer(self._timeout_s, self._con.interrupt)
+        with get_gate().slot():
+            return self._execute(sql)
+
+    def _execute(self, sql: str) -> pa.Table:
+        # A cursor per call: it shares the catalog and locked settings, and
+        # interrupting it cancels only this query.
+        cursor = self._con.cursor()
+        timer = Timer(self._timeout_s, cursor.interrupt)
         timer.daemon = True
         timer.start()
         try:
-            statements = self._con.extract_statements(sql)
+            statements = cursor.extract_statements(sql)
             if len(statements) != 1 or statements[0].type != duckdb.StatementType.SELECT:
-                raise QueryError("expected exactly one SELECT statement")
-            self._validate_sql(sql)
-            result = self._con.sql(sql).limit(self._max_rows + 1).to_arrow_table()
+                raise QueryError(
+                    "expected exactly one SELECT statement",
+                    hint="send exactly one SELECT statement",
+                )
+            self._validate_sql(sql, cursor)
+            result = cursor.sql(sql).limit(self._max_rows + 1).to_arrow_table()
             if result.num_rows > self._max_rows:
                 raise QueryError(
                     f"result has more than {self._max_rows} rows; aggregate further"
@@ -153,6 +173,7 @@ class Engine:
         finally:
             timer.cancel()
             timer.join()
+            cursor.close()
 
     def coverage(self) -> Coverage:
         if self._coverage is None:
@@ -167,6 +188,12 @@ class Engine:
         return self._coverage
 
     def columns(self) -> list[tuple[str, str]]:
-        # This engine-generated query only needs relation metadata, not Arrow data.
-        relation = self._con.sql(f"SELECT * FROM {self._table} LIMIT 0")
-        return list(zip(relation.columns, map(str, relation.types), strict=True))
+        # This engine-generated query only needs relation metadata, not Arrow
+        # data. Like execute: inside the gate, on its own cursor.
+        with get_gate().slot():
+            cursor = self._con.cursor()
+            try:
+                relation = cursor.sql(f"SELECT * FROM {self._table} LIMIT 0")
+                return list(zip(relation.columns, map(str, relation.types), strict=True))
+            finally:
+                cursor.close()

@@ -655,3 +655,13 @@ def test_zero_denominators(engine, model):
     )
     assert result["zero_change_pct"][0].as_py() is None
     assert result["zero_share_pct"][0].as_py() is None
+
+
+def test_same_period_last_year_description_states_offsets():
+    from analyst.semantic.compiler import MetricQuery
+
+    description = MetricQuery.model_fields["compare_to"].description
+    assert "364 days" in description and "hour" in description and "day" in description
+    assert "52 weeks" in description
+    assert "12 months" in description and "no grain" in description
+    assert "weekday" in description

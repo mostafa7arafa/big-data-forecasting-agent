@@ -172,7 +172,10 @@ def test_missing_dates_reindexed():
     assert list(result.df) == ["unique_id", "ds", "y"]
     assert result.df.y.tolist() == [1, 2, 3, 4, 5]
     assert result.df.unique_id.nunique() == 1
-    assert "imputed 2 missing days 2024-01-02..2024-01-03" in result.adjustments
+    assert (
+        "imputed 2 missing days 2024-01-02..2024-01-03 by interpolation"
+        in result.adjustments
+    )
 
 
 def test_partial_last_month_dropped():
@@ -618,3 +621,25 @@ def test_only_impute_quirks_are_changed():
         (df.loc[20, "y"] + df.loc[22, "y"]) / 2
     )
     assert len(result.adjustments) == 1
+
+
+@pytest.mark.parametrize("freq, dates", [("D", ["2024-01-01", "2024-01-03"]), ("MS", ["2024-01-01", "2024-03-01"])])
+def test_unobserved_additive_series_rejected_before_zero_fill(freq, dates):
+    frame = pd.DataFrame({"ds": pd.to_datetime(dates), "y": [np.nan, np.nan]})
+    with pytest.raises(ValueError, match="no observed values"):
+        prepare_series(
+            frame,
+            freq=freq,
+            data_end=datetime(2024, 6, 30, 23),
+            id_col=None,
+            time_col="ds",
+            value_col="y",
+            additive=True,
+        )
+    # One observed value is enough: the gap is a real zero.
+    frame.loc[0, "y"] = 5.0
+    result = prepare_series(
+        frame, freq=freq, data_end=datetime(2024, 6, 30, 23),
+        id_col=None, time_col="ds", value_col="y", additive=True,
+    )
+    assert result.df.y.notna().all()

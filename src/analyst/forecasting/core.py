@@ -4,7 +4,8 @@ No data access occurs here. MASE is evaluated separately at every cutoff using
 only its training prefix, then scores are averaged equally across windows.
 """
 
-from collections.abc import Sequence
+import time
+from collections.abc import Callable, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -18,11 +19,14 @@ from statsforecast.models import MSTL, SeasonalNaive
 from utilsforecast.evaluation import evaluate
 from utilsforecast.losses import coverage, mae, mase, scaled_crps
 
+from analyst.errors import InvalidRequestError
 from analyst.semantic.model import Quirk
 
 from .models import DEFAULTS, candidate_models
 
 Freq = Literal["D", "MS"]
+ProgressFn = Callable[[str], None]
+MIN_BUDGET_WINDOWS = 4
 
 
 @dataclass
@@ -40,6 +44,11 @@ class BacktestReport:
     windows: int
     horizon: int
     adjustments: list[str] = field(default_factory=list)
+    windows_used: int | None = None
+
+    def __post_init__(self):
+        if self.windows_used is None:
+            self.windows_used = self.windows
 
 
 @dataclass
@@ -53,7 +62,7 @@ class ForecastRun:
 
 def _check_freq(freq):
     if freq not in DEFAULTS:
-        raise ValueError(f"unsupported frequency: {freq!r}")
+        raise InvalidRequestError(f"unsupported frequency: {freq!r}")
 
 
 def _record(adjustments, message):
@@ -108,6 +117,36 @@ def _monthly_gaps(group, quirks, adjustments, *, additive: bool):
             )
 
 
+def _quirk_periods(quirks: Sequence[Quirk], freq: Freq) -> set[pd.Timestamp]:
+    """Calendar periods covered by the approved impute quirks."""
+    periods: set[pd.Timestamp] = set()
+    for quirk in quirks:
+        start = pd.Timestamp(quirk.start)
+        end = pd.Timestamp(quirk.end or quirk.start)
+        if freq == "D":
+            periods.update(pd.date_range(start.normalize(), end.normalize(), freq="D"))
+        else:
+            periods.update(
+                pd.date_range(
+                    start.to_period("M").start_time,
+                    end.to_period("M").start_time,
+                    freq="MS",
+                )
+            )
+    return periods
+
+
+def _plural(count: int, unit: str) -> str:
+    return unit if count == 1 else unit + "s"
+
+
+def _runs(full_index: pd.DatetimeIndex, positions: np.ndarray):
+    """Yield the contiguous calendar runs inside a set of positions."""
+    for chunk in np.split(positions, np.flatnonzero(np.diff(positions) > 1) + 1):
+        if len(chunk):
+            yield full_index[chunk]
+
+
 def prepare_series(
     df: pd.DataFrame,
     *,
@@ -123,15 +162,17 @@ def prepare_series(
 
     Boundary gaps use the nearest observed value (no extrapolated trend). An
     entirely missing series cannot be imputed and is rejected. Only approved
-    impute quirks apply. Additive monthly metrics are scaled by observed-day fraction;
-    non-additive metrics use interpolation across known gaps. Whole missing months are
-    interpolated. Input is copied.
+    impute quirks apply. Periods with no events are zero-filled for additive
+    metrics (and interpolated otherwise); quirk-covered periods keep their
+    audit treatment. Additive monthly metrics are scaled by observed-day fraction;
+    non-additive metrics use interpolation across known gaps. Input is copied.
     """
     _check_freq(freq)
     data_end = pd.Timestamp(data_end)
     if data_end.tzinfo is not None:
-        raise ValueError("data_end must be timezone-naive")
+        raise InvalidRequestError("data_end must be timezone-naive")
     quirks = [q for q in quirks if q.status == "approved" and q.treatment == "impute"]
+    quirk_periods = _quirk_periods(quirks, freq)
     columns = [time_col, value_col] + ([id_col] if id_col else [])
     frame = df[columns].rename(columns={time_col: "ds", value_col: "y"}).copy()
     if id_col:
@@ -141,11 +182,13 @@ def prepare_series(
     frame["ds"] = pd.to_datetime(frame["ds"])
     frame["y"] = pd.to_numeric(frame["y"]).astype(float)
     if frame.empty or frame[["unique_id", "ds"]].isna().any().any():
-        raise ValueError("series must have non-null ids and dates and at least one row")
+        raise InvalidRequestError(
+            "series must have non-null ids and dates and at least one row"
+        )
     if frame.duplicated(["unique_id", "ds"]).any():
-        raise ValueError("duplicate dates within a series")
+        raise InvalidRequestError("duplicate dates within a series")
     if np.isinf(frame.y).any():
-        raise ValueError("series values must be finite")
+        raise InvalidRequestError("series values must be finite")
     all_adjustments, frames = [], []
     imputed_points = 0
     multiple_ids = frame.unique_id.nunique() > 1
@@ -161,22 +204,36 @@ def prepare_series(
             group = group.iloc[:-1]
             adjustments.append(f"dropped partial period {last.date()}")
         if group.empty:
-            raise ValueError("series too short after dropping partial period")
+            raise InvalidRequestError("series too short after dropping partial period")
+        # Before zero-filling: synthetic zeros must not make an unobserved series look valid.
+        if group.y.isna().all():
+            raise InvalidRequestError(f"cannot impute series {uid!r}: no observed values")
         full_index = pd.date_range(group.index.min(), group.index.max(), freq=freq)
         if not group.index.isin(full_index).all():
-            raise ValueError(f"dates must be aligned to {freq}")
+            raise InvalidRequestError(f"dates must be aligned to {freq}")
         missing = full_index.difference(group.index)
         group = group.reindex(full_index)
         unit = "days" if freq == "D" else "months"
+        period_unit = "day" if freq == "D" else "month"
         # Describe each contiguous gap rather than implying nonmissing dates
-        # between disjoint gaps were also imputed.
+        # between disjoint gaps were also imputed. Additive metrics treat
+        # event-free periods as real zeros, but quirk-covered periods keep the
+        # imputation the quirk handling below reports.
         positions = full_index.get_indexer(missing)
         for chunk in np.split(positions, np.flatnonzero(np.diff(positions) > 1) + 1):
-            if len(chunk):
-                start, end = full_index[chunk[0]], full_index[chunk[-1]]
-                adjustments.append(
-                    f"imputed {len(chunk)} missing {unit} {start.date()}..{end.date()}"
-                )
+            if not len(chunk):
+                continue
+            covered = full_index[chunk].isin(quirk_periods)
+            for run in _runs(full_index, chunk[~covered]):
+                plural = _plural(len(run), period_unit)
+                if additive:
+                    group.loc[run, "y"] = 0.0
+                    adjustments.append(f"zero-filled {len(run)} {plural} with no events")
+                else:
+                    adjustments.append(
+                        f"imputed {len(run)} missing {plural} "
+                        f"{run[0].date()}..{run[-1].date()} by interpolation"
+                    )
         existing_missing = group.y.isna() & ~group.index.isin(missing)
         if existing_missing.any():
             dates = group.index[existing_missing]
@@ -201,7 +258,7 @@ def prepare_series(
         imputed_points += int(group.y.isna().sum())
         group["y"] = group.y.interpolate(method="time", limit_direction="both")
         if group.y.isna().any():
-            raise ValueError(f"cannot impute series {uid!r}: no observed values")
+            raise InvalidRequestError(f"cannot impute series {uid!r}: no observed values")
         group["unique_id"] = uid
         group.index.name = "ds"
         frames.append(group.reset_index()[["unique_id", "ds", "y"]])
@@ -237,7 +294,7 @@ def _supported_models(series, models, horizon, n_windows):
             )
             supported.append(model)
     if not supported:
-        raise ValueError("series too short for any candidate model")
+        raise InvalidRequestError("series too short for any candidate model")
     return supported
 
 
@@ -269,6 +326,9 @@ def backtest(
     n_windows=None,
     levels=(80, 95),
     n_jobs=1,
+    progress: ProgressFn | None = None,
+    budget_s: float | None = None,
+    clock: Callable[[], float] = time.perf_counter,
 ) -> BacktestReport:
     """Backtest candidates against SeasonalNaive, with per-cutoff MASE scaling.
 
@@ -278,6 +338,10 @@ def backtest(
     without a median).
     On a zero-error baseline, relative MAE is 1 for zero error and inf otherwise.
     Zero training scale yields MASE 0 for perfect predictions and inf otherwise.
+    Each rolling-origin window is fitted on its own truncated series,
+    newest first, so ``progress`` can report "backtest window i/n" and
+    ``budget_s`` can stop the loop (keeping the most recent windows) once at
+    least four windows are done and the budget is spent.
     """
     _check_freq(freq)
     series = PreparedSeries(series.df, [])
@@ -286,7 +350,7 @@ def backtest(
     step = defaults["step"] if step is None else step
     requested = defaults["n_windows"] if n_windows is None else n_windows
     if horizon < 1 or step < 1 or requested < 3:
-        raise ValueError(
+        raise InvalidRequestError(
             "horizon and step must be positive; n_windows must be at least 3"
         )
     history = series.df.groupby("unique_id").size().min()
@@ -300,7 +364,7 @@ def backtest(
     ):
         windows -= 1
     if windows < 3 or pd.isna(history):
-        raise ValueError("series too short for at least 3 backtest windows")
+        raise InvalidRequestError("series too short for at least 3 backtest windows")
     if windows != requested:
         _series_record(
             series,
@@ -309,28 +373,62 @@ def backtest(
     candidates = _backtest_models(series, freq, models, horizon, windows)
     # Reports always carry the contracted 80/95 columns; callers may add levels.
     levels = sorted(set(levels) | {80, 95})
-    cv, names = None, []
     keys = ["unique_id", "ds", "cutoff", "y"]
     # Isolate model fits so failed candidates never borrow baseline predictions.
     # Baseline first: its failures must propagate, not trigger a fallback.
-    for model in sorted(candidates, key=lambda m: str(m) != "SeasonalNaive"):
-        try:
-            result = StatsForecast(
-                models=[model], freq=freq, n_jobs=n_jobs
-            ).cross_validation(
-                df=series.df,
-                h=horizon,
-                step_size=step,
-                n_windows=windows,
-                level=levels,
+    ordered = sorted(candidates, key=lambda m: str(m) != "SeasonalNaive")
+    per_model: dict[str, list[pd.DataFrame]] = {str(m): [] for m in ordered}
+    failed: set[str] = set()
+    sizes = series.df.groupby("unique_id", sort=False).cumcount(ascending=False)
+    started = clock()
+    windows_used = windows
+    for i in range(1, windows + 1):
+        if progress is not None:
+            progress(f"backtest window {i}/{windows}")
+        # Newest first, so a budget stop keeps the most recent windows: window i
+        # ends step * (i - 1) periods before the series end.
+        window_df = series.df.loc[sizes >= step * (i - 1)]
+        for model in ordered:
+            name = str(model)
+            if name in failed:
+                continue
+            try:
+                result = StatsForecast(
+                    models=[model], freq=freq, n_jobs=n_jobs
+                ).cross_validation(
+                    df=window_df,
+                    h=horizon,
+                    step_size=step,
+                    n_windows=1,
+                    level=levels,
+                )
+            except Exception as error:
+                if name == "SeasonalNaive":
+                    raise
+                _fit_failure(series, model, error)
+                failed.add(name)
+                continue
+            per_model[name].append(result)
+        elapsed = clock() - started
+        if (
+            budget_s is not None
+            and MIN_BUDGET_WINDOWS <= i < windows
+            and elapsed >= budget_s
+        ):
+            windows_used = i
+            _series_record(
+                series,
+                f"backtest stopped at {i}/{windows} windows (time budget {budget_s:g} s)",
             )
-        except Exception as error:
-            if str(model) == "SeasonalNaive":
-                raise
-            _fit_failure(series, model, error)
+            break
+    cv, names = None, []
+    for model in ordered:
+        name = str(model)
+        if name in failed:
             continue
+        result = pd.concat(per_model[name], ignore_index=True)
         cv = result if cv is None else cv.merge(result, on=keys, validate="one_to_one")
-        names.append(str(model))
+        names.append(name)
     evaluated = []
     for cutoff, window in cv.groupby("cutoff"):
         # Dropping cutoff explicitly gives evaluate a single window. In
@@ -354,7 +452,7 @@ def backtest(
             )
             scores.loc[mask, name] = 0.0
         if scores[names].isna().any().any():
-            raise ValueError("undefined backtest scores")
+            raise InvalidRequestError("undefined backtest scores")
         evaluated.append(scores)
     long = pd.concat(evaluated).melt(
         id_vars=["unique_id", "metric"],
@@ -388,7 +486,7 @@ def backtest(
     ]
     scores = scores[columns]
     scores.columns.name = None
-    return _report(scores, windows, horizon, series.adjustments)
+    return _report(scores, windows, horizon, series.adjustments, windows_used)
 
 
 def _fit_failure(series, model, error):
@@ -396,7 +494,7 @@ def _fit_failure(series, model, error):
     _series_record(series, f"{model} skipped (fit failed: {first_line})")
 
 
-def _report(scores, windows, horizon, adjustments):
+def _report(scores, windows, horizon, adjustments, windows_used=None):
     means = scores.groupby("model")[["relative_mae", "mase"]].mean()
     contenders = means.loc[(means.index != "SeasonalNaive") & (means.relative_mae < 1)]
     best = (
@@ -404,7 +502,9 @@ def _report(scores, windows, horizon, adjustments):
         if not contenders.empty else "SeasonalNaive"
     )
     beats = best != "SeasonalNaive"
-    return BacktestReport(scores, best, beats, windows, horizon, list(adjustments))
+    return BacktestReport(
+        scores, best, beats, windows, horizon, list(adjustments), windows_used
+    )
 
 
 def fit_predict(
@@ -419,7 +519,7 @@ def fit_predict(
     """Fit the supplied models on all observations without running a backtest."""
     _check_freq(freq)
     if horizon < 1:
-        raise ValueError("horizon must be positive")
+        raise InvalidRequestError("horizon must be positive")
     return StatsForecast(
         models=deepcopy(list(models)), freq=freq, n_jobs=n_jobs
     ).forecast(df=series.df, h=horizon, level=list(levels))
@@ -433,10 +533,19 @@ def forecast(
     levels=(80, 95),
     models=None,
     n_jobs=1,
+    progress: ProgressFn | None = None,
+    budget_s: float | None = None,
 ) -> ForecastRun:
     """Select by mean relative MAE (MASE tie-break), then refit the winner."""
     report = backtest(
-        series, freq=freq, horizon=horizon, models=models, levels=levels, n_jobs=n_jobs
+        series,
+        freq=freq,
+        horizon=horizon,
+        models=models,
+        levels=levels,
+        n_jobs=n_jobs,
+        progress=progress,
+        budget_s=budget_s,
     )
     working = PreparedSeries(series.df, list(report.adjustments))
     candidates = _backtest_models(working, freq, models, horizon, report.windows)
@@ -461,7 +570,13 @@ def forecast(
             remaining = report.scores.loc[
                 report.scores.model != report.best_model
             ].copy()
-            report = _report(remaining, report.windows, horizon, working.adjustments)
+            report = _report(
+                remaining,
+                report.windows,
+                horizon,
+                working.adjustments,
+                report.windows_used,
+            )
     adjustments = list(series.adjustments)
     for message in working.adjustments:
         _record(adjustments, message)

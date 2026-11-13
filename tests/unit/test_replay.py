@@ -303,3 +303,37 @@ def test_missing_truth_is_checked_before_fitting(synthetic_dataset, monkeypatch,
     with pytest.raises(ValueError, match="missing/nonfinite held-out truth"):
         replay(synthetic_dataset, QUERY, cutoffs=CUTOFFS[:1], freq="D", horizon=7,
                id_col="area", value_col="total_amount", store_root=tmp_path)
+
+
+def test_convergence_warnings_reported_as_one_adjustment(synthetic_dataset, monkeypatch, tmp_path):
+    import warnings
+
+    import analyst.forecasting.replay as module
+
+    noisy = [True]
+
+    def fake(series, *, horizon, models, **kwargs):
+        name = str(models[0])
+        if name == "AutoARIMA" and noisy[0]:
+            warnings.warn("possible convergence problem: minimize did not converge", UserWarning)
+        dates = pd.date_range(series.df.ds.max(), periods=horizon + 1, freq="D")[1:]
+        result = pd.DataFrame({"unique_id": series.df.unique_id.iloc[0], "ds": dates})
+        result[name] = 0.0
+        for level in (80, 95):
+            result[f"{name}-lo-{level}"] = -1e9
+            result[f"{name}-hi-{level}"] = 1e9
+        return result
+
+    monkeypatch.setattr(module, "fit_predict", fake)
+    report = replay(
+        synthetic_dataset, QUERY, cutoffs=CUTOFFS, freq="D", horizon=7,
+        id_col="area", value_col="total_amount", store_root=tmp_path,
+    )
+    # one AutoARIMA fit per id (2) per cutoff (2)
+    assert report.adjustments == ["AutoARIMA: 4 convergence warnings"]
+    noisy[0] = False
+    clean = replay(
+        synthetic_dataset, QUERY, cutoffs=CUTOFFS[:1], freq="D", horizon=7,
+        id_col="area", value_col="total_amount", store_root=tmp_path / "clean",
+    )
+    assert clean.adjustments == []

@@ -285,3 +285,12 @@ card = store.save(
 assert store.load(card.handle_id).equals(table)
 """
     subprocess.run([sys.executable, "-c", script], check=True)
+
+
+def test_orphan_parquet_without_card_is_unknown(tmp_path):
+    import pyarrow.parquet as pq
+
+    pq.write_table(pa.table({"a": [1]}), tmp_path / "r_deadbeef00.parquet")
+    store = ResultStore(tmp_path)
+    with pytest.raises(KeyError, match="unknown result handle r_deadbeef00"):
+        store.load("r_deadbeef00")

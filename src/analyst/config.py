@@ -2,7 +2,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Self
 
-from pydantic import Field, model_validator
+from pydantic import AliasChoices, Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -17,6 +17,38 @@ class Settings(BaseSettings):
     repo_root: Path = Field(default_factory=lambda: Path(__file__).resolve().parents[2])
     datasets_dir: Path | None = None
     artifacts_dir: Path | None = None
+
+    # Dataset and agent runtime.
+    dataset: str | None = None
+    model: str = "openai:gpt-6-luna"
+    max_background_tasks: int = 3
+    max_concurrent_queries: int = 3
+    forecast_budget_s: float = 120.0
+    inline_forecast_limit_s: float = 15.0
+    nanogpt_base_url: str = "https://nano-gpt.com/api/v1"
+
+    # Provider keys keep their ecosystem-standard names, so the LangChain,
+    # LangSmith and OpenAI SDKs read the same environment this does.
+    openai_api_key: SecretStr | None = Field(
+        default=None,
+        validation_alias=AliasChoices("OPENAI_API_KEY", "ANALYST_OPENAI_API_KEY"),
+    )
+    openrouter_api_key: SecretStr | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "OPENROUTER_API_KEY", "ANALYST_OPENROUTER_API_KEY"
+        ),
+    )
+    nanogpt_api_key: SecretStr | None = Field(
+        default=None,
+        validation_alias=AliasChoices("NANOGPT_API_KEY", "ANALYST_NANOGPT_API_KEY"),
+    )
+    langsmith_api_key: SecretStr | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "LANGSMITH_API_KEY", "ANALYST_LANGSMITH_API_KEY"
+        ),
+    )
 
     @model_validator(mode="after")
     def _default_path_dirs(self) -> Self:
