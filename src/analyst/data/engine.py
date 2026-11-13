@@ -1,6 +1,7 @@
 """Read-only, bounded SQL access to a configured dataset."""
 
 import json
+import os
 import re
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -9,7 +10,9 @@ from threading import Timer
 import duckdb
 import pyarrow as pa
 
+from analyst.config import get_settings
 from analyst.data.dataset import DatasetConfig
+from analyst.data.gate import get_gate
 from analyst.errors import AnalystError
 
 VIEWS_HINT = "use only the dataset views listed by describe('schema')"
@@ -85,13 +88,17 @@ class Engine:
         self._con.execute(f"SET allowed_directories=[{directories}]")
         self._con.execute("SET enable_external_access=false")
         self._con.execute("SET memory_limit='8GB'")
+        # threads is database-wide: split the cores across gated queries.
+        threads = max(2, (os.cpu_count() or 2) // get_settings().max_concurrent_queries)
+        self._con.execute(f"SET threads={threads}")
         self._con.execute("SET lock_configuration=true")
 
-    def _validate_sql(self, sql: str) -> None:
+    def _validate_sql(self, sql: str, con: duckdb.DuckDBPyConnection | None = None) -> None:
+        con = con or self._con
         message = "query may only read the dataset views: " + ", ".join(self._view_names)
         try:
             # Fully consume this result before executing the user's relation.
-            rows = self._con.execute("SELECT json_serialize_sql(?)", [sql]).fetchall()
+            rows = con.execute("SELECT json_serialize_sql(?)", [sql]).fetchall()
             ast = json.loads(rows[0][0])
             if ast.get("error"):
                 raise QueryError(ast["error_message"].splitlines()[0])
@@ -135,18 +142,25 @@ class Engine:
             raise QueryError(message, hint=VIEWS_HINT) from exc
 
     def execute(self, sql: str) -> pa.Table:
-        timer = Timer(self._timeout_s, self._con.interrupt)
+        with get_gate().slot():
+            return self._execute(sql)
+
+    def _execute(self, sql: str) -> pa.Table:
+        # A cursor per call: it shares the catalog and locked settings, and
+        # interrupting it cancels only this query.
+        cursor = self._con.cursor()
+        timer = Timer(self._timeout_s, cursor.interrupt)
         timer.daemon = True
         timer.start()
         try:
-            statements = self._con.extract_statements(sql)
+            statements = cursor.extract_statements(sql)
             if len(statements) != 1 or statements[0].type != duckdb.StatementType.SELECT:
                 raise QueryError(
                     "expected exactly one SELECT statement",
                     hint="send exactly one SELECT statement",
                 )
-            self._validate_sql(sql)
-            result = self._con.sql(sql).limit(self._max_rows + 1).to_arrow_table()
+            self._validate_sql(sql, cursor)
+            result = cursor.sql(sql).limit(self._max_rows + 1).to_arrow_table()
             if result.num_rows > self._max_rows:
                 raise QueryError(
                     f"result has more than {self._max_rows} rows; aggregate further"
@@ -159,6 +173,7 @@ class Engine:
         finally:
             timer.cancel()
             timer.join()
+            cursor.close()
 
     def coverage(self) -> Coverage:
         if self._coverage is None:

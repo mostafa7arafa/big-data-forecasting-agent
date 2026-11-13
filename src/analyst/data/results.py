@@ -3,7 +3,9 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import re
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +14,8 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
 from pydantic import BaseModel, Field, field_validator
+
+from analyst.errors import UnknownNameError
 
 _RENDER_BUDGET = 4096
 _PREVIEW_ROWS = 10
@@ -167,12 +171,40 @@ class ResultStore:
         )
         pq_path = self._root / f"{handle_id}.parquet"
         card_path = self._root / f"{handle_id}.card.json"
-        pq.write_table(table, pq_path)
-        card_path.write_text(
-            json.dumps(_card_to_json(card), indent=2),
-            encoding="utf-8",
-        )
+        tag = uuid.uuid4().hex
+        pq_tmp = self._root / f"{handle_id}.parquet.{tag}.tmp"
+        card_tmp = self._root / f"{handle_id}.card.json.{tag}.tmp"
+        index_path = self._index_path(produced_by, source)
+        index_tmp = self._root / "index" / f"{index_path.name}.{tag}.tmp"
+        index_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            pq.write_table(table, pq_tmp)
+            card_tmp.write_text(
+                json.dumps(_card_to_json(card), indent=2), encoding="utf-8"
+            )
+            index_tmp.write_text(json.dumps({"handle_id": handle_id}), encoding="utf-8")
+            # Card last: its presence means the parquet is complete.
+            os.replace(pq_tmp, pq_path)
+            os.replace(card_tmp, card_path)
+            os.replace(index_tmp, index_path)
+        finally:
+            for tmp in (pq_tmp, card_tmp, index_tmp):
+                tmp.unlink(missing_ok=True)
         return card
+
+    def lookup(self, produced_by: str, source: str) -> SummaryCard | None:
+        try:
+            data = json.loads(self._index_path(produced_by, source).read_text("utf-8"))
+            handle_id = data["handle_id"]
+            if not self.exists(handle_id):
+                return None
+            return self.card(handle_id)
+        except (OSError, ValueError, KeyError):
+            return None
+
+    def _index_path(self, produced_by: str, source: str) -> Path:
+        key = hashlib.sha256((produced_by + "\0" + source).encode()).hexdigest()
+        return self._root / "index" / f"{key}.json"
 
     def load(self, handle_id: str) -> pa.Table:
         path = self._parquet_path(handle_id)
@@ -184,25 +216,32 @@ class ResultStore:
         return SummaryCard.model_validate(data)
 
     def exists(self, handle_id: str) -> bool:
-        return self._parquet_path(handle_id, fail=False).is_file()
+        return self._card_path(handle_id, fail=False).is_file()
 
     def _validate_handle_id(self, handle_id: str) -> None:
         if not is_result_handle_id(handle_id):
-            raise KeyError(f"unknown result handle {handle_id}")
+            raise _unknown(handle_id)
 
     def _parquet_path(self, handle_id: str, *, fail: bool = True) -> Path:
         self._validate_handle_id(handle_id)
         path = self._root / f"{handle_id}.parquet"
         if fail and not path.is_file():
-            raise KeyError(f"unknown result handle {handle_id}")
+            raise _unknown(handle_id)
         return path
 
-    def _card_path(self, handle_id: str) -> Path:
+    def _card_path(self, handle_id: str, *, fail: bool = True) -> Path:
         self._validate_handle_id(handle_id)
         path = self._root / f"{handle_id}.card.json"
-        if not path.is_file():
-            raise KeyError(f"unknown result handle {handle_id}")
+        if fail and not path.is_file():
+            raise _unknown(handle_id)
         return path
+
+
+def _unknown(handle_id: str) -> UnknownNameError:
+    return UnknownNameError(
+        f"unknown result handle {handle_id}",
+        hint="use a handle id returned by an earlier tool call",
+    )
 
 
 def is_result_handle_id(value: str) -> bool:
