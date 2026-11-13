@@ -20,6 +20,7 @@ The product face of the analyst. A senior AI engineer opening it should feel "th
   - a chat with 30 charts scrolls without dropped frames.
 - **Design** uses the "impeccable" design skills. Install them at the start of the session.
 - **An original brand character** that is the AI's persona, animated in the UI and reused in the README and the demo video. It must not resemble Omni's Blobby.
+- **Character voice for progress messages (owner, 2026-11-13).** Plan B ships neutral status lines (model-written lines next to tool calls, plus tool progress events from LangGraph's custom stream). Once the character is designed, rewrite them in its voice: the analyst prompt's status-line instructions and the tool-progress templates. See `docs/superpowers/specs/2026-11-12-plan-b-agent-harness-design.md` §5.1b.
 
 ## Screens and parts
 
