@@ -1,5 +1,9 @@
 """Compact long conversations into a structured analytics digest.
 
+Runs as a step of the outer analyst graph (graph.py ``compact`` node), on the
+thread's messages before the turn starts; it is not agent middleware, because
+the inner agent's state is not the thread's. Only prior turns are compacted.
+
 When the approximate token count of the thread passes ``trigger_tokens``, every
 message except the last ``keep_messages`` is replaced by one harness-added
 ``HumanMessage`` that renders a :class:`Digest`: the goal, confirmed findings
@@ -19,10 +23,9 @@ from __future__ import annotations
 import logging
 import re
 import uuid
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from typing import Any
 
-from langchain.agents.middleware import AgentMiddleware, AgentState
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import (
     AIMessage,
@@ -36,15 +39,14 @@ from langchain_core.messages import (
 from langchain_core.messages.notification import add_notification_metadata
 from langchain_core.messages.utils import count_tokens_approximately
 from langgraph.graph.message import REMOVE_ALL_MESSAGES
-from langgraph.runtime import Runtime
 from langsmith.run_helpers import get_current_run_tree
 from pydantic import BaseModel, Field
 
 __all__ = [
     "COMPACTION_SOURCE",
-    "CompactionMiddleware",
     "Digest",
     "Finding",
+    "compact_messages",
     "is_compaction_summary",
 ]
 
@@ -152,17 +154,16 @@ def render_digest(digest: Digest, handles: list[str]) -> str:
     return "\n".join(lines)
 
 
-def safe_cutoff(messages: list[AnyMessage], keep: int) -> int:
-    """Index where the kept tail starts; 0 when nothing can be dropped.
+def safe_cutoff(messages: list[AnyMessage], target: int) -> int:
+    """Index where the kept tail starts, at or before ``target``; 0 = nothing to drop.
 
     Never splits an AI tool call from its ToolMessages, and the tail never
     starts with a ToolMessage.
     """
-    cut = len(messages) - keep
+    cut = target
     if cut <= 0:
         return 0
     while cut < len(messages) and isinstance(messages[cut], ToolMessage):
-        # move back to the AI message that issued these tool calls
         ids = set()
         j = cut
         while j < len(messages) and isinstance(messages[j], ToolMessage):
@@ -176,109 +177,68 @@ def safe_cutoff(messages: list[AnyMessage], keep: int) -> int:
     return cut
 
 
-class CompactionMiddleware(AgentMiddleware):
-    """Replace old messages with a structured digest above a token budget.
+def plan_cut(
+    messages: list[AnyMessage], trigger_tokens: int, keep_messages: int, protect_from: int
+) -> int:
+    """Where to cut, or 0 for no compaction.
 
-    ``model`` (a chat model, or a callable taking the run's model spec) is for
-    tests and graphs built around a given model; otherwise the digest is made
-    by ``get_model`` for the run context's model, like the graph's own nodes.
+    ``protect_from`` is the index of the current user question: it and
+    everything after it stay in the tail, so only prior turns are summarised.
     """
+    if count_tokens_approximately(messages) <= trigger_tokens:
+        return 0
+    return safe_cutoff(messages, min(len(messages) - keep_messages, protect_from))
 
-    def __init__(
-        self,
-        trigger_tokens: int,
-        keep_messages: int,
-        model: BaseChatModel | Callable[[str | None], BaseChatModel] | None = None,
-    ) -> None:
-        super().__init__()
-        self.trigger_tokens = trigger_tokens
-        self.keep_messages = keep_messages
-        self._model = model
 
-    # -- model ---------------------------------------------------------------
-    def _chat(self, runtime: Runtime) -> BaseChatModel:
-        if isinstance(self._model, BaseChatModel):
-            return self._model
-        spec = getattr(getattr(runtime, "context", None), "model", None)
-        if self._model is not None:
-            return self._model(spec)
-        from analyst.providers import get_model
+def _prompt(old: list[AnyMessage]) -> list[AnyMessage]:
+    parts = []
+    for m in old:
+        text = _text(m)
+        if isinstance(m, ToolMessage) and len(text) > _TOOL_TEXT_LIMIT:
+            text = text[:_TOOL_TEXT_LIMIT] + " ...[truncated]"
+        line = f"{m.type}: {text}"
+        if isinstance(m, AIMessage) and m.tool_calls:
+            line += f" tool_calls={m.tool_calls}"
+        if isinstance(m, ToolMessage) and isinstance(m.artifact, dict):
+            line += f" artifact={m.artifact}"
+        parts.append(line)
+    return [SystemMessage(DIGEST_PROMPT), HumanMessage("\n\n".join(parts))]
 
-        return get_model(spec)
 
-    # -- planning ------------------------------------------------------------
-    def _plan(self, messages: list[AnyMessage]) -> int:
-        if count_tokens_approximately(messages) <= self.trigger_tokens:
-            return 0
-        return safe_cutoff(messages, self.keep_messages)
+async def compact_messages(
+    messages: list[AnyMessage],
+    chat: BaseChatModel,
+    *,
+    trigger_tokens: int,
+    keep_messages: int,
+    protect_from: int,
+) -> dict | None:
+    """A state update replacing old messages with the digest, or None.
 
-    @staticmethod
-    def _prompt(old: list[AnyMessage]) -> list[AnyMessage]:
-        parts = []
-        for m in old:
-            text = _text(m)
-            if isinstance(m, ToolMessage) and len(text) > _TOOL_TEXT_LIMIT:
-                text = text[:_TOOL_TEXT_LIMIT] + " ...[truncated]"
-            line = f"{m.type}: {text}"
-            if isinstance(m, AIMessage) and m.tool_calls:
-                line += f" tool_calls={m.tool_calls}"
-            if isinstance(m, ToolMessage) and isinstance(m.artifact, dict):
-                line += f" artifact={m.artifact}"
-            parts.append(line)
-        return [SystemMessage(DIGEST_PROMPT), HumanMessage("\n\n".join(parts))]
-
-    @staticmethod
-    def _as_digest(result: Any) -> Digest:
-        return result if isinstance(result, Digest) else Digest.model_validate(result)
-
-    def _apply(self, messages: list[AnyMessage], cut: int, digest: Digest) -> dict:
-        old, tail = messages[:cut], messages[cut:]
-        handles = list(dict.fromkeys([*digest.live_handles, *_handles_in(old)]))
-        handles = [h for h in handles if HANDLE_ID.fullmatch(h)]
-        summary = add_notification_metadata(
-            HumanMessage(content=render_digest(digest, handles), id=str(uuid.uuid4())),
-            source=COMPACTION_SOURCE,
-            data={"compacted_messages": len(old), "handles": handles},
-        )
-        run_tree = get_current_run_tree()
-        if run_tree is not None:
-            run_tree.add_metadata({"compacted": True, "compacted_messages": len(old)})
-        return {"messages": [RemoveMessage(id=REMOVE_ALL_MESSAGES), summary, *tail]}
-
-    @staticmethod
-    def _ensure_ids(messages: list[AnyMessage]) -> None:
-        for m in messages:
-            if m.id is None:
-                m.id = str(uuid.uuid4())
-
-    # -- hooks ---------------------------------------------------------------
-    def before_model(self, state: AgentState, runtime: Runtime) -> dict | None:
-        messages = state["messages"]
-        cut = self._plan(messages)
-        if cut <= 0:
-            return None
-        self._ensure_ids(messages)
-        try:
-            chat = self._chat(runtime).with_structured_output(Digest)
-            digest = self._as_digest(chat.invoke(self._prompt(messages[:cut])))
-        except Exception:
-            logger.warning("compaction failed; continuing uncompacted", exc_info=True)
-            return None
-        return self._apply(messages, cut, digest)
-
-    async def abefore_model(self, state: AgentState, runtime: Runtime) -> dict | None:
-        import asyncio
-
-        messages = state["messages"]
-        cut = self._plan(messages)
-        if cut <= 0:
-            return None
-        self._ensure_ids(messages)
-        try:
-            model = await asyncio.to_thread(self._chat, runtime)
-            chat = model.with_structured_output(Digest)
-            digest = self._as_digest(await chat.ainvoke(self._prompt(messages[:cut])))
-        except Exception:
-            logger.warning("compaction failed; continuing uncompacted", exc_info=True)
-            return None
-        return self._apply(messages, cut, digest)
+    None when below the trigger, when nothing can be dropped, or when the
+    digest fails (logged); the run then continues with the messages unchanged.
+    The update is ``RemoveMessage(REMOVE_ALL)``, the summary, the tail.
+    """
+    cut = plan_cut(messages, trigger_tokens, keep_messages, protect_from)
+    if cut <= 0:
+        return None
+    old, tail = messages[:cut], messages[cut:]
+    try:
+        result = await chat.with_structured_output(Digest).ainvoke(_prompt(old))
+        digest = result if isinstance(result, Digest) else Digest.model_validate(result)
+    except Exception:
+        logger.warning("compaction failed; continuing uncompacted", exc_info=True)
+        return None
+    handles = list(dict.fromkeys([*digest.live_handles, *_handles_in(old)]))
+    handles = [h for h in handles if HANDLE_ID.fullmatch(h)]
+    summary = add_notification_metadata(
+        HumanMessage(content=render_digest(digest, handles), id=str(uuid.uuid4())),
+        source=COMPACTION_SOURCE,
+        data={"compacted_messages": len(old), "handles": handles},
+    )
+    run_tree = get_current_run_tree()
+    if run_tree is not None:
+        run_tree.add_metadata({"compacted": True, "compacted_messages": len(old)})
+    # tail messages need ids for the add_messages reducer to keep them stable
+    tail = [m if m.id is not None else m.model_copy(update={"id": str(uuid.uuid4())}) for m in tail]
+    return {"messages": [RemoveMessage(id=REMOVE_ALL_MESSAGES), summary, *tail]}

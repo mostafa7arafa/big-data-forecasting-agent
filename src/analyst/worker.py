@@ -88,7 +88,7 @@ def build_worker(
         model=model if model is not None else _default_model(),
         tools=DATA_TOOLS,
         system_prompt=WORKER_PROMPT,
-        middleware=[worker_context or WorkerContext(), *analyst_middleware(settings, compaction=False)],
+        middleware=[worker_context or WorkerContext(), *analyst_middleware(settings)],
         context_schema=AnalystContext,
         name="worker",
     )

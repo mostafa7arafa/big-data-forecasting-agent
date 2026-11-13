@@ -9,10 +9,12 @@ from langchain_core.messages import AIMessage, HumanMessage, RemoveMessage, Tool
 from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_core.runnables import RunnableLambda
 
-from analyst.data.results import ResultStore
-from analyst.middleware import CompactionMiddleware, analyst_middleware
-from analyst.middleware.compaction import Digest, Finding, is_compaction_summary
-from analyst.verify import collect_handles
+from analyst.middleware.compaction import (
+    Digest,
+    Finding,
+    compact_messages,
+    is_compaction_summary,
+)
 
 H_LISTED = "r_aaaaaaaaaa"
 H_ONLY_IN_TOOL = "r_bbbbbbbbbb"
@@ -76,118 +78,90 @@ def _conversation(n_pairs=10):
     return msgs
 
 
-def _mw(chat, trigger=100, keep=8):
-    return CompactionMiddleware(trigger, keep, model=chat)
-
-
-RUNTIME = SimpleNamespace(context=None)
-
-
-def _run(mw, msgs):
-    return mw.before_model({"messages": msgs}, RUNTIME)
+def _run(chat, msgs, trigger=100, keep=8, protect=None):
+    return asyncio.run(
+        compact_messages(
+            msgs,
+            chat,
+            trigger_tokens=trigger,
+            keep_messages=keep,
+            protect_from=len(msgs) if protect is None else protect,
+        )
+    )
 
 
 def _no_orphans(msgs):
     for i, m in enumerate(msgs):
         if isinstance(m, AIMessage) and m.tool_calls:
-            after = {
-                t.tool_call_id for t in msgs[i + 1 :] if isinstance(t, ToolMessage)
-            }
+            after = {t.tool_call_id for t in msgs[i + 1 :] if isinstance(t, ToolMessage)}
             assert {c["id"] for c in m.tool_calls} <= after
         if isinstance(m, ToolMessage):
-            before = {
-                c["id"]
-                for a in msgs[:i]
-                if isinstance(a, AIMessage)
-                for c in a.tool_calls
-            }
+            before = {c["id"] for a in msgs[:i] if isinstance(a, AIMessage) for c in a.tool_calls}
             assert m.tool_call_id in before
 
 
 def test_no_compaction_below_trigger():
     chat = FakeChat(digest=_digest())
-    assert _run(_mw(chat, trigger=10**9), _conversation()) is None
+    assert _run(chat, _conversation(), trigger=10**9) is None
     assert chat.calls == []
 
 
 def test_compacts_above_trigger_keeps_tail_and_pairs():
     msgs = _conversation()
-    update = _run(_mw(FakeChat(digest=_digest())), msgs)
-    out = update["messages"]
+    out = _run(FakeChat(digest=_digest()), msgs)["messages"]
     assert isinstance(out[0], RemoveMessage)
     summary, tail = out[1], out[2:]
     assert is_compaction_summary(summary)
     assert "Why did trips fall in March?" in summary.content
-    assert len(tail) == 8 and tail == msgs[-8:]
+    assert [m.content for m in tail] == [m.content for m in msgs[-8:]] and len(tail) == 8
     assert not isinstance(tail[0], ToolMessage)
     _no_orphans(tail)
 
 
 def test_cut_landing_on_tool_message_moves_back_to_ai():
-    msgs = _conversation()
-    # keep=7 would start the tail on a ToolMessage
-    out = _run(_mw(FakeChat(digest=_digest()), keep=7), msgs)["messages"]
+    out = _run(FakeChat(digest=_digest()), _conversation(), keep=7)["messages"]
     tail = out[2:]
     assert isinstance(tail[0], AIMessage)
     _no_orphans(tail)
 
 
-def test_handles_survive_compaction(tmp_path):
-    update = _run(_mw(FakeChat(digest=_digest())), _conversation())
-    summary = update["messages"][1]
+def test_current_question_and_after_always_stay():
+    msgs = _conversation() + [HumanMessage("and April?")]
+    # an extra message after the question; keep=1 alone would drop the question
+    msgs.append(AIMessage("working"))
+    out = _run(FakeChat(digest=_digest()), msgs, keep=1, protect=len(msgs) - 2)["messages"]
+    assert [m.content for m in out[2:]] == ["and April?", "working"]
+
+
+def test_nothing_to_drop_when_question_is_first():
+    msgs = _conversation()
+    assert _run(FakeChat(digest=_digest()), msgs, protect=0) is None
+
+
+def test_handles_survive_compaction():
+    summary = _run(FakeChat(digest=_digest()), _conversation())["messages"][1]
     assert H_ONLY_IN_TOOL in summary.content and H_LISTED in summary.content
     assert "Handles:" in summary.content
 
-    import pyarrow as pa
-
-    store = ResultStore(tmp_path)
-    saved = store.save(
-        pa.table({"n": [1.0, 2.0]}),
-        produced_by="run_sql",
-        source="select 1",
-        governed=True,
-        elapsed_s=0.0,
-    )
-    msgs = _conversation()
-    msgs[2] = msgs[2].model_copy(
-        update={"artifact": {"handle_id": saved.handle_id, "produced_by": "run_sql"}}
-    )
-    summary = _run(_mw(FakeChat(digest=_digest())), msgs)["messages"][1]
-    found = collect_handles([summary], store)
-    assert list(found) == [saved.handle_id]  # H_LISTED etc. unknown: dropped
-
 
 def test_digest_failure_falls_back_to_no_compaction():
-    assert _run(_mw(FakeChat(error=True)), _conversation()) is None
-    # invalid structured output
-    assert _run(_mw(FakeChat(digest={"nope": 1})), _conversation()) is None
+    assert _run(FakeChat(error=True), _conversation()) is None
+    assert _run(FakeChat(digest={"nope": 1}), _conversation()) is None
 
 
-def test_async_path_and_metadata(monkeypatch):
+def test_metadata_on_run(monkeypatch):
     seen = {}
     run = SimpleNamespace(add_metadata=lambda m: seen.update(m))
-    monkeypatch.setattr(
-        "analyst.middleware.compaction.get_current_run_tree", lambda: run
-    )
-    mw = _mw(FakeChat(digest=_digest()))
-    update = asyncio.run(mw.abefore_model({"messages": _conversation()}, RUNTIME))
-    assert update is not None
+    monkeypatch.setattr("analyst.middleware.compaction.get_current_run_tree", lambda: run)
+    assert _run(FakeChat(digest=_digest()), _conversation()) is not None
     assert seen == {"compacted": True, "compacted_messages": 13}
 
 
 def test_dict_digest_is_validated():
-    update = _run(_mw(FakeChat(digest=_digest().model_dump())), _conversation())
-    assert update is not None
+    assert _run(FakeChat(digest=_digest().model_dump()), _conversation()) is not None
 
 
-def test_compaction_is_first_middleware_and_configured():
-    from analyst.config import Settings
-
-    s = Settings()
-    assert (s.compaction_trigger_tokens, s.compaction_keep_messages) == (60_000, 8)
-    first = analyst_middleware(s)[0]
-    assert isinstance(first, CompactionMiddleware)
-    assert not any(
-        isinstance(m, CompactionMiddleware)
-        for m in analyst_middleware(s, compaction=False)
-    )
+def test_input_messages_not_mutated():
+    msgs = _conversation()
+    _run(FakeChat(digest=_digest()), msgs)
+    assert all(m.id is None for m in msgs)

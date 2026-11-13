@@ -994,3 +994,121 @@ def test_zero_claim_answer_is_not_retried():
         isinstance(m, HumanMessage) and str(m.content).startswith("Verification failed")
         for m in out["messages"]
     )
+
+
+# --- compaction at the graph level ------------------------------------------
+
+
+def _saved(store, value: float) -> str:
+    return store.save(
+        pa.table({"v": pa.array([value])}),
+        produced_by="query_metrics",
+        source="seeded",
+        governed=True,
+        elapsed_s=0.0,
+    ).handle_id
+
+
+def _digest_turn(goal: str) -> AIMessage:
+    return AIMessage("", tool_calls=[call("Digest", {"goal": goal}, "d0")])
+
+
+def test_compaction_graph_keeps_turn_handles_and_prior_handle(monkeypatch):
+    from analyst.middleware.compaction import is_compaction_summary
+
+    monkeypatch.setenv("ANALYST_COMPACTION_TRIGGER_TOKENS", "1500")
+    monkeypatch.setenv("ANALYST_COMPACTION_KEEP_MESSAGES", "1")
+    get_settings.cache_clear()
+    store = registry.get_service("events", None).store
+    handle_a = _saved(store, 123_456.0)
+    history = [
+        HumanMessage("how many events last time?"),
+        AIMessage("", tool_calls=[call("query_metrics", COUNT, "c0")]),
+        ToolMessage(
+            "card " + "x" * 8000,
+            tool_call_id="c0",
+            artifact={"handle_id": handle_a, "produced_by": "query_metrics", "governed": True},
+        ),
+        AIMessage("There were 123,456 events.\n\nVerified"),
+        HumanMessage("how many events now?"),
+    ]
+
+    def cite_both(messages: list[BaseMessage]) -> AIMessage:
+        hid_b = handles_in(messages)[-1]
+        n = int(total(hid_b))
+        text = f"There were {n:,} events, against 123,456 before."
+        claims = [
+            {"text": f"{n:,} events", "type": "descriptive", "values": [n], "handles": [hid_b]},
+            {"text": "123,456 before", "type": "descriptive", "values": [123456], "handles": [handle_a]},
+        ]
+        return answer_turn(text, claims)
+
+    model = ScriptedModel(
+        script=[
+            _digest_turn("events count"),
+            no_plan(),
+            tool_turn(call("query_metrics", COUNT, "c1")),
+            cite_both,
+        ]
+    )
+    out = run(model, history)
+    messages = out["messages"]
+    assert is_compaction_summary(messages[0])
+    assert handle_a in messages[0].content
+    assert messages[1].content == "how many events now?"
+    assert out["answer"].verification.label in ("verified", "verified_off_model"), (
+        out["answer"].verification
+    )
+
+    # second turn: the thread is already small, so no new digest is made
+    model2 = ScriptedModel(
+        script=[no_plan(), tool_turn(call("query_metrics", COUNT, "c2")), cite_total]
+    )
+    out2 = run(model2, [*messages, HumanMessage("and again?")])
+    assert is_compaction_summary(out2["messages"][0])
+    assert sum(is_compaction_summary(m) for m in out2["messages"]) == 1
+    assert not any(
+        "Summarise the earlier part" in str(m.content)
+        for call_seen in model2.seen
+        for m in call_seen
+    )
+    assert out2["answer"].verification.label in ("verified", "verified_off_model")
+
+
+def test_question_skips_compaction_summary():
+    from langchain_core.messages.notification import add_notification_metadata
+
+    from analyst.graph import _question
+    from analyst.middleware.compaction import COMPACTION_SOURCE
+
+    summary = add_notification_metadata(
+        HumanMessage("Goal: 5 things"), source=COMPACTION_SOURCE
+    )
+    real = HumanMessage("real question")
+    assert _question([real, summary]) is real
+
+
+def test_compaction_default_model_comes_from_get_model(monkeypatch):
+    import analyst.graph as graph_mod
+    from analyst.middleware.compaction import is_compaction_summary
+
+    monkeypatch.setenv("ANALYST_COMPACTION_TRIGGER_TOKENS", "200")
+    monkeypatch.setenv("ANALYST_COMPACTION_KEEP_MESSAGES", "1")
+    get_settings.cache_clear()
+    specs = []
+    model = ScriptedModel(
+        script=[_digest_turn("g"), no_plan(), AIMessage("Nothing to compute.")]
+    )
+    monkeypatch.setattr(
+        graph_mod, "get_model", lambda spec=None: (specs.append(spec), model)[1]
+    )
+    history = [
+        HumanMessage("first " + "x" * 2000),
+        AIMessage("ok"),
+        HumanMessage("thanks"),
+    ]
+    out = asyncio.run(
+        build_graph().ainvoke({"messages": history}, context=CTX)
+    )
+    assert is_compaction_summary(out["messages"][0])
+    assert specs  # resolved through get_model, not an injected model

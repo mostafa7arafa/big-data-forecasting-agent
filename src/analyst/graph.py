@@ -32,6 +32,7 @@ from langchain_core.messages import (
     SystemMessage,
     ToolMessage,
 )
+from langchain_core.messages.utils import count_tokens_approximately
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.runtime import Runtime
@@ -49,6 +50,7 @@ from analyst.config import get_settings
 from analyst.context import AnalystContext
 from analyst.data.registry import get_service
 from analyst.middleware import analyst_middleware
+from analyst.middleware.compaction import compact_messages, is_compaction_summary
 from analyst.prompts import PLAN_PROMPT, build_system_prompt
 from analyst.providers import get_model
 from analyst.state import AnalystState, Answer, Plan, Verification
@@ -122,6 +124,7 @@ def _question(messages: Sequence[BaseMessage]) -> HumanMessage | None:
         if (
             isinstance(message, HumanMessage)
             and _source(message) not in (_VERIFY_SOURCE, _PLAN_SOURCE)
+            and not is_compaction_summary(message)
             and not is_background_notification(message)
         ):
             return message
@@ -267,7 +270,7 @@ def build_graph(
             resolve_model(spec),
             tools=DATA_TOOLS,
             middleware=[
-                *analyst_middleware(settings, model=model),
+                *analyst_middleware(settings),
                 AsyncSubAgentMiddleware(async_subagents=[WORKER]),
                 BackgroundGuard(settings.max_background_tasks),
                 *extra,
@@ -316,6 +319,31 @@ def build_graph(
             return reset
         runtime.stream_writer({"type": "plan", "steps": list(result.steps)})
         return {**reset, "plan": list(result.steps)}
+
+    async def compact(
+        state: AnalystState, runtime: Runtime[AnalystContext]
+    ) -> dict | None:
+        # A turn-start node (not agent middleware): the update lands in the
+        # thread state, so the thread itself shrinks and later turns reuse it.
+        messages = list(state["messages"])
+        settings = await asyncio.to_thread(get_settings)
+        if count_tokens_approximately(messages) <= settings.compaction_trigger_tokens:
+            return None
+        question = _question(messages)
+        protect = (
+            next(i for i, m in enumerate(messages) if m is question)
+            if question is not None
+            else len(messages)
+        )
+        ctx = await asyncio.to_thread(_context, runtime, state.get("wake_context"))
+        chat = await asyncio.to_thread(resolve_model, ctx.model)
+        return await compact_messages(
+            messages,
+            chat,
+            trigger_tokens=settings.compaction_trigger_tokens,
+            keep_messages=settings.compaction_keep_messages,
+            protect_from=protect,
+        )
 
     async def analyst(state: AnalystState, runtime: Runtime[AnalystContext]) -> dict:
         ctx = await asyncio.to_thread(_context, runtime, state.get("wake_context"))
@@ -434,11 +462,13 @@ def build_graph(
         return {"answer": final, "verification": verification, "messages": [message]}
 
     builder = StateGraph(AnalystState, context_schema=AnalystContext)
+    builder.add_node("compact", compact)
     builder.add_node("plan", plan)
     builder.add_node("analyst", analyst)
     builder.add_node("verify", verify)
     builder.add_node("answer", answer)
-    builder.add_edge(START, "plan")
+    builder.add_edge(START, "compact")
+    builder.add_edge("compact", "plan")
     builder.add_edge("plan", "analyst")
     builder.add_edge("analyst", "verify")
     builder.add_edge("answer", END)
