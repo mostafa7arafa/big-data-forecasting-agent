@@ -52,6 +52,10 @@ _SCORE_FIELDS = (
 _BASELINE_NOTE = "no model beat the seasonal baseline"
 _BACKTEST_SERIES_LIMIT = 5
 _FORECAST_LEVELS = (80, 95)
+_VALUE_LIMIT = 50
+# Same id-share rule as analyst.forecasting.replay.min_share.
+_MIN_HEADLINE_SHARE = 0.01
+_HEADLINE_RULE = "ids with ≥ 1% share of total"
 # Seconds per (series id x backtest window); rough single-core estimates.
 _WINDOW_COST_S = {"D": 0.6, "MS": 0.05}
 
@@ -404,6 +408,8 @@ class DataService:
         frame = run.forecast.loc[:, list(_FORECAST_COLUMNS)]
         forecast_table = pa.Table.from_pandas(frame, preserve_index=False)
         kept = _kept_scores(run.backtest.scores, run.model)
+        headline_ids = _headline_ids(table, id_col=id_col, value_col=value_col)
+        headline_kept = kept.loc[kept["unique_id"].map(str).isin(set(headline_ids))]
         # A budget-truncated run is returned but never served from the cache.
         complete = run.backtest.windows_used >= run.backtest.windows
         backtest_card = self.store.save(
@@ -421,13 +427,17 @@ class DataService:
             "freq": freq,
             "beats_baseline": bool(run.backtest.beats_baseline),
             "backtest_handle": backtest_card.handle_id,
-            "backtest_summary": _backtest_summary(kept, run.model),
+            "backtest_summary": _backtest_summary(
+                headline_kept if len(headline_kept) else kept, run.model
+            ),
             "input_handle": handle_id,
             "cutoff": self.engine.cutoff.isoformat() if self.engine.cutoff else None,
             "data_end": data_end.isoformat(),
             "windows_used": int(run.backtest.windows_used),
             "candidates": candidate_names,
             "candidates_source": candidates_source,
+            "headline_ids": headline_ids,
+            "headline_rule": _HEADLINE_RULE,
         }
         if kept["unique_id"].nunique() <= _BACKTEST_SERIES_LIMIT:
             meta["backtest"] = _backtest_rows(kept)
@@ -534,10 +544,16 @@ def _describe_dimension_values(
     source = from_sql(model, [dimension])
     sql = (
         f"SELECT {dimension.expr} AS value, count(*) AS n\n{source}\n"
-        "GROUP BY 1\nORDER BY n DESC\nLIMIT 50"
+        f"GROUP BY 1\nORDER BY n DESC\nLIMIT {_VALUE_LIMIT}"
     )
     table = engine.execute(sql)
     lines = [f"{row['value']}\t{row['n']}" for row in table.to_pylist()]
+    if table.num_rows >= _VALUE_LIMIT:
+        total = engine.execute(
+            f"SELECT count(DISTINCT {dimension.expr}) AS n\n{source}"
+        )[0][0].as_py()
+        if total > _VALUE_LIMIT:
+            lines.insert(0, f"showing {_VALUE_LIMIT} of {total} values")
     return "\n".join(lines)
 
 
@@ -559,6 +575,21 @@ def _format_bound(dt: datetime) -> str:
     if dt.hour == 0 and dt.minute == 0 and dt.second == 0 and dt.microsecond == 0:
         return dt.date().isoformat()
     return dt.strftime("%Y-%m-%d %H:%M")
+
+
+def _headline_ids(
+    table: pa.Table, *, id_col: str | None, value_col: str
+) -> list[str]:
+    """Ids whose total is at least 1% of the headline total."""
+    if id_col is None:
+        return ["series"]
+    frame = table.select([id_col, value_col]).to_pandas()
+    totals = frame.groupby(id_col)[value_col].sum()
+    shares = totals / totals.sum()
+    headline = totals[shares >= _MIN_HEADLINE_SHARE]
+    # A degenerate total (all zero/negative) cannot rank ids; keep every id.
+    wanted = headline.index if not headline.empty else totals.index
+    return [str(uid) for uid in wanted]
 
 
 def _coverage_notes(
@@ -594,7 +625,54 @@ def _coverage_notes(
                 f"(data ends {_format_bound(cov.end)})"
             )
             extra["partial_last_period"] = period_label
+    if (
+        q.time_range is not None
+        and q.grain in {"week", "month"}
+        and table.num_rows > 0
+        and "period" in table.column_names
+    ):
+        start, end = q.time_range
+        first_period = _min_period(table.column("period"))
+        last_period = _max_period(table.column("period"))
+        if first_period is not None and datetime.combine(
+            start, datetime.min.time()
+        ) > _period_start(first_period, q.grain):
+            notes.append(
+                f"{_grain_label(first_period, q.grain)} is partial: "
+                f"time_range starts {start.isoformat()}"
+            )
+        if last_period is not None and datetime.combine(
+            end, datetime.min.time()
+        ) <= _period_threshold(last_period, q.grain):
+            notes.append(
+                f"{_grain_label(last_period, q.grain)} is partial: "
+                f"time_range ends {end.isoformat()}"
+            )
     return notes, extra
+
+
+def _min_period(column: pa.ChunkedArray) -> date | datetime | None:
+    values = [v for v in column.to_pylist() if v is not None]
+    if not values:
+        return None
+    return min(values)
+
+
+def _period_start(period: date | datetime, grain: str) -> datetime:
+    if isinstance(period, datetime):
+        period = period.date()
+    if grain == "month":
+        return datetime(period.year, period.month, 1)
+    if grain == "week":
+        monday = period - timedelta(days=period.weekday())
+        return datetime.combine(monday, datetime.min.time())
+    return datetime.combine(period, datetime.min.time())
+
+
+def _grain_label(period: date | datetime, grain: str) -> str:
+    if grain == "month":
+        return f"{period:%Y-%m}"
+    return _period_label(period)
 
 
 def _max_period(column: pa.ChunkedArray) -> date | datetime | None:

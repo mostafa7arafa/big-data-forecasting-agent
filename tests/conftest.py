@@ -75,6 +75,9 @@ dimensions:
     synonyms: [zone_group]
   - name: region_id
     expr: region_id
+  - name: region_slot
+    expr: region_id * 10000 + hour(ts) * 100 + dayofweek(ts)
+    description: Region, hour-of-day and weekday identifier (more than 50 values)
 filters:
   - name: positive_qty
     expr: qty > 0

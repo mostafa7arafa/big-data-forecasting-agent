@@ -172,7 +172,10 @@ def test_missing_dates_reindexed():
     assert list(result.df) == ["unique_id", "ds", "y"]
     assert result.df.y.tolist() == [1, 2, 3, 4, 5]
     assert result.df.unique_id.nunique() == 1
-    assert "imputed 2 missing days 2024-01-02..2024-01-03" in result.adjustments
+    assert (
+        "imputed 2 missing days 2024-01-02..2024-01-03 by interpolation"
+        in result.adjustments
+    )
 
 
 def test_partial_last_month_dropped():

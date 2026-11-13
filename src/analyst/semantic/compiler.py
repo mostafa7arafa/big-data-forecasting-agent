@@ -33,7 +33,15 @@ class MetricQuery(BaseModel):
     filters: list[FilterSpec] = Field(default_factory=list)
     grain: Literal["hour", "day", "week", "month"] | None = None
     time_range: tuple[date, date] | None = None
-    compare_to: Literal["previous_period", "same_period_last_year"] | None = None
+    compare_to: Literal["previous_period", "same_period_last_year"] | None = Field(
+        default=None,
+        description=(
+            "previous_period compares with the immediately preceding equal-length "
+            "range. same_period_last_year compares with the same range one year "
+            "earlier; without a grain, the whole time_range is compared with the "
+            "same range one year earlier, as one total."
+        ),
+    )
     share: bool = False
     order_by: str | None = None
     order_desc: bool = False
@@ -58,7 +66,7 @@ def _literal(value: str | int) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
-def _approved(item: MemoryItem, name: str, allow_proposed: bool) -> None:
+def approved(item: MemoryItem, name: str, allow_proposed: bool) -> None:
     if item.status != "approved" and not allow_proposed:
         raise InvalidRequestError(
             f"{name!r} is {item.status}; only approved items may be used"
@@ -76,7 +84,7 @@ def from_sql(
         if name not in joins:
             raise InvalidRequestError(f"unknown join {name!r}")
         join = joins[name]
-        _approved(join, join.name, allow_proposed)
+        approved(join, join.name, allow_proposed)
         sql += (
             f"\nLEFT JOIN main.{_identifier(join.table)} AS {_identifier(join.name)}"
             f" ON {join.on}"
@@ -155,7 +163,7 @@ def _metric_predicates(
                     hint="call describe('metrics')",
                 )
             item = filters[name]
-            _approved(item, name, allow_proposed)
+            approved(item, name, allow_proposed)
             parts.append(f"({item.expr})")
         predicates[metric.name] = " AND ".join(parts)
     return predicates
@@ -256,7 +264,7 @@ def compile_query(
     dimensions = [model.dimension(name) for name in q.dimensions]
     filter_dimensions = [model.dimension(spec.dimension) for spec in q.filters]
     for item in [*metrics, *dimensions, *filter_dimensions]:
-        _approved(item, item.name, allow_proposed)
+        approved(item, item.name, allow_proposed)
         _identifier(item.name)
     source = from_sql(
         model, dimensions + filter_dimensions, allow_proposed=allow_proposed

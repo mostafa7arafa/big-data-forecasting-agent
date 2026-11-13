@@ -117,6 +117,36 @@ def _monthly_gaps(group, quirks, adjustments, *, additive: bool):
             )
 
 
+def _quirk_periods(quirks: Sequence[Quirk], freq: Freq) -> set[pd.Timestamp]:
+    """Calendar periods covered by the approved impute quirks."""
+    periods: set[pd.Timestamp] = set()
+    for quirk in quirks:
+        start = pd.Timestamp(quirk.start)
+        end = pd.Timestamp(quirk.end or quirk.start)
+        if freq == "D":
+            periods.update(pd.date_range(start.normalize(), end.normalize(), freq="D"))
+        else:
+            periods.update(
+                pd.date_range(
+                    start.to_period("M").start_time,
+                    end.to_period("M").start_time,
+                    freq="MS",
+                )
+            )
+    return periods
+
+
+def _plural(count: int, unit: str) -> str:
+    return unit if count == 1 else unit + "s"
+
+
+def _runs(full_index: pd.DatetimeIndex, positions: np.ndarray):
+    """Yield the contiguous calendar runs inside a set of positions."""
+    for chunk in np.split(positions, np.flatnonzero(np.diff(positions) > 1) + 1):
+        if len(chunk):
+            yield full_index[chunk]
+
+
 def prepare_series(
     df: pd.DataFrame,
     *,
@@ -132,15 +162,17 @@ def prepare_series(
 
     Boundary gaps use the nearest observed value (no extrapolated trend). An
     entirely missing series cannot be imputed and is rejected. Only approved
-    impute quirks apply. Additive monthly metrics are scaled by observed-day fraction;
-    non-additive metrics use interpolation across known gaps. Whole missing months are
-    interpolated. Input is copied.
+    impute quirks apply. Periods with no events are zero-filled for additive
+    metrics (and interpolated otherwise); quirk-covered periods keep their
+    audit treatment. Additive monthly metrics are scaled by observed-day fraction;
+    non-additive metrics use interpolation across known gaps. Input is copied.
     """
     _check_freq(freq)
     data_end = pd.Timestamp(data_end)
     if data_end.tzinfo is not None:
         raise InvalidRequestError("data_end must be timezone-naive")
     quirks = [q for q in quirks if q.status == "approved" and q.treatment == "impute"]
+    quirk_periods = _quirk_periods(quirks, freq)
     columns = [time_col, value_col] + ([id_col] if id_col else [])
     frame = df[columns].rename(columns={time_col: "ds", value_col: "y"}).copy()
     if id_col:
@@ -179,15 +211,26 @@ def prepare_series(
         missing = full_index.difference(group.index)
         group = group.reindex(full_index)
         unit = "days" if freq == "D" else "months"
+        period_unit = "day" if freq == "D" else "month"
         # Describe each contiguous gap rather than implying nonmissing dates
-        # between disjoint gaps were also imputed.
+        # between disjoint gaps were also imputed. Additive metrics treat
+        # event-free periods as real zeros, but quirk-covered periods keep the
+        # imputation the quirk handling below reports.
         positions = full_index.get_indexer(missing)
         for chunk in np.split(positions, np.flatnonzero(np.diff(positions) > 1) + 1):
-            if len(chunk):
-                start, end = full_index[chunk[0]], full_index[chunk[-1]]
-                adjustments.append(
-                    f"imputed {len(chunk)} missing {unit} {start.date()}..{end.date()}"
-                )
+            if not len(chunk):
+                continue
+            covered = full_index[chunk].isin(quirk_periods)
+            for run in _runs(full_index, chunk[~covered]):
+                plural = _plural(len(run), period_unit)
+                if additive:
+                    group.loc[run, "y"] = 0.0
+                    adjustments.append(f"zero-filled {len(run)} {plural} with no events")
+                else:
+                    adjustments.append(
+                        f"imputed {len(run)} missing {plural} "
+                        f"{run[0].date()}..{run[-1].date()} by interpolation"
+                    )
         existing_missing = group.y.isna() & ~group.index.isin(missing)
         if existing_missing.any():
             dates = group.index[existing_missing]
