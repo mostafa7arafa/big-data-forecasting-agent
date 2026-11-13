@@ -7,7 +7,6 @@ synced to the LangSmith dataset ``analyst-single-turn`` and run as an experiment
 import argparse
 import asyncio
 import re
-import statistics
 import subprocess
 import sys
 from pathlib import Path
@@ -21,6 +20,7 @@ from evals.target import (
     DATASET_NAME,
     evaluators,
     example_id,
+    format_summary,
     run_case,
     run_local,
     summarize,
@@ -62,32 +62,13 @@ def select(rows: list[dict], ids: list[str] | None, limit: int | None) -> list[d
     return rows[:limit] if limit else rows
 
 
-def print_summary(summary: dict) -> None:
-    def pct(x: float | None) -> str:
-        return "n/a" if x is None else f"{x:.0%}"
-
-    print(f"\nPass rate: {pct(summary['overall'])} over {summary['n']} runs")
-    print("By category:")
-    for name, value in summary["by_category"].items():
-        print(f"  {name:<10} {pct(value)}")
-    print("By gate:")
-    for name, value in summary["by_gate"].items():
-        print(f"  {name:<14} {pct(value)}")
-    wape = summary["mean_forecast_wape"]
-    if wape is not None:
-        print(f"Mean forecast WAPE: {wape:.3f}")
-
-
 def run_dry(rows: list[dict], model: str | None) -> None:
     results = asyncio.run(run_local(rows, model=model))
     for r in results:
         failed = [x["key"] for x in r["results"] if x["score"] is False]
         error = r["outputs"].get("error")
         print(f"{r['id']} {r['category']:<10} {'PASS' if r['passed'] else 'FAIL'} {error or ','.join(failed)}")
-    latencies = [r["outputs"]["latency_s"] for r in results if "latency_s" in r["outputs"]]
-    print_summary(summarize(results))
-    if latencies:
-        print(f"Median latency: {statistics.median(latencies):.1f}s")
+    print("\n" + format_summary(summarize(results)))
 
 
 async def run_experiment(rows: list[dict], args: argparse.Namespace) -> None:
@@ -128,11 +109,15 @@ async def run_experiment(rows: list[dict], args: argparse.Namespace) -> None:
                 "id": reference.get("id"),
                 "category": reference.get("category", "?"),
                 "results": scored,
+                "outputs": item["run"].outputs or {},
                 "passed": by_key.get("passed", {}).get("score") is True,
             }
         )
     print(f"dataset tag: {tag}; experiment prefix: {prefix}")
-    print_summary(summarize(results))
+    name = getattr(experiment, "experiment_name", None)
+    url = getattr(getattr(experiment, "_manager", None), "_experiment", None)
+    url = getattr(url, "url", None)
+    print(format_summary(summarize(results), experiment=name or prefix, url=url))
 
 
 def main(argv: list[str] | None = None) -> None:

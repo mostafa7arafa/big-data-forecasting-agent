@@ -212,7 +212,8 @@ docs/              spec, plans, research, results
 ## Roadmap
 
 - [x] **Plan A: data and forecasting core.** Engine, semantic layer, forecasting, cutoff replay, profiler, gold set ([PR #1](https://github.com/mostafa7arafa/big-data-forecasting-agent/pull/1))
-- [ ] **Plan B: the agent.** LangGraph analyst with `create_agent`, a guarded CodeAct sandbox, OpenAI / OpenRouter / NanoGPT providers, context compaction, LangSmith tracing
+- [x] **Plan B1: the agent in LangGraph Studio.** The analyst graph, tools, verification labels, background worker and a 50-question eval run as a LangSmith experiment
+- [ ] **Plan B2: sandbox and compaction.** A guarded CodeAct sandbox and context compaction
 - [ ] **Plan C: calibration and memory.** The agent drafts a new dataset's semantic layer from the profile, you approve it, and it remembers per user across sessions
 - [ ] **Plan D: evals at scale.** About 70 gold questions, agent-level cutoff replay, grounding checks, model comparisons, a second non-taxi dataset
 - [ ] **Web: Leptos/Rust dashboard.** Built to render millions of chart points without lag

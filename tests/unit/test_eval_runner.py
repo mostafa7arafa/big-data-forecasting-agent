@@ -6,6 +6,8 @@ import re
 from datetime import datetime
 from types import SimpleNamespace
 
+import pytest
+
 from analyst.graph import build_graph
 from evals.graders.agent import GATES, GRADERS, passed
 from evals.target import (
@@ -13,6 +15,7 @@ from evals.target import (
     content_hash,
     evaluators,
     example_id,
+    format_summary,
     run_case,
     run_local,
     summarize,
@@ -78,6 +81,7 @@ class FakeClient:
         self.examples: dict = {}
         self.tags: list[tuple[datetime, str]] = []
         self.versions = 0
+        self.writes = 0
 
     def has_dataset(self, *, dataset_name):
         return self.exists
@@ -87,17 +91,19 @@ class FakeClient:
         return SimpleNamespace(id="ds")
 
     def list_examples(self, *, dataset_name, **kw):
-        return [SimpleNamespace(id=i) for i in self.examples]
+        return [SimpleNamespace(id=i, **{k: e[k] for k in ("inputs", "outputs", "metadata")}) for i, e in self.examples.items()]
 
     def create_examples(self, *, dataset_name, examples):
         for e in examples:
             self.examples[e["id"]] = e
         self.versions += 1
+        self.writes += 1
 
     def update_examples(self, *, dataset_name, updates):
         for e in updates:
             self.examples[e["id"]] = e
         self.versions += 1
+        self.writes += 1
 
     def list_dataset_versions(self, *, dataset_name):
         return [SimpleNamespace(tags=[t], as_of=a) for a, t in self.tags]
@@ -151,3 +157,48 @@ def test_run_local_and_summarize():
     assert summary["by_category"] == {"lookup": 1.0}
     assert summary["by_gate"]["label"] == 1.0
     assert summary["n"] == 2
+
+
+def test_sync_dataset_skips_unchanged_and_lists_stale(capsys):
+    client = FakeClient()
+    rows = [ROW, {**ROW, "id": "x002"}]
+    sync_dataset(client, rows)
+    writes = client.writes
+    sync_dataset(client, rows)
+    assert client.writes == writes  # identical rows: no create, no update
+    sync_dataset(client, [ROW])
+    assert client.writes == writes
+    assert f"stale ids: {example_id('x002')}" in capsys.readouterr().out
+    sync_dataset(client, [{**ROW, "question": "changed?"}])
+    assert client.writes == writes + 1
+
+
+def test_summary_metrics_and_format():
+    def res(key, score, comment=""):
+        return {"key": key, "score": score, "comment": comment}
+
+    def row(cat, ok, latency, tool_bytes, usage, forecast=None):
+        results = [res("label", ok), res("trajectory", ok)]
+        if forecast is not None:
+            results.append(res("forecast_skill", forecast, "wape=0.1 coverage_80=0.80 coverage_95=0.90"))
+        return {
+            "category": cat, "passed": ok, "results": results,
+            "outputs": {"latency_s": latency, "tool_bytes": tool_bytes, "usage": usage},
+        }
+
+    rows = [
+        row("lookup", True, 1.0, 100, {"input_tokens": 10, "output_tokens": 5, "cost": 0.01}),
+        row("lookup", False, 3.0, 900, {"input_tokens": 20, "output_tokens": 15, "cost": 0.03}),
+        row("forecast", True, 5.0, 300, {"input_tokens": 30, "output_tokens": 20}, forecast=0.1),
+    ]
+    s = summarize(rows)
+    assert s["median_latency_s"] == 3.0 and s["p95_latency_s"] == 5.0
+    assert s["mean_cost_usd"] == pytest.approx(0.02)
+    assert s["mean_tokens"] == pytest.approx((15 + 35 + 50) / 3)
+    assert s["peak_tool_bytes"] == 900
+    assert s["mean_trajectory"] == pytest.approx(2 / 3)
+    assert s["mean_forecast_wape"] == pytest.approx(0.1)
+    assert s["mean_coverage_80"] == pytest.approx(0.8) and s["mean_coverage_95"] == pytest.approx(0.9)
+    text = format_summary(s, experiment="exp-1", url="https://x/y")
+    assert "exp-1 (https://x/y)" in text and "p95 5.0s" in text and "$0.0200" in text
+    assert "n/a" in format_summary(summarize([{"category": "a", "passed": True, "results": []}]))
