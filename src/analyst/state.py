@@ -3,7 +3,20 @@
 from typing import Annotated, Literal, TypedDict
 
 from langgraph.graph.message import add_messages
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+
+def _none_to_list(value: object) -> object:
+    """Providers may send ``null`` for an optional list; treat it as empty."""
+    return [] if value is None else value
+
+
+def _null_lists(*fields: str):
+    """A before-validator coercing ``None`` to ``[]`` on the given list fields.
+
+    The JSON schema stays a plain array (with ``items``), which OpenAI accepts.
+    """
+    return field_validator(*fields, mode="before")(_none_to_list)
 
 
 class Claim(BaseModel):
@@ -12,6 +25,8 @@ class Claim(BaseModel):
     values: list[float] = Field(default_factory=list)
     handles: list[str] = Field(default_factory=list)
     fact_ids: list[str] = Field(default_factory=list)
+
+    _lists = _null_lists("values", "handles", "fact_ids")
 
 
 class ChartSpec(BaseModel):
@@ -24,6 +39,8 @@ class ChartSpec(BaseModel):
     forecast_handle: str | None = None
     bands: list[int] = Field(default_factory=list)
     last_year_handle: str | None = None
+
+    _lists = _null_lists("bands")
 
 
 class Verification(BaseModel):
@@ -40,6 +57,8 @@ class Answer(BaseModel):
     sql: list[str] = Field(default_factory=list)
     verification: Verification | None = None
     background_tasks: list[str] = Field(default_factory=list)
+
+    _lists = _null_lists("claims", "charts", "sql", "background_tasks")
 
 
 class Plan(BaseModel):

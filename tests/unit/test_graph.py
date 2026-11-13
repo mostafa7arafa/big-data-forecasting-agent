@@ -26,6 +26,7 @@ from analyst.data.service import DataService
 from analyst.graph import build_graph
 from analyst.memory.knowledge import TOPICS
 from analyst.prompts import build_system_prompt
+from analyst.state import Answer, Claim
 
 REPO = Path(__file__).resolve().parents[2]
 CTX = AnalystContext(dataset="events", background=False)
@@ -441,3 +442,172 @@ def test_background_policy_off_until_async_tools_exist():
     system = model.seen[1][0].content
     assert "## Background work" not in system
     assert "no background tasks" in system
+
+
+# --- fix round 2 -----------------------------------------------------------
+
+
+def provider_model(script: list[Any]) -> ScriptedModel:
+    """A model whose profile makes create_agent use the provider strategy:
+    the final answer arrives as JSON text, as it does from OpenAI."""
+    return ScriptedModel(script=script, profile={"structured_output": True})
+
+
+def json_turn(payload: dict) -> AIMessage:
+    return AIMessage(json.dumps(payload))
+
+
+def cite_total_json_with_nulls(messages: list[BaseMessage]) -> AIMessage:
+    hid = handles_in(messages)[-1]
+    n = int(total(hid))
+    text = f"There were {n:,} events."
+    return json_turn(
+        {
+            "narrative": text,
+            "claims": [
+                {
+                    "text": text,
+                    "type": "descriptive",
+                    "values": [n],
+                    "handles": [hid],
+                    "fact_ids": None,
+                }
+            ],
+            "charts": [
+                {
+                    "kind": "bar",
+                    "title": "Events",
+                    "handle": hid,
+                    "x": "event_count",
+                    "y": "event_count",
+                    "bands": None,
+                }
+            ],
+            "sql": None,
+            "background_tasks": None,
+        }
+    )
+
+
+def test_answer_schema_coerces_null_lists():
+    answer = Answer.model_validate(
+        {
+            "narrative": "n",
+            "claims": None,
+            "charts": [
+                {
+                    "kind": "line",
+                    "title": "t",
+                    "handle": "r_1",
+                    "x": "a",
+                    "y": "b",
+                    "bands": None,
+                }
+            ],
+            "sql": None,
+            "background_tasks": None,
+        }
+    )
+    assert answer.claims == [] and answer.sql == [] and answer.background_tasks == []
+    assert answer.charts[0].bands == []
+    claim = Claim.model_validate(
+        {
+            "text": "t",
+            "type": "descriptive",
+            "values": None,
+            "handles": None,
+            "fact_ids": None,
+        }
+    )
+    assert claim.values == [] and claim.handles == [] and claim.fact_ids == []
+
+
+def test_answer_json_schema_arrays_have_items():
+    from langchain_core.utils.function_calling import convert_to_openai_tool
+
+    def walk(node):
+        if isinstance(node, dict):
+            if node.get("type") == "array":
+                assert "items" in node and "prefixItems" not in node, node
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for value in node:
+                walk(value)
+
+    walk(Answer.model_json_schema())
+    walk(convert_to_openai_tool(Answer))
+
+
+def test_provider_null_list_fields_do_not_raise():
+    model = provider_model(
+        [
+            no_plan(),
+            tool_turn(call("query_metrics", COUNT, "c1")),
+            cite_total_json_with_nulls,
+        ]
+    )
+    out = run(model, [HumanMessage("how many events?")])
+    answer = out["answer"]
+    assert answer.verification.label == "verified", answer.verification
+    assert answer.charts[0].bands == []
+
+
+def test_unrepairable_structured_output_is_not_verified():
+    model = provider_model(
+        [
+            no_plan(),
+            tool_turn(call("query_metrics", COUNT, "c1")),
+            json_turn({"narrative": {"oops": 1}, "claims": "nope"}),
+        ]
+    )
+    out = run(model, [HumanMessage("how many events?")])
+    verification = out["answer"].verification
+    assert verification.label == "not_verified"
+    assert verification.reason == "no structured answer"
+    # the work done before the bad answer stays in the thread
+    assert any(
+        isinstance(m, ToolMessage) and m.tool_call_id == "c1" for m in out["messages"]
+    )
+
+
+def _is_answer_json(text: str) -> bool:
+    try:
+        Answer.model_validate_json(text)
+    except ValueError:
+        return False
+    return True
+
+
+@pytest.mark.parametrize("strategy", ["tool", "provider"])
+def test_raw_structured_response_not_persisted(strategy):
+    if strategy == "tool":
+        model = ScriptedModel(
+            script=[
+                no_plan(),
+                tool_turn(call("query_metrics", COUNT, "c1")),
+                cite_total,
+            ]
+        )
+    else:
+        model = provider_model(
+            [
+                no_plan(),
+                tool_turn(call("query_metrics", COUNT, "c1")),
+                cite_total_json_with_nulls,
+            ]
+        )
+    out = run(model, [HumanMessage("how many events?")])
+    assert out["answer"].verification.label == "verified"
+    messages = out["messages"]
+    ai = [m for m in messages if isinstance(m, AIMessage)]
+    assert not any(_is_answer_json(str(m.content)) for m in ai)
+    assert not any(tc["name"] == "Answer" for m in ai for tc in m.tool_calls)
+    answer_calls = {"a1"}
+    assert not any(
+        isinstance(m, ToolMessage) and m.tool_call_id in answer_calls for m in messages
+    )
+    # status line + tool call and its result are kept; the chip message is last
+    assert any(m.tool_calls and m.content == "Pulling the totals." for m in ai)
+    assert any(isinstance(m, ToolMessage) and m.tool_call_id == "c1" for m in messages)
+    assert messages[-1].content.startswith(out["answer"].narrative + "\n\n")

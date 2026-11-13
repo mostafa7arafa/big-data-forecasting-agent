@@ -22,12 +22,20 @@ from functools import lru_cache
 from typing import Any, Literal
 
 from langchain.agents import create_agent
+from langchain.agents.structured_output import StructuredOutputError
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
+from langchain_core.messages import (
+    AIMessage,
+    BaseMessage,
+    HumanMessage,
+    SystemMessage,
+    ToolMessage,
+)
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.runtime import Runtime
 from langgraph.types import Command
+from pydantic import ValidationError
 
 from analyst.context import AnalystContext
 from analyst.data.registry import get_service
@@ -124,6 +132,46 @@ def _question(messages: Sequence[BaseMessage]) -> HumanMessage | None:
     return None
 
 
+_ANSWER_TOOL = Answer.__name__
+
+
+def _drop_structured_response(
+    new: list[BaseMessage], *, structured: bool
+) -> list[BaseMessage]:
+    """The agent's new messages minus the raw structured answer.
+
+    The answer node posts the visible final answer, so the agent's own copy is
+    clutter: under the tool strategy an ``Answer`` tool call and its tool
+    message, under the provider strategy the closing JSON-text AI message.
+    Status lines, data tool calls and their results stay.
+    """
+    answer_ids = {
+        tc["id"]
+        for m in new
+        if isinstance(m, AIMessage)
+        for tc in m.tool_calls
+        if tc["name"] == _ANSWER_TOOL
+    }
+    kept = [
+        m
+        for m in new
+        if not (
+            isinstance(m, AIMessage)
+            and any(tc["name"] == _ANSWER_TOOL for tc in m.tool_calls)
+        )
+        and not (isinstance(m, ToolMessage) and m.tool_call_id in answer_ids)
+    ]
+    if (
+        structured
+        and not answer_ids
+        and kept
+        and isinstance(kept[-1], AIMessage)
+        and not kept[-1].tool_calls
+    ):
+        kept.pop()  # provider strategy: the final message is the JSON answer
+    return kept
+
+
 def _context(runtime: Runtime[AnalystContext]) -> AnalystContext:
     """The run's context with background work gated on the async-task tools.
 
@@ -216,13 +264,25 @@ def build_graph(
                     additional_kwargs={SOURCE_KEY: _PLAN_SOURCE},
                 )
             )
-        result = await agent.ainvoke({"messages": messages}, context=ctx)
-        new = result["messages"][len(messages) :]
-        draft = result.get("structured_response")
-        return {
-            "messages": new,
-            "draft": draft if isinstance(draft, Answer) else None,
-        }
+        # Stream state snapshots so the work done so far survives a
+        # structured-output failure; that failure must never escape the graph
+        # (it becomes the answer node's "no structured answer" path).
+        last: dict[str, Any] = {"messages": messages}
+        try:
+            async for snapshot in agent.astream(
+                {"messages": messages}, context=ctx, stream_mode="values"
+            ):
+                last = snapshot
+        except (StructuredOutputError, ValidationError, ValueError):
+            logger.warning("analyst gave no valid structured answer", exc_info=True)
+            last = {**last, "structured_response": None}
+        draft = last.get("structured_response")
+        if not isinstance(draft, Answer):
+            draft = None
+        new = _drop_structured_response(
+            list(last["messages"][len(messages) :]), structured=draft is not None
+        )
+        return {"messages": new, "draft": draft}
 
     async def verify(
         state: AnalystState, runtime: Runtime[AnalystContext]
@@ -266,8 +326,18 @@ def build_graph(
         draft = state.get("draft")
         verification = state.get("verification")
         if draft is None:
+            # The latest prose reply of this turn, never an earlier turn's answer.
+            messages = state["messages"]
+            question = _question(messages)
+            start = 0
+            if question is not None:
+                start = next(i for i, m in enumerate(messages) if m is question) + 1
             last_ai = next(
-                (m for m in reversed(state["messages"]) if isinstance(m, AIMessage)),
+                (
+                    m
+                    for m in reversed(messages[start:])
+                    if isinstance(m, AIMessage) and not m.tool_calls
+                ),
                 None,
             )
             verification = Verification(
