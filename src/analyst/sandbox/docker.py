@@ -11,7 +11,6 @@ import json
 import os
 import queue
 import re
-import shutil
 import stat
 import subprocess
 import threading
@@ -134,6 +133,7 @@ class DockerSandbox:
                 pass
 
     def _restarted(self, error: str) -> ExecResult:
+        self._notice = ""
         self._kill()
         return ExecResult(ok=False, stdout="", error=error, restarted=True)
 
@@ -188,7 +188,7 @@ class DockerSandbox:
                 continue
             try:
                 staged = self._stage(fname)
-            except OSError as exc:
+            except (OSError, ValueError) as exc:
                 msg = f"rejected saved file {fname!r}: {exc}"
                 error = f"{error}\n{msg}" if error else msg
                 continue
@@ -211,7 +211,7 @@ class DockerSandbox:
         src = self.out_dir / fname
         if src.parent.resolve() != self.out_dir.resolve():
             raise OSError("path escapes the output directory")
-        fd = os.open(src, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0))
+        fd = os.open(src, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0))
         try:
             st = os.fstat(fd)
             if not stat.S_ISREG(st.st_mode):
@@ -220,8 +220,18 @@ class DockerSandbox:
                 raise OSError("file has multiple hard links")
             self.staging_dir.mkdir(parents=True, exist_ok=True)
             dest = self.staging_dir / f"{uuid.uuid4().hex}.parquet"
-            with os.fdopen(fd, "rb", closefd=False) as fin, open(dest, "xb") as fout:
-                shutil.copyfileobj(fin, fout)
+            try:
+                with os.fdopen(fd, "rb", closefd=False) as fin, open(dest, "xb") as fout:
+                    remaining = st.st_size
+                    while remaining > 0:
+                        chunk = fin.read(min(1 << 20, remaining))
+                        if not chunk:
+                            break
+                        fout.write(chunk)
+                        remaining -= len(chunk)
+            except BaseException:
+                dest.unlink(missing_ok=True)
+                raise
         finally:
             os.close(fd)
         try:

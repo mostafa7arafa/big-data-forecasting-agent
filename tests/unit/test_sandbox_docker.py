@@ -1,6 +1,7 @@
 import io
 import os
 import subprocess
+import threading
 from datetime import date
 from pathlib import Path
 
@@ -89,6 +90,25 @@ def test_normal_file_is_staged_outside_out_dir(tmp_path):
     (f,) = res.saved
     assert sb.out_dir not in f.path.parents and f.path.read_bytes() == b"abc"
     assert not (sb.out_dir / "n.parquet").exists()
+
+
+def test_fifo_in_scratch_rejected_without_hang(tmp_path):
+    sb = _box(tmp_path)
+    os.mkfifo(sb.out_dir / "f.parquet")
+    out = []
+    t = threading.Thread(target=lambda: out.append(sb._to_result(_resp("f"))), daemon=True)
+    t.start()
+    t.join(5)
+    assert not t.is_alive(), "FIFO open blocked"
+    assert not out[0].ok and not out[0].saved and "regular" in out[0].error
+
+
+def test_nul_in_name_rejected(tmp_path):
+    sb = _box(tmp_path)
+    resp = _resp("a")
+    resp["saved"][0]["path"] = "/artifacts/out/a\x00.parquet"
+    res = sb._to_result(resp)
+    assert not res.ok and not res.saved and "rejected" in res.error
 
 
 def test_exited_between_calls_reports_restart(tmp_path, monkeypatch):
