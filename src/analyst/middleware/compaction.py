@@ -10,8 +10,8 @@ message except the last ``keep_messages`` is replaced by one harness-added
 with their numbers and handles, live handles, open questions and user
 preferences. Handle ids survive verbatim: the digest's handle list is the
 union of what the model listed and every id found in the removed messages
-(text, tool artifacts), and the message carries a ``Handles:`` line that
-``collect_handles`` reads back.
+(text, tool artifacts), and the message carries a ``Handles:`` line. Prior
+handles resolve through the result store when a claim cites them.
 
 The first user question is not kept as a separate message: the digest's
 ``goal`` carries it, and a later compaction folds the earlier digest in.
@@ -61,7 +61,7 @@ DIGEST_PROMPT = (
     "lets the analysis continue. Record: the user's goal (their question, "
     "stated in full), confirmed findings with the exact numbers and the result "
     "handles (ids like r_0123456789) they came from, every handle still worth "
-    "reusing, open questions, and stated user preferences. Copy numbers and "
+    "reusing, open questions (include the ids of background tasks still running, as 'task <id> running'), and stated user preferences. Copy numbers and "
     "handle ids exactly; never invent or round them."
 )
 
@@ -85,7 +85,7 @@ class Digest(BaseModel):
 
 
 def is_compaction_summary(message: object) -> bool:
-    """Whether ``message`` was written by this middleware (a locator, not trust)."""
+    """Whether ``message`` is a compaction digest (a locator, not trust)."""
     if isinstance(message, Mapping):
         kwargs = message.get("additional_kwargs")
         return (
@@ -184,10 +184,15 @@ def plan_cut(
 
     ``protect_from`` is the index of the current user question: it and
     everything after it stay in the tail, so only prior turns are summarised.
+    Returns 0 too when nothing but earlier digests would be dropped: a model
+    call that cannot shrink the thread only adds digest-of-digest drift.
     """
     if count_tokens_approximately(messages) <= trigger_tokens:
         return 0
-    return safe_cutoff(messages, min(len(messages) - keep_messages, protect_from))
+    cut = safe_cutoff(messages, min(len(messages) - keep_messages, protect_from))
+    if all(is_compaction_summary(m) for m in messages[:cut]):
+        return 0
+    return cut
 
 
 def _prompt(old: list[AnyMessage]) -> list[AnyMessage]:

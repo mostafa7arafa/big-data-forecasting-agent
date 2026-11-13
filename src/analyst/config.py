@@ -22,8 +22,8 @@ class Settings(BaseSettings):
     dataset: str | None = None
     model: str = "openai:gpt-6-luna"
     max_background_tasks: int = 3
-    compaction_trigger_tokens: int = 60_000
-    compaction_keep_messages: int = 8
+    compaction_trigger_tokens: int = Field(default=60_000, gt=0)
+    compaction_keep_messages: int = Field(default=8, ge=1)
     max_concurrent_queries: int = 3
     forecast_budget_s: float = 120.0
     inline_forecast_limit_s: float = 15.0

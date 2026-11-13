@@ -1,4 +1,4 @@
-"""The analyst graph: plan -> analyst -> verify -> answer, served by ``langgraph dev``.
+"""The analyst graph: compact -> plan -> analyst -> verify -> answer, served by ``langgraph dev``.
 
 The module-level ``graph`` imports without API keys or ``ANALYST_DATASET``:
 the model, dataset, cutoff and background flag are all resolved per run from
@@ -335,7 +335,7 @@ def build_graph(
             if question is not None
             else len(messages)
         )
-        ctx = await asyncio.to_thread(_context, runtime, state.get("wake_context"))
+        ctx = await asyncio.to_thread(_context, runtime, None)
         chat = await asyncio.to_thread(resolve_model, ctx.model)
         return await compact_messages(
             messages,

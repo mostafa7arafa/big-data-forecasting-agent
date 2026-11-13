@@ -165,3 +165,16 @@ def test_input_messages_not_mutated():
     msgs = _conversation()
     _run(FakeChat(digest=_digest()), msgs)
     assert all(m.id is None for m in msgs)
+
+
+def test_nothing_droppable_but_summaries_makes_no_model_call():
+    from langchain_core.messages.notification import add_notification_metadata
+
+    summary = add_notification_metadata(
+        HumanMessage("Goal: old " + "x" * 2000), source="compaction"
+    )
+    msgs = [summary, HumanMessage("Q1"), *_conversation()[1:3]]
+    chat = FakeChat(digest=_digest())
+    chat.calls.clear()
+    assert _run(chat, msgs, keep=1, protect=1) is None
+    assert chat.calls == []
