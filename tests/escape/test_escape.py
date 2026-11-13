@@ -49,23 +49,38 @@ def _containers(*names: str) -> str:
     return out
 
 
+def _track(box, names: list[str]) -> None:
+    """Record every container name the sandbox starts (restarts included)."""
+    orig_start = box._start
+
+    def start() -> None:
+        orig_start()
+        names.append(box._name)
+
+    box._start = start
+
+
 @pytest.fixture(scope="module")
 def sb(tmp_path_factory):
     _need_image()
     root = tmp_path_factory.mktemp("escape")
     box = DockerSandbox(in_dir=root / "in", out_dir=root / "out", image=IMAGE, timeout_s=30)
+    names: list[str] = []
+    _track(box, names)
     yield box
     box.close()
-    assert _containers() == "", "sandbox containers left running"
+    assert _containers(*names) == "", "sandbox containers left running"
 
 
 def _run(sb, code: str):
     return sb.run(textwrap.dedent(code))
 
 
-def _guard_rejects(code: str) -> None:
-    with pytest.raises(InvalidRequestError):
+def _guard_rejects(code: str, fragment: str) -> None:
+    with pytest.raises(InvalidRequestError) as exc:
         check_code(textwrap.dedent(code))
+    assert fragment.lower() in exc.value.message.lower(), exc.value.message
+    assert exc.value.hint
 
 
 def _alive(sb) -> None:
@@ -76,7 +91,7 @@ def _alive(sb) -> None:
 # 1
 def test_network_connect_refused(sb):
     code = "import socket\nsocket.create_connection(('1.1.1.1', 53), 2)"
-    _guard_rejects(code)
+    _guard_rejects(code, "import of 'socket'")
     r = _run(sb, code)
     assert not r.ok and ("OSError" in r.error or "unreachable" in r.error)
 
@@ -84,7 +99,7 @@ def test_network_connect_refused(sb):
 # 2
 def test_dns_lookup_refused(sb):
     code = "import socket\nsocket.getaddrinfo('example.com', 443)"
-    _guard_rejects(code)
+    _guard_rejects(code, "import of 'socket'")
     r = _run(sb, code)
     assert not r.ok and "gaierror" in r.error
 
@@ -92,7 +107,7 @@ def test_dns_lookup_refused(sb):
 # 3
 def test_read_etc_shadow_refused(sb):
     code = "print(open('/etc/shadow').read())"
-    _guard_rejects(code)
+    _guard_rejects(code, "under /artifacts/")
     r = _run(sb, code)
     assert not r.ok and "PermissionError" in r.error and r.stdout == ""
 
@@ -100,7 +115,7 @@ def test_read_etc_shadow_refused(sb):
 # 4
 def test_write_usr_read_only_root(sb):
     code = "open('/usr/x', 'w').write('x')"
-    _guard_rejects(code)
+    _guard_rejects(code, "under /artifacts/")
     r = _run(sb, code)
     assert not r.ok and "Read-only file system" in r.error
 
@@ -108,14 +123,14 @@ def test_write_usr_read_only_root(sb):
 # 5
 def test_write_artifacts_in_read_only(sb):
     code = "open('/artifacts/in/x', 'w').write('x')"
-    _guard_rejects(code)
+    _guard_rejects(code, "may only write under /artifacts/out/")
     r = _run(sb, code)
     assert not r.ok and "Read-only file system" in r.error
 
 
 # 6
 def test_no_data_mount(sb):
-    _guard_rejects("import os\nprint(os.listdir('/'))")
+    _guard_rejects("import os\nprint(os.listdir('/'))", "import of 'os'")
     r = _run(sb, """
         import os
         print(os.path.exists('/data'), '/data' in os.listdir('/'))
@@ -147,7 +162,7 @@ def test_fork_bomb_hits_pids_limit(sb):
             os.waitpid(p, 0)
         print(err, len(pids))
     """
-    _guard_rejects(code)
+    _guard_rejects(code, "import of 'os'")
     r = _run(sb, code)
     assert r.ok, r.error
     err, n = r.stdout.split()
@@ -162,6 +177,7 @@ def test_memory_bomb_contained(sb):
     r = _run(sb, code)
     assert not r.ok
     assert r.restarted or "MemoryError" in r.error
+    assert "timeout" not in r.error, "a hang must not pass as OOM"
     _alive(sb)
 
 
@@ -181,7 +197,7 @@ def test_infinite_loop_times_out(tmp_path):
 
 # 10
 def test_ctypes(sb):
-    _guard_rejects("import ctypes\nctypes.CDLL(None).system(b'id')")
+    _guard_rejects("import ctypes\nctypes.CDLL(None).system(b'id')", "import of 'ctypes'")
     # Container side: libc is reachable without the guard; what it can do is not.
     r = _run(sb, """
         import ctypes
@@ -195,9 +211,9 @@ def test_ctypes(sb):
 
 # 11
 def test_subprocess_and_os_system(sb):
-    _guard_rejects("import subprocess\nsubprocess.run(['id'])")
-    _guard_rejects("import os\nos.system('id')")
-    _guard_rejects("pd.io.common.os.system('id')")
+    _guard_rejects("import subprocess\nsubprocess.run(['id'])", "import of 'subprocess'")
+    _guard_rejects("import os\nos.system('id')", "import of 'os'")
+    _guard_rejects("pd.io.common.os.system('id')", "os.system")
     r = _run(sb, """
         import subprocess, sys
         print(subprocess.run(['id', '-u'], capture_output=True, text=True).stdout.strip())
@@ -216,7 +232,7 @@ def test_subclasses_walk(sb):
         osmod = wrap.__init__.__globals__
         print(osmod['getuid'](), sorted(k for k in osmod['environ'] if any(s in k for s in SECRETS)))
     """
-    _guard_rejects(code)
+    _guard_rejects(code, "dunder attribute")
     r = _run(sb, f"SECRETS = {SECRET_NAMES!r}\n" + textwrap.dedent(code))
     assert r.ok, r.error
     assert r.stdout.split()[0] != "0" and r.stdout.strip().endswith("[]")
@@ -225,8 +241,8 @@ def test_subclasses_walk(sb):
 # 13
 def test_importlib(sb):
     code = "import importlib\nos = importlib.import_module('os')\nprint(os.getuid())"
-    _guard_rejects(code)
-    _guard_rejects("from importlib import import_module")
+    _guard_rejects(code, "import of 'importlib'")
+    _guard_rejects("from importlib import import_module", "import of 'importlib'")
     r = _run(sb, code)
     assert r.ok and r.stdout.strip() != "0", r.error
 
@@ -238,7 +254,7 @@ def test_importlib(sb):
     "exec(compile(\"import os; print(os.getuid())\", 's', 'exec'))",
 ])
 def test_eval_exec_compile(sb, code):
-    _guard_rejects(code)
+    _guard_rejects(code, f"'{code.split('(', 1)[0]}' is not allowed")
     r = _run(sb, f"print({code})" if code.startswith("eval") else code)
     assert r.ok and r.stdout.strip().splitlines()[0] != "0", r.error
 
@@ -253,8 +269,8 @@ def test_huge_stdout_capped(sb):
 
 # 16
 def test_setuid_and_capabilities(sb):
-    _guard_rejects("import os\nos.setuid(0)")
-    _guard_rejects("print(open('/proc/self/status').read())")
+    _guard_rejects("import os\nos.setuid(0)", "import of 'os'")
+    _guard_rejects("print(open('/proc/self/status').read())", "under /artifacts/")
     r = _run(sb, "import os\nos.setuid(0)")
     assert not r.ok and "PermissionError" in r.error
     r = _run(sb, """
@@ -270,7 +286,7 @@ def test_setuid_and_capabilities(sb):
 
 # 17
 def test_no_host_secrets_in_environ(sb):
-    _guard_rejects("print(open('/proc/1/environ').read())")
+    _guard_rejects("print(open('/proc/1/environ').read())", "under /artifacts/")
     r = _run(sb, f"""
         import os
         names = [kv.split(b'=', 1)[0].decode() for kv in open('/proc/1/environ', 'rb').read().split(b'\\0') if kv]
@@ -301,17 +317,20 @@ def test_load_traversal_rejected(sb, arg):
 # 19
 def test_other_cutoff_segment_not_mounted(tmp_path, monkeypatch):
     _need_image()
-    _guard_rejects("open('/artifacts/../2024-02-01/two.txt')")
+    _guard_rejects("open('/artifacts/../2024-02-01/two.txt')", "'..'")
     monkeypatch.setattr(get_settings(), "artifacts_dir", tmp_path)
     sbx.close_all()
+    started: list[str] = []
     try:
         d1, d2 = date(2024, 1, 1), date(2024, 2, 1)
         for d, name in [(d1, "one"), (d2, "two")]:
             root = tmp_path / "ds" / d.isoformat()
             root.mkdir(parents=True)
             (root / f"{name}.txt").write_text(name)
-        s1 = get_sandbox("escape", "ds", d1)
-        started = []
+        s1, s2 = get_sandbox("escape", "ds", d1), get_sandbox("escape", "ds", d2)
+        _track(s1, started)
+        _track(s2, started)
+        assert s2.run("import os\nprint(sorted(os.listdir('/artifacts/in')))").stdout.strip() == "['two.txt']"
         r = s1.run(textwrap.dedent("""
             import os
             found = [os.path.join(d, f) for top in ('/artifacts', '/tmp', '/srv', '/mnt', '/home')
@@ -322,17 +341,16 @@ def test_other_cutoff_segment_not_mounted(tmp_path, monkeypatch):
         """))
         assert r.ok, r.error
         assert r.stdout.splitlines() == ["[] False True", "['one.txt']"]
-        started.append(s1._name)
     finally:
         sbx.close_all()
-    assert _containers(*started) == ""
+    assert len(started) == 2 and _containers(*started) == ""
 
 
 # 20
 @pytest.mark.parametrize("path", ["/x", "/srv/x", "/home/x", "/etc/x", "/artifacts/x"])
 def test_write_outside_artifacts_out_fails(sb, path):
     code = f"open({path!r}, 'w').write('x')"
-    _guard_rejects(code)
+    _guard_rejects(code, "under /artifacts/")
     r = _run(sb, code)
     assert not r.ok and ("Read-only file system" in r.error or "PermissionError" in r.error)
 

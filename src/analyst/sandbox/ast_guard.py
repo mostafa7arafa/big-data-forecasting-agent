@@ -8,13 +8,14 @@ what actually contains code that slips past this check.
 """
 
 import ast
+from typing import NoReturn
 
 from analyst.errors import InvalidRequestError
 
 ALLOWED_IMPORTS: tuple[str, ...] = (
     "duckdb", "pandas", "polars", "numpy", "scipy", "statsmodels", "statsforecast",
     "plotly", "math", "statistics", "datetime", "json", "re", "collections",
-    "itertools", "functools",
+    "itertools", "functools", "warnings", "typing", "dataclasses",
 )
 _ALLOWED = frozenset(ALLOWED_IMPORTS)
 
@@ -39,7 +40,7 @@ _BLOCKED_ATTRS = frozenset({
 _WRITE_MODE_CHARS = frozenset("wax+")
 
 
-def _reject(message: str, hint: str = _HELPERS, node: ast.AST | None = None) -> None:
+def _reject(message: str, hint: str = _HELPERS, node: ast.AST | None = None) -> NoReturn:
     line = getattr(node, "lineno", None)
     where = f" (line {line})" if line else ""
     raise InvalidRequestError(f"{message}{where}", hint=hint)
@@ -95,7 +96,8 @@ class _Guard(ast.NodeVisitor):
         if id(node) in self._ok_callees:
             return
         name = node.id
-        if name in _BLOCKED_NAMES:
+        # Rebinding a blocked builtin name (``input = load(...)``) is harmless; using it is not.
+        if name in _BLOCKED_NAMES and isinstance(node.ctx, ast.Load):
             _reject(f"'{name}' is not allowed in the sandbox", node=node)
         if name in _ATTR_FUNCS:
             _reject(f"'{name}' may only be called with a literal, non-dunder attribute name",
@@ -163,9 +165,14 @@ def check_code(code: str) -> None:
     """Raise InvalidRequestError if ``code`` uses something the sandbox disallows."""
     try:
         tree = ast.parse(code, "<sandbox>", "exec")
+        _Guard().visit(tree)
+    except InvalidRequestError:
+        raise
     except SyntaxError as exc:
         _reject(f"syntax error: {exc.msg} (line {exc.lineno})",
                 "Fix the Python syntax and resend the whole cell.")
     except ValueError as exc:  # e.g. NUL bytes in source
         _reject(f"syntax error: {exc}", "Fix the Python source and resend the whole cell.")
-    _Guard().visit(tree)
+    except (RecursionError, MemoryError):
+        _reject("code too deeply nested or too large",
+                "Split the work into smaller, flatter statements and send them as separate cells.")

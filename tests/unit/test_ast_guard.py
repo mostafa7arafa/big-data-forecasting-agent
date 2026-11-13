@@ -19,6 +19,10 @@ ALLOWED = [
     "x = getattr(load('r_0123456789'), 'shape')",
     "class A:\n    def __init__(self):\n        self.x = 1",
     "",
+    "import warnings\nwarnings.filterwarnings('ignore')",
+    "from typing import Any\nfrom dataclasses import dataclass",
+    "input = load('r_0123456789')",
+    "help, eval = 1, 2\ndel help",
 ]
 
 
@@ -49,6 +53,8 @@ REJECTED = [
     ("vars()", "vars"),
     ("breakpoint()", "breakpoint"),
     ("input()", "input"),
+    ("input = load('r_0123456789')\nprint(input)", "input"),
+    ("h = help", "help"),
     ("getattr(x, name)", "getattr"),
     ("getattr(x, '__class__')", "getattr"),
     ("setattr(x, name, 1)", "setattr"),
@@ -103,7 +109,7 @@ def test_allowlist_matches_constraints():
     assert set(ALLOWED_IMPORTS) == {
         "duckdb", "pandas", "polars", "numpy", "scipy", "statsmodels", "statsforecast",
         "plotly", "math", "statistics", "datetime", "json", "re", "collections",
-        "itertools", "functools",
+        "itertools", "functools", "warnings", "typing", "dataclasses",
     }
 
 
@@ -111,3 +117,14 @@ def test_syntax_error_reports_line():
     with pytest.raises(InvalidRequestError) as exc:
         check_code("x = 1\ny = (")
     assert "line 2" in exc.value.message
+
+
+@pytest.mark.parametrize(("code", "fragment"), [
+    ("x" + "+x" * 5000, "too deeply nested"),  # RecursionError in the visitor
+    ("x" + "+x" * 200_000, "too deeply nested"),  # RecursionError in ast.parse
+    ("(" * 300 + ")" * 300, "syntax error"),
+])
+def test_too_deep_or_large_is_invalid_request(code, fragment):
+    with pytest.raises(InvalidRequestError) as exc:
+        check_code(code)
+    assert fragment in exc.value.message and exc.value.hint
