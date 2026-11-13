@@ -81,11 +81,13 @@ _NUMBER = re.compile(
 )
 
 _YEAR_RANGE_BEFORE = re.compile(r"\b(?:19|20|21)\d{2}\s*[-–—/]\s*$")
-# A bare 1900-2100 integer is a year unless it counts items: followed
-# (optionally after one adjective) by a plural count noun ("2000 new trips").
-# ...but a calendar preposition right before it makes it a year anyway ("In 2024 trips grew").
-_CALENDAR_PREP_BEFORE = re.compile(
-    r"\b(?:in|since|during|until|through|from|of|before|after|for)\s+$", re.IGNORECASE
+# A bare 1900-2100 integer is a year unless it is a quantity: a quantity cue
+# directly before it (optionally with one filler word) AND a plural count noun
+# after it (optionally after one adjective): "There were 2000 events".
+_QUANTITY_CUE_BEFORE = re.compile(
+    r"\b(?:were|was|had|has|have|total\s+of|about|around|approximately|roughly|nearly"
+    r"|almost|over|under|reached|recorded|exactly|only)\s+(?:[A-Za-z-]+\s+)?$",
+    re.IGNORECASE,
 )
 _COUNT_NOUN_AFTER = re.compile(
     r"\s+(?:[A-Za-z-]+\s+)?(?:events|trips|rides|rows|records|people|passengers|vehicles"
@@ -137,9 +139,9 @@ def _extract(text: str) -> list[StatedNumber]:
             and re.fullmatch(r"\d{4}", digits)
             and 1900 <= int(digits) <= 2100
             and (sign is None or _YEAR_RANGE_BEFORE.search(masked[: m.start("num")]))
-            and (
-                _CALENDAR_PREP_BEFORE.search(masked, 0, m.start())
-                or not _COUNT_NOUN_AFTER.match(masked, m.end("num"))
+            and not (
+                _QUANTITY_CUE_BEFORE.search(masked, 0, m.start())
+                and _COUNT_NOUN_AFTER.match(masked, m.end("num"))
             )
         ):
             continue

@@ -853,14 +853,14 @@ def test_scientific_notation_not_traced_to_mantissa(tmp_path):
         ("Volume rose to 2000 by March", []),
         ("There were 2000 events", ["2000"]),
         ("There were 2000 new trips", ["2000"]),
-        ("1999 rides and 2050 passengers", ["1999", "2050"]),
-        ("2000 records, 2001 orders, 2002 visits", ["2000", "2001", "2002"]),
+        ("There were 1999 rides and had 2050 passengers", ["1999", "2050"]),
+        ("2000 records, 2001 orders, 2002 visits", []),  # no quantity cue (item 19)
         ("$2000 in fees", ["$2000"]),
         ("2,000 in fees", ["2,000"]),
         ("2000.5 in fees", ["2000.5"]),
         ("2000k in fees", ["2000k"]),
         ("A total of 2000 was recorded", []),
-        ("2000 distinct users", ["2000"]),
+        ("There were 2000 distinct users", ["2000"]),
     ],
 )
 def test_bare_years_unless_counting_items(text, raws):
@@ -893,8 +893,37 @@ def test_day_range_does_not_swallow_values():
         ("during 2023 rides fell", []),
         ("from 2023 rows were dropped", []),
         ("There were 2000 events", ["2000"]),
-        ("rose to 2000 trips", ["2000"]),  # "to" is not a calendar preposition
+        ("rose to 2000 trips", []),  # item 19: no quantity cue, so a year
     ],
 )
 def test_calendar_preposition_beats_count_noun(text, raws):  # follow-up item 18
+    assert [n.raw for n in extract_numbers(text)] == raws, text
+
+
+# --- follow-up item 19: quantity cue AND count noun, else a year ----------------------
+
+
+@pytest.mark.parametrize(
+    "text, raws",
+    [
+        ("In 2024 trips grew", []),
+        ("In January 2024 trips rose 5%", ["5%"]),
+        ("December 2025 trips fell 3%", ["3%"]),
+        ("In Q1 2024 trips were 9.1M", ["9.1M"]),
+        ("From 2023 to 2025 rides grew", []),
+        ("Between 2023 and 2025 trips grew 4%", ["4%"]),
+        ("2023–2025 trips grew", []),
+        ("Compared with 2024 trips fell 3%", ["3%"]),
+        ("There were 2000 events", ["2000"]),
+        ("a total of 2000 trips", ["2000"]),
+        ("about 1950 rides", ["1950"]),
+        ("There were roughly 2000 new trips", ["2000"]),
+        ("The zone had some 2000 trips", ["2000"]),
+        ("2024 revenue was 12.5M", ["12.5M"]),
+        ("rose to 2000 trips", []),
+        ("$2000 in fees", ["$2000"]),
+        ("2,000 in fees", ["2,000"]),
+    ],
+)
+def test_year_unless_quantity_cue_and_count_noun(text, raws):
     assert [n.raw for n in extract_numbers(text)] == raws, text
