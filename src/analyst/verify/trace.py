@@ -19,14 +19,25 @@ _HANDLE_ID = re.compile(r"r_[0-9a-f]{10}")
 
 @dataclass
 class HandleInfo:
+    """A result handle's numeric cells. ``columns`` holds them per column.
+
+    Derivations pair cells of one column, or cells of two different handles;
+    ``values`` alone (no ``columns``) counts as a single column.
+    """
+
     handle_id: str
     produced_by: str
     governed: bool
     values: list[float] = field(default_factory=list)
+    columns: list[list[float]] = field(default_factory=list)
+
+    def column_lists(self) -> list[list[float]]:
+        return self.columns or ([self.values] if self.values else [])
 
 
-def _numeric_values(table: pa.Table) -> list[float]:
-    columns = [
+def _numeric_columns(table: pa.Table) -> list[list[float]]:
+    """Numeric cells per column; head and tail kept within MAX_CELLS overall."""
+    cols = [
         col
         for col, field_ in zip(table.columns, table.schema, strict=True)
         if (
@@ -35,19 +46,27 @@ def _numeric_values(table: pa.Table) -> list[float]:
             or pat.is_decimal(field_.type)
         )
     ]
-    if not columns:
+    if not cols:
         return []
-    rows = max(1, MAX_CELLS // len(columns))
-    out: list[float] = []
-    for row in range(min(rows, table.num_rows)):
-        for col in columns:
-            cell = col[row].as_py()
+    per_col = max(2, MAX_CELLS // len(cols))
+    out: list[list[float]] = []
+    for col in cols:
+        n = len(col)
+        if n > per_col:
+            half = per_col // 2
+            idx = list(range(half)) + list(range(n - half, n))
+        else:
+            idx = list(range(n))
+        cells: list[float] = []
+        for i in idx:
+            cell = col[i].as_py()
             if cell is None:
                 continue
             number = float(cell)
             if math.isfinite(number):
-                out.append(number)
-    return out[:MAX_CELLS]
+                cells.append(number)
+        out.append(cells)
+    return out
 
 
 def load_handle_info(store: ResultStore, handle_id: str) -> HandleInfo | None:
@@ -56,10 +75,11 @@ def load_handle_info(store: ResultStore, handle_id: str) -> HandleInfo | None:
         if not store.exists(handle_id):
             return None
         card = store.card(handle_id)
-        values = _numeric_values(store.load(handle_id))
+        columns = _numeric_columns(store.load(handle_id))
     except (UnknownNameError, OSError, ValueError):
         return None
-    return HandleInfo(handle_id, card.produced_by, card.governed, values)
+    values = [v for col in columns for v in col]
+    return HandleInfo(handle_id, card.produced_by, card.governed, values, columns)
 
 
 def _get(message: object, name: str):
@@ -102,6 +122,7 @@ def collect_handles(messages, store: ResultStore) -> dict[str, HandleInfo]:
                 str(artifact.get("produced_by", "")),
                 bool(artifact.get("governed", False)),
                 loaded.values if loaded else [],
+                loaded.columns if loaded else [],
             )
             continue
         if _is_worker_note(message):
@@ -115,17 +136,22 @@ def collect_handles(messages, store: ResultStore) -> dict[str, HandleInfo]:
     return found
 
 
-def trace_value(x: StatedNumber, cited: list[HandleInfo]) -> bool:
-    """A direct match, or one hop: a-b, (a-b)/b*100, a/b*100, a/b over ordered pairs."""
-    pool = [v for h in cited for v in h.values[:MAX_CELLS]]
-    if not pool:
-        return False
-    if any(matches(x, v) for v in pool):
-        return True
-    spans = intervals(x)
-    values = np.array(pool, dtype=float)
-    uniq, counts = np.unique(values, return_counts=True)
-    nonzero = uniq != 0
+def direct_handles(x: StatedNumber, handles: list[HandleInfo]) -> list[HandleInfo]:
+    """Handles holding a cell that matches ``x`` at its stated precision."""
+    return [h for h in handles if any(matches(x, v) for v in h.values)]
+
+
+def _derive_hit(cited: list[HandleInfo], spans, confirm) -> bool:
+    """One-hop a-b, (a-b)/b*100, a/b*100, a/b between allowed cell pairs.
+
+    Allowed: two cells of the same column, or cells of two different cited
+    handles. Cells of two different columns of one handle are not paired.
+    """
+    cols = [
+        (hi, np.array(col, dtype=float))
+        for hi, h in enumerate(cited)
+        for col in h.column_lists()
+    ]
 
     def hit(derived: np.ndarray) -> np.ndarray:
         mask = np.zeros(derived.shape, dtype=bool)
@@ -134,16 +160,57 @@ def trace_value(x: StatedNumber, cited: list[HandleInfo]) -> bool:
         return mask
 
     with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
-        for i, a in enumerate(uniq):
-            usable = np.ones(len(uniq), dtype=bool)
-            if counts[i] < 2:
-                usable[i] = False  # a value cannot pair with its own single cell
-            candidates = [a - uniq]
-            ok_b = usable & nonzero
-            candidates += [(a - uniq) / uniq * 100, a / uniq * 100, a / uniq]
-            for n, derived in enumerate(candidates):
-                mask = usable if n == 0 else ok_b
-                for idx in np.nonzero(hit(derived) & mask)[0]:
-                    if matches(x, float(derived[idx])):
-                        return True
+        for ai, (ah, avals) in enumerate(cols):
+            for bi, (bh, bvals) in enumerate(cols):
+                if ah == bh and ai != bi:
+                    continue
+                nonzero = bvals != 0
+                for i, a in enumerate(avals):
+                    usable = np.ones(len(bvals), dtype=bool)
+                    if ai == bi:
+                        usable[i] = False
+                    candidates = (
+                        (a - bvals, usable),
+                        ((a - bvals) / bvals * 100, usable & nonzero),
+                        (a / bvals * 100, usable & nonzero),
+                        (a / bvals, usable & nonzero),
+                    )
+                    for derived, mask in candidates:
+                        for idx in np.nonzero(hit(derived) & mask)[0]:
+                            if confirm(float(derived[idx])):
+                                return True
     return False
+
+
+def trace_value(
+    x: StatedNumber, cited: list[HandleInfo], *, derive: bool = True
+) -> bool:
+    """A direct match, or (``derive``) a one-hop derivation over ``cited``."""
+    if direct_handles(x, cited):
+        return True
+    if not derive:
+        return False
+    return _derive_hit(cited, intervals(x), lambda d: matches(x, d))
+
+
+def _close(a: float, b: float) -> bool:
+    return math.isclose(a, b, rel_tol=1e-9, abs_tol=1e-12)
+
+
+def trace_float(value: float, cited: list[HandleInfo]) -> bool:
+    """Trace an exact claim value (rel. tolerance 1e-9), directly or one hop.
+
+    A percent given as a number (-2.99) also matches the fraction (-0.0299).
+    """
+    targets = (value, value / 100)
+
+    def confirm(d: float) -> bool:
+        return any(_close(d, t) for t in targets)
+
+    if any(confirm(v) for h in cited for v in h.values):
+        return True
+    spans = []
+    for t in targets:
+        pad = 2e-9 * max(abs(t), 1e-3)
+        spans.append((t - pad, t + pad))
+    return _derive_hit(cited, spans, confirm)

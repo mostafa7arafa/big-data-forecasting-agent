@@ -1,12 +1,19 @@
 """Deterministic verdict on an Answer: number tracing, causal policy, labels."""
 
+import re
 from datetime import date
 
 from analyst.data.results import ResultStore
 from analyst.semantic.model import Memory
 from analyst.state import Answer, Verification
-from analyst.verify.numbers import StatedNumber, extract_numbers
-from analyst.verify.trace import HandleInfo, load_handle_info, trace_value
+from analyst.verify.numbers import extract_numbers, matches
+from analyst.verify.trace import (
+    HandleInfo,
+    direct_handles,
+    load_handle_info,
+    trace_float,
+    trace_value,
+)
 
 HEDGES: tuple[str, ...] = (
     "coincides with",
@@ -24,17 +31,7 @@ HEDGES: tuple[str, ...] = (
 )
 
 
-def _claim_value(value: float) -> list[StatedNumber]:
-    text = repr(float(value))
-    decimals = 0 if "e" in text else len(text.split(".")[1].rstrip("0"))
-    return [
-        StatedNumber(float(value), decimals, 1.0, percent, text)
-        for percent in (False, True)
-    ]
-
-
-def _trace_claim_value(value: float, cited: list[HandleInfo]) -> bool:
-    return any(trace_value(variant, cited) for variant in _claim_value(value))
+_HEDGE_RE = re.compile(r"\b(?:" + "|".join(re.escape(h) for h in HEDGES) + r")\b")
 
 
 def verify_answer(
@@ -77,30 +74,37 @@ def verify_answer(
         if claim.type != "causal":
             continue
         text = claim.text.lower()
-        hedged = any(hedge in text for hedge in HEDGES)
+        hedged = _HEDGE_RE.search(text) is not None
         if not hedged or not any(fid in fact_ids for fid in claim.fact_ids):
             problems.append("unsupported causal claim")
 
-    # Narrative and claim text may trace to any collected handle; claim values
-    # only to the handles that claim cites.
+    # Claim values trace (one hop allowed) to the handles that claim cites. Claim
+    # text traces the same way, else directly to any collected handle. The
+    # narrative traces directly to any collected handle. Either may also equal a
+    # traced claim value, which is how a derived number reaches the prose.
     everything = list({**handles, **known}.values())
     used: dict[str, HandleInfo] = {h.handle_id: h for h in known.values()}
+    claim_values = [v for claim in answer.claims for v in claim.values]
     for claim, cited in zip(answer.claims, claim_handles, strict=True):
         for value in claim.values:
-            if not _trace_claim_value(value, cited):
+            if not trace_float(value, cited):
                 problems.append(f"untraced number {value:g}")
-    pools = [
-        (claim.text, cited)
-        for claim, cited in zip(answer.claims, claim_handles, strict=True)
-    ] + [(answer.narrative, list(known.values()))]
-    for text, preferred in pools:
+
+    def trace_prose(text: str, cited: list[HandleInfo] | None) -> None:
         for number in extract_numbers(text, exclude=question):
-            if trace_value(number, preferred):
+            if cited is not None and trace_value(number, cited):
                 continue
-            if trace_value(number, everything):
-                used.update({h.handle_id: h for h in everything})
+            direct = direct_handles(number, everything)
+            if direct:
+                used.update({h.handle_id: h for h in direct})
+                continue
+            if any(matches(number, v) for v in claim_values):
                 continue
             problems.append(f"untraced number {number.raw}")
+
+    for claim, cited in zip(answer.claims, claim_handles, strict=True):
+        trace_prose(claim.text, cited)
+    trace_prose(answer.narrative, None)
 
     if problems:
         return Verification(label="not_verified", reason=problems[0], problems=problems)

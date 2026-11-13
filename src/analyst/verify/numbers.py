@@ -7,10 +7,11 @@ from decimal import ROUND_HALF_UP, Decimal
 
 _SCALES = {
     "k": 1e3,
-    "K": 1e3,
-    "M": 1e6,
+    "m": 1e6,
+    "mn": 1e6,
     "million": 1e6,
-    "B": 1e9,
+    "b": 1e9,
+    "bn": 1e9,
     "billion": 1e9,
 }
 
@@ -23,11 +24,20 @@ _MONTH = (
 _MASKS = [
     re.compile(r"\b\d{4}-\d{2}-\d{2}\b"),
     re.compile(r"\b\d{1,2}/\d{1,2}/\d{2,4}\b"),
-    re.compile(rf"\b{_MONTH}\.? \d{{1,2}}(?!\d)(?:st|nd|rd|th)?(?:,? \d{{4}})?"),
+    re.compile(r"\b\d{4}-\d{1,2}\b"),
+    re.compile(r"\b\d{1,2}/\d{4}\b"),
+    re.compile(r"\b\d{1,2}:\d{2}(?::\d{2})?(?:\s?[ap]m\b)?", re.IGNORECASE),
+    re.compile(
+        rf"\b{_MONTH}\.? \d{{1,2}}(?!\d)(?:st|nd|rd|th)?(?:\s?[-\u2013]\s?\d{{1,2}}(?!\d))?"
+        r"(?:,? \d{4})?"
+    ),
     re.compile(rf"\b\d{{1,2}}(?:st|nd|rd|th)?(?: of)? {_MONTH}\b"),
     re.compile(r"\b\d+(?:st|nd|rd|th)\b"),
+    # Integer window phrases only ("12 months", "4-day gap"); decimals such as
+    # "14.2 minutes" are metric values and stay.
     re.compile(
-        r"\b\d+(?:\.\d+)?[- ](?:minute|hour|day|week|month|year|quarter)s?\b",
+        r"(?<![\d.,])(?:\d{1,3}(?:,\d{3})+|\d+)(?![\d.]*\d)[- ]"
+        r"(?:hour|day|week|month|year)s?\b",
         re.IGNORECASE,
     ),
 ]
@@ -36,7 +46,7 @@ _NUMBER = re.compile(
     r"(?<![\w.])(?<![A-Za-z]-)"
     r"(?P<sign>[-−–+])?(?P<dollar>\$)?"
     r"(?P<num>\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)"
-    r"(?:\s?(?P<suf>%|percent\b|k\b|K\b|M\b|B\b|million\b|billion\b))?"
+    r"(?:\s?(?P<suf>%|(?i:percent|billion|million|bn|mn)\b)|(?P<suf1>[kKmMB]\b))?"
 )
 
 
@@ -59,7 +69,7 @@ def _extract(text: str) -> list[StatedNumber]:
     out: list[StatedNumber] = []
     for m in _NUMBER.finditer(_mask(text)):
         digits = m.group("num")
-        suffix = m.group("suf")
+        suffix = m.group("suf") or m.group("suf1")
         if (
             suffix is None
             and m.group("sign") is None
@@ -72,12 +82,12 @@ def _extract(text: str) -> list[StatedNumber]:
         if m.group("sign") in ("-", "−", "–"):
             value = -value
         decimals = len(digits.split(".")[1]) if "." in digits else 0
-        percent = suffix in ("%", "percent")
+        percent = suffix is not None and suffix.lower() in ("%", "percent")
         out.append(
             StatedNumber(
                 value=value,
                 decimals=decimals,
-                scale=_SCALES.get(suffix, 1) if suffix else 1,
+                scale=_SCALES.get(suffix.lower(), 1) if suffix else 1,
                 percent=percent,
                 raw=m.group(0).strip(),
             )

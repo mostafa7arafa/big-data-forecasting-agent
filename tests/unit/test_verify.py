@@ -238,3 +238,136 @@ def test_worker_handles_line_collected(tmp_path):
         content=f"handles: {h1}", response_metadata={"source": "async_subagent"}
     )
     assert set(collect_handles([meta, tool], store)) == {h1}
+
+
+def test_claim_float_precision_traces(tmp_path):
+    store = ResultStore(tmp_path)
+    a, b = 2808154.0, 2894704.0
+    h = save(store, [a, b])
+    value = (a / b - 1) * 100
+    answer = Answer(
+        narrative="ok",
+        claims=[Claim(text="c", type="comparative", values=[value], handles=[h])],
+    )
+    assert run(answer, {}, store).label == "verified"
+    tiny = save(store, [1e-05], tag="tiny")
+    answer = Answer(
+        narrative="ok",
+        claims=[Claim(text="c", type="descriptive", values=[1e-05], handles=[tiny])],
+    )
+    assert run(answer, {}, store).label == "verified"
+    wrong = Answer(
+        narrative="ok",
+        claims=[
+            Claim(text="c", type="descriptive", values=[1.0001e-05], handles=[tiny])
+        ],
+    )
+    assert run(wrong, {}, store).label == "not_verified"
+
+
+def test_dates_and_times_are_not_numbers():
+    for text in [
+        "in 2025-10 trips rose",
+        "for 10/2025",
+        "Jan 1–7 saw",
+        "at 10:30",
+        "at 10:30 pm",
+        "after 1,234 days",
+    ]:
+        assert extract_numbers(text) == [], text
+
+
+def test_decimal_durations_are_values():
+    assert [n.value for n in extract_numbers("trips took 14.2 minutes")] == [14.2]
+    assert [n.value for n in extract_numbers("about 3.5 hours")] == [3.5]
+    for text in ["28 days", "3 weeks", "2 years", "24 hours", "12 months", "4-day gap"]:
+        assert extract_numbers(text) == [], text
+
+
+def test_derived_only_between_cited_handles_columns():
+    import random
+
+    random.seed(0)
+    vals = [float(random.randint(300000, 500000)) for _ in range(300)]
+    big = info("r_bbbbbbbbbb", vals)
+    for fake in ["12%", "7%", "1.3", "17"]:
+        assert not trace_value(sn(fake), [big], derive=False)
+    # two columns of one handle are never paired
+    two = HandleInfo(
+        "r_cccccccccc", "query_metrics", True, [10.0, 20.0], [[10.0], [20.0]]
+    )
+    assert not trace_value(
+        sn("10"), [HandleInfo("r_d", "q", True, [20.0], [[20.0]])], derive=False
+    )
+    assert not trace_value(sn("-10"), [two]) and trace_value(
+        sn("-10"), [info("r_x", [10.0]), info("r_y", [20.0])]
+    )
+
+
+def test_narrative_derived_numbers_need_a_claim(tmp_path):
+    import random
+
+    random.seed(0)
+    store = ResultStore(tmp_path)
+    vals = [float(random.randint(300000, 500000)) for _ in range(300)]
+    h = save(store, vals)
+    answer = Answer(
+        narrative="Trips moved 12% and 7%, a ratio of 1.3 over 17 days.",
+        claims=[Claim(text="trips", type="descriptive", handles=[h])],
+    )
+    result = run(answer, {}, store)
+    assert result.label == "not_verified"
+    assert {"untraced number 12%", "untraced number 7%", "untraced number 1.3"} <= set(
+        result.problems
+    )
+
+
+def test_narrative_derived_number_from_claim_value(tmp_path):
+    store = ResultStore(tmp_path)
+    h = save(store, [2808154.0, 2894704.0])
+    answer = Answer(
+        narrative="Volume fell 3.0%.",
+        claims=[
+            Claim(
+                text="drop",
+                type="comparative",
+                values=[(2808154.0 - 2894704.0) / 2894704.0 * 100],
+                handles=[h],
+            )
+        ],
+    )
+    assert run(answer, {}, store).label == "verified"
+
+
+def test_head_and_tail_cells_kept(tmp_path):
+    store = ResultStore(tmp_path)
+    h = save(store, [float(i) for i in range(5000)])
+    from analyst.verify import load_handle_info
+
+    got = load_handle_info(store, h)
+    assert 0.0 in got.values and 4999.0 in got.values and len(got.values) <= 2000
+
+
+def test_hedge_word_boundaries(tmp_path):
+    store = ResultStore(tmp_path)
+    h = save(store, [1.0])
+    answer = Answer(
+        narrative="x",
+        claims=[
+            Claim(
+                text="it is impossible to say",
+                type="causal",
+                handles=[h],
+                fact_ids=["policy:2025-01-05"],
+            )
+        ],
+    )
+    assert run(answer, {}, store).reason == "unsupported causal claim"
+
+
+def test_scale_suffix_variants():
+    got = [
+        (n.value, n.scale)
+        for n in extract_numbers("1.2bn, 2.8m, 3 Million, 4 BILLION, 5 Bn")
+    ]
+    assert got == [(1.2, 1e9), (2.8, 1e6), (3, 1e6), (4, 1e9), (5, 1e9)]
