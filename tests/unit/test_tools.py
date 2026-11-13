@@ -214,3 +214,36 @@ def test_context_from_settings(monkeypatch):
 def test_answer_schema_defaults():
     a = Answer(narrative="n", claims=[Claim(text="t", type="descriptive")])
     assert a.verification is None and a.charts == [] and a.claims[0].values == []
+
+
+def _array_nodes(node):
+    if isinstance(node, dict):
+        if node.get("type") == "array" or "prefixItems" in node:
+            yield node
+        for value in node.values():
+            yield from _array_nodes(value)
+    elif isinstance(node, list):
+        for value in node:
+            yield from _array_nodes(value)
+
+
+@pytest.mark.parametrize("tool", DATA_TOOLS, ids=lambda t: t.name)
+def test_openai_tool_schema_arrays_have_items(tool):
+    from langchain_core.utils.function_calling import convert_to_openai_tool
+
+    schema = convert_to_openai_tool(tool)
+    for node in _array_nodes(schema):
+        assert "items" in node and "prefixItems" not in node, (tool.name, node)
+
+
+def test_query_metrics_time_range_as_list():
+    args = {**MONTH, "time_range": ["2024-01-01", "2024-02-01"]}
+    msg = invoke(query_metrics, args)
+    assert msg.status == "success", msg.content
+
+
+def test_query_metrics_time_range_wrong_length_is_rejected():
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        invoke(query_metrics, {**MONTH, "time_range": ["2024-01-01"]})

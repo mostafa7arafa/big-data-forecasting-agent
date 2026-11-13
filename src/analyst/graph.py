@@ -5,12 +5,18 @@ the model, dataset, cutoff and background flag are all resolved per run from
 ``Runtime.context``. The analyst's system prompt depends on that context, so
 the inner ``create_agent`` is built per run and cached by
 (model spec, dataset, cutoff, background).
+
+The nodes are async and run on the server's event loop, so everything that
+touches the disk or builds clients (settings, services, the result store,
+model and agent construction, verification) goes through ``asyncio.to_thread``.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Sequence
+from dataclasses import replace
 from datetime import date
 from functools import lru_cache
 from typing import Any, Literal
@@ -40,8 +46,14 @@ __all__ = ["LABEL_CHIPS", "build_graph", "graph", "label_chip"]
 SOURCE_KEY = "source"
 _VERIFY_SOURCE = "verify"
 _PLAN_SOURCE = "plan"
-#: tag the Agent Server puts on a background task's completion message.
+#: tag the Agent Server puts on a background task's completion message
+#: (``additional_kwargs["lc_source"]`` today; ``source`` kept for older shapes).
 _BACKGROUND_SOURCE = "async_subagent"
+_BACKGROUND_KEYS = ("lc_source", SOURCE_KEY)
+
+#: the async-task tools the analyst can start background work with. Task 11
+#: fills this; until then background work is off whatever the context says.
+ASYNC_TASK_TOOLS: list = []
 
 RETRY_TEXT = (
     "Verification failed: {problems}. Fix the answer: cite handles for every "
@@ -75,6 +87,16 @@ def _source(message: Any) -> str | None:
     return None
 
 
+def _is_background_note(message: Any) -> bool:
+    for location in ("additional_kwargs", "response_metadata"):
+        meta = getattr(message, location, None)
+        if isinstance(meta, dict) and any(
+            meta.get(key) == _BACKGROUND_SOURCE for key in _BACKGROUND_KEYS
+        ):
+            return True
+    return False
+
+
 def _text(message: BaseMessage) -> str:
     content = message.content
     if isinstance(content, str):
@@ -87,23 +109,33 @@ def _text(message: BaseMessage) -> str:
 
 
 def _question(messages: Sequence[BaseMessage]) -> HumanMessage | None:
-    """The latest human turn the graph did not write itself."""
+    """The latest real user turn: not one the graph wrote, not a worker note.
+
+    Numbers in the question are exempt from tracing, so a background task's
+    notification must never stand in for it.
+    """
     for message in reversed(messages):
-        if isinstance(message, HumanMessage) and _source(message) not in (
-            _VERIFY_SOURCE,
-            _PLAN_SOURCE,
+        if (
+            isinstance(message, HumanMessage)
+            and _source(message) not in (_VERIFY_SOURCE, _PLAN_SOURCE)
+            and not _is_background_note(message)
         ):
             return message
     return None
 
 
 def _context(runtime: Runtime[AnalystContext]) -> AnalystContext:
+    """The run's context with background work gated on the async-task tools.
+
+    Blocking (settings may read ``.env``): call it through ``asyncio.to_thread``.
+    """
     ctx = runtime.context
     if ctx is None:
-        return AnalystContext.from_settings()
-    if isinstance(ctx, dict):
-        return AnalystContext.from_settings(**ctx)
-    return ctx
+        ctx = AnalystContext.from_settings()
+    elif isinstance(ctx, dict):
+        ctx = AnalystContext.from_settings(**ctx)
+    background = ctx.background and bool(ASYNC_TASK_TOOLS)
+    return ctx if ctx.background == background else replace(ctx, background=background)
 
 
 def build_graph(
@@ -146,30 +178,33 @@ def build_graph(
             "retries": 0,
         }
         messages = state["messages"]
-        if messages and _source(messages[-1]) == _BACKGROUND_SOURCE:
+        if messages and _is_background_note(messages[-1]):
             return reset
         question = _question(messages)
         if question is None:
             return reset
-        ctx = _context(runtime)
-        planner = resolve_model(ctx.model).with_structured_output(Plan)
+        ctx = await asyncio.to_thread(_context, runtime)
+        chat = await asyncio.to_thread(resolve_model, ctx.model)
+        planner = chat.with_structured_output(Plan)
         try:
             result = await planner.ainvoke(
                 [SystemMessage(PLAN_PROMPT), HumanMessage(_text(question))]
             )
+            if isinstance(result, dict):
+                result = Plan.model_validate(result)
         except Exception:  # a planning failure must not fail the question
             logger.warning("plan node failed; continuing without a plan", exc_info=True)
             return reset
-        if isinstance(result, dict):
-            result = Plan.model_validate(result)
         if not isinstance(result, Plan) or not result.needs_plan or not result.steps:
             return reset
         runtime.stream_writer({"type": "plan", "steps": list(result.steps)})
         return {**reset, "plan": list(result.steps)}
 
     async def analyst(state: AnalystState, runtime: Runtime[AnalystContext]) -> dict:
-        ctx = _context(runtime)
-        agent = analyst_agent(ctx.model, ctx.dataset, ctx.cutoff, ctx.background)
+        ctx = await asyncio.to_thread(_context, runtime)
+        agent = await asyncio.to_thread(
+            analyst_agent, ctx.model, ctx.dataset, ctx.cutoff, ctx.background
+        )
         messages = list(state["messages"])
         steps = state.get("plan") or []
         if steps and not state.get("retries"):
@@ -195,18 +230,22 @@ def build_graph(
         draft = state.get("draft")
         if draft is None:
             return Command(goto="answer")
-        ctx = _context(runtime)
-        service = get_service(ctx.dataset, ctx.cutoff)
+        ctx = await asyncio.to_thread(_context, runtime)
         messages = state["messages"]
         question = _question(messages)
-        verification = verify_answer(
-            draft,
-            question=_text(question) if question is not None else "",
-            handles=collect_handles(messages, service.store),
-            memory=service.memory,
-            cutoff=ctx.cutoff,
-            store=service.store,
-        )
+
+        def check() -> Verification:  # reads the result store: off the loop
+            service = get_service(ctx.dataset, ctx.cutoff)
+            return verify_answer(
+                draft,
+                question=_text(question) if question is not None else "",
+                handles=collect_handles(messages, service.store),
+                memory=service.memory,
+                cutoff=ctx.cutoff,
+                store=service.store,
+            )
+
+        verification = await asyncio.to_thread(check)
         if verification.label == "not_verified" and not state.get("retries"):
             problems = "; ".join(verification.problems or [verification.reason])
             feedback = HumanMessage(

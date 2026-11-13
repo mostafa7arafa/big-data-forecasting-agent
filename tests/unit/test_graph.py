@@ -367,3 +367,77 @@ def test_langgraph_json_points_at_graph(monkeypatch):
     get_settings.cache_clear()
     module = importlib.reload(importlib.import_module("analyst.graph"))
     assert hasattr(getattr(module, attr), "ainvoke")
+
+
+# --- fix round 1 -----------------------------------------------------------
+
+
+@pytest.mark.parametrize("key", ["lc_source", "source"])
+def test_background_note_numbers_are_not_exempt(key):
+    note = HumanMessage(
+        "Task t1 finished: 4242 events.", additional_kwargs={key: "async_subagent"}
+    )
+    untraced_answer = answer_turn("The worker found 4242 events.", [])
+    model = ScriptedModel(script=[untraced_answer, untraced_answer.model_copy()])
+    out = run(model, [HumanMessage("how many events?"), note])
+    assert out["plan"] == []
+    verification = out["answer"].verification
+    assert verification.label == "not_verified"
+    assert "4242" in verification.reason
+
+
+def test_no_blocking_calls_on_event_loop(monkeypatch):
+    import threading
+
+    from blockbuster import blockbuster_ctx
+
+    loop_threads: set[int] = set()
+    tool_threads: set[int] = set()
+    original = DataService.query_metrics
+
+    def spy(self, q):
+        tool_threads.add(threading.get_ident())
+        return original(self, q)
+
+    monkeypatch.setattr(DataService, "query_metrics", spy)
+    model = ScriptedModel(
+        script=[no_plan(), tool_turn(call("query_metrics", COUNT, "c1")), cite_total]
+    )
+    graph = build_graph(model=model)
+
+    async def go():
+        loop_threads.add(threading.get_ident())
+        with blockbuster_ctx():
+            return await graph.ainvoke(
+                {"messages": [HumanMessage("how many events?")]}, context=None
+            )
+
+    out = asyncio.run(go())
+    assert out["answer"].verification.label == "verified"
+    assert tool_threads and not tool_threads & loop_threads  # tools ran off-loop
+
+
+def test_plan_malformed_result_is_empty_plan():
+    from langchain_core.runnables import RunnableLambda
+
+    class BadPlanner(ScriptedModel):
+        def with_structured_output(self, schema, **kwargs):
+            return RunnableLambda(lambda _: {"needs_plan": "maybe", "steps": 3})
+
+    model = BadPlanner(
+        script=[tool_turn(call("query_metrics", COUNT, "c1")), cite_total]
+    )
+    out = run(model, [HumanMessage("how many events?")])
+    assert out["plan"] == []
+    assert out["answer"].verification.label == "verified"
+
+
+def test_background_policy_off_until_async_tools_exist():
+    model = ScriptedModel(
+        script=[no_plan(), tool_turn(call("query_metrics", COUNT, "c1")), cite_total]
+    )
+    ctx = AnalystContext(dataset="events", background=True)
+    run(model, [HumanMessage("how many events?")], context=ctx)
+    system = model.seen[1][0].content
+    assert "## Background work" not in system
+    assert "no background tasks" in system
