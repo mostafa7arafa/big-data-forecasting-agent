@@ -56,3 +56,10 @@ def get_gate() -> QueryGate:
         if _gate is None:
             _gate = QueryGate(get_settings().max_concurrent_queries)
         return _gate
+
+
+def reset_gate() -> None:
+    """Drop the singleton so the next get_gate() re-reads settings."""
+    global _gate
+    with _gate_lock:
+        _gate = None

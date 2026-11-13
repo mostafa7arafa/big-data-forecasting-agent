@@ -119,6 +119,9 @@ def render_report(report, *, dataset, series, elapsed, min_share, min_wins=2, fr
     )
     if not report.failed_fits:
         lines.append("None.")
+    if report.adjustments:
+        lines.extend(["", "## Adjustments", ""])
+        lines.extend(f"- {item}" for item in report.adjustments)
     lines.extend(["", "## Final lineup", "", ", ".join(selected), ""])
     return "\n".join(lines)
 

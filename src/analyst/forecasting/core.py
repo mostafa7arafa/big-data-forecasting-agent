@@ -4,7 +4,8 @@ No data access occurs here. MASE is evaluated separately at every cutoff using
 only its training prefix, then scores are averaged equally across windows.
 """
 
-from collections.abc import Sequence
+import time
+from collections.abc import Callable, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -24,6 +25,8 @@ from analyst.semantic.model import Quirk
 from .models import DEFAULTS, candidate_models
 
 Freq = Literal["D", "MS"]
+ProgressFn = Callable[[str], None]
+MIN_BUDGET_WINDOWS = 4
 
 
 @dataclass
@@ -41,6 +44,11 @@ class BacktestReport:
     windows: int
     horizon: int
     adjustments: list[str] = field(default_factory=list)
+    windows_used: int | None = None
+
+    def __post_init__(self):
+        if self.windows_used is None:
+            self.windows_used = self.windows
 
 
 @dataclass
@@ -272,6 +280,9 @@ def backtest(
     n_windows=None,
     levels=(80, 95),
     n_jobs=1,
+    progress: ProgressFn | None = None,
+    budget_s: float | None = None,
+    clock: Callable[[], float] = time.perf_counter,
 ) -> BacktestReport:
     """Backtest candidates against SeasonalNaive, with per-cutoff MASE scaling.
 
@@ -281,6 +292,9 @@ def backtest(
     without a median).
     On a zero-error baseline, relative MAE is 1 for zero error and inf otherwise.
     Zero training scale yields MASE 0 for perfect predictions and inf otherwise.
+    Each rolling-origin window is fitted on its own truncated series, oldest
+    first, so ``progress`` can report "backtest window i/n" and ``budget_s`` can
+    stop the loop once at least four windows are done and the budget is spent.
     """
     _check_freq(freq)
     series = PreparedSeries(series.df, [])
@@ -312,28 +326,61 @@ def backtest(
     candidates = _backtest_models(series, freq, models, horizon, windows)
     # Reports always carry the contracted 80/95 columns; callers may add levels.
     levels = sorted(set(levels) | {80, 95})
-    cv, names = None, []
     keys = ["unique_id", "ds", "cutoff", "y"]
     # Isolate model fits so failed candidates never borrow baseline predictions.
     # Baseline first: its failures must propagate, not trigger a fallback.
-    for model in sorted(candidates, key=lambda m: str(m) != "SeasonalNaive"):
-        try:
-            result = StatsForecast(
-                models=[model], freq=freq, n_jobs=n_jobs
-            ).cross_validation(
-                df=series.df,
-                h=horizon,
-                step_size=step,
-                n_windows=windows,
-                level=levels,
+    ordered = sorted(candidates, key=lambda m: str(m) != "SeasonalNaive")
+    per_model: dict[str, list[pd.DataFrame]] = {str(m): [] for m in ordered}
+    failed: set[str] = set()
+    sizes = series.df.groupby("unique_id", sort=False).cumcount(ascending=False)
+    started = clock()
+    windows_used = windows
+    for i in range(1, windows + 1):
+        if progress is not None:
+            progress(f"backtest window {i}/{windows}")
+        # Window i ends step * (windows - i) periods before the series end.
+        window_df = series.df.loc[sizes >= step * (windows - i)]
+        for model in ordered:
+            name = str(model)
+            if name in failed:
+                continue
+            try:
+                result = StatsForecast(
+                    models=[model], freq=freq, n_jobs=n_jobs
+                ).cross_validation(
+                    df=window_df,
+                    h=horizon,
+                    step_size=step,
+                    n_windows=1,
+                    level=levels,
+                )
+            except Exception as error:
+                if name == "SeasonalNaive":
+                    raise
+                _fit_failure(series, model, error)
+                failed.add(name)
+                continue
+            per_model[name].append(result)
+        elapsed = clock() - started
+        if (
+            budget_s is not None
+            and MIN_BUDGET_WINDOWS <= i < windows
+            and elapsed >= budget_s
+        ):
+            windows_used = i
+            _series_record(
+                series,
+                f"backtest stopped at {i}/{windows} windows (time budget {budget_s:g} s)",
             )
-        except Exception as error:
-            if str(model) == "SeasonalNaive":
-                raise
-            _fit_failure(series, model, error)
+            break
+    cv, names = None, []
+    for model in ordered:
+        name = str(model)
+        if name in failed:
             continue
+        result = pd.concat(per_model[name], ignore_index=True)
         cv = result if cv is None else cv.merge(result, on=keys, validate="one_to_one")
-        names.append(str(model))
+        names.append(name)
     evaluated = []
     for cutoff, window in cv.groupby("cutoff"):
         # Dropping cutoff explicitly gives evaluate a single window. In
@@ -391,7 +438,7 @@ def backtest(
     ]
     scores = scores[columns]
     scores.columns.name = None
-    return _report(scores, windows, horizon, series.adjustments)
+    return _report(scores, windows, horizon, series.adjustments, windows_used)
 
 
 def _fit_failure(series, model, error):
@@ -399,7 +446,7 @@ def _fit_failure(series, model, error):
     _series_record(series, f"{model} skipped (fit failed: {first_line})")
 
 
-def _report(scores, windows, horizon, adjustments):
+def _report(scores, windows, horizon, adjustments, windows_used=None):
     means = scores.groupby("model")[["relative_mae", "mase"]].mean()
     contenders = means.loc[(means.index != "SeasonalNaive") & (means.relative_mae < 1)]
     best = (
@@ -407,7 +454,9 @@ def _report(scores, windows, horizon, adjustments):
         if not contenders.empty else "SeasonalNaive"
     )
     beats = best != "SeasonalNaive"
-    return BacktestReport(scores, best, beats, windows, horizon, list(adjustments))
+    return BacktestReport(
+        scores, best, beats, windows, horizon, list(adjustments), windows_used
+    )
 
 
 def fit_predict(
@@ -436,10 +485,19 @@ def forecast(
     levels=(80, 95),
     models=None,
     n_jobs=1,
+    progress: ProgressFn | None = None,
+    budget_s: float | None = None,
 ) -> ForecastRun:
     """Select by mean relative MAE (MASE tie-break), then refit the winner."""
     report = backtest(
-        series, freq=freq, horizon=horizon, models=models, levels=levels, n_jobs=n_jobs
+        series,
+        freq=freq,
+        horizon=horizon,
+        models=models,
+        levels=levels,
+        n_jobs=n_jobs,
+        progress=progress,
+        budget_s=budget_s,
     )
     working = PreparedSeries(series.df, list(report.adjustments))
     candidates = _backtest_models(working, freq, models, horizon, report.windows)
@@ -464,7 +522,13 @@ def forecast(
             remaining = report.scores.loc[
                 report.scores.model != report.best_model
             ].copy()
-            report = _report(remaining, report.windows, horizon, working.adjustments)
+            report = _report(
+                remaining,
+                report.windows,
+                horizon,
+                working.adjustments,
+                report.windows_used,
+            )
     adjustments = list(series.adjustments)
     for message in working.adjustments:
         _record(adjustments, message)

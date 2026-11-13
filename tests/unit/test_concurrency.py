@@ -101,3 +101,17 @@ def test_registry_returns_same_service_per_key(synthetic_dataset, monkeypatch, t
     finally:
         clear_services()
         get_settings.cache_clear()
+
+
+def test_reset_gate_rereads_settings(monkeypatch):
+    from analyst.data.gate import reset_gate
+
+    get_settings.cache_clear()
+    monkeypatch.setenv("ANALYST_MAX_CONCURRENT_QUERIES", "1")
+    reset_gate()
+    try:
+        assert get_gate().max_concurrent == 1
+    finally:
+        monkeypatch.delenv("ANALYST_MAX_CONCURRENT_QUERIES")
+        get_settings.cache_clear()
+        reset_gate()

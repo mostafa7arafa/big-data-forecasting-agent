@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -14,11 +15,12 @@ import pyarrow as pa
 from analyst.config import get_settings
 from analyst.data.dataset import DatasetConfig
 from analyst.data.engine import Coverage, Engine
+from analyst.data.gate import get_gate
 from analyst.data.results import ResultStore, SummaryCard, is_result_handle_id
 from analyst.errors import InvalidRequestError
+from analyst.forecasting.core import ProgressFn, prepare_series
 from analyst.forecasting.core import forecast as run_forecast
-from analyst.forecasting.core import prepare_series
-from analyst.forecasting.models import DEFAULTS
+from analyst.forecasting.models import DEFAULTS, candidate_models
 from analyst.memory.files import load_memory
 from analyst.semantic.compiler import (
     FilterSpec,
@@ -49,6 +51,17 @@ _SCORE_FIELDS = (
 )
 _BASELINE_NOTE = "no model beat the seasonal baseline"
 _BACKTEST_SERIES_LIMIT = 5
+_FORECAST_LEVELS = (80, 95)
+# Seconds per (series id x backtest window); rough single-core estimates.
+_WINDOW_COST_S = {"D": 0.6, "MS": 0.05}
+
+_forecast_locks: dict[str, threading.Lock] = {}
+_forecast_locks_guard = threading.Lock()
+
+
+def _forecast_lock(key: str) -> threading.Lock:
+    with _forecast_locks_guard:
+        return _forecast_locks.setdefault(key, threading.Lock())
 
 _DESCRIBE_TARGETS = (
     "metrics",
@@ -147,6 +160,96 @@ class DataService:
             hint=f"call describe('metrics') with one of: {choices}",
         )
 
+    def _forecast_source(
+        self,
+        handle_id: str,
+        *,
+        freq: str,
+        horizon: int,
+        value_col: str,
+        id_col: str | None,
+        time_col: str,
+        levels,
+    ) -> str:
+        return json.dumps(
+            {
+                "input_handle": handle_id,
+                "freq": freq,
+                "horizon": horizon,
+                "value_col": value_col,
+                "id_col": id_col,
+                "time_col": time_col,
+                "levels": list(levels),
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+
+    def forecast_is_cached(
+        self,
+        handle_id: str,
+        *,
+        value_col: str,
+        id_col: str | None,
+        freq: Literal["D", "MS"],
+        horizon: int | None = None,
+        time_col: str = "period",
+    ) -> bool:
+        if horizon is None:
+            horizon = DEFAULTS[freq]["horizon"]
+        source = self._forecast_source(
+            handle_id,
+            freq=freq,
+            horizon=horizon,
+            value_col=value_col,
+            id_col=id_col,
+            time_col=time_col,
+            levels=_FORECAST_LEVELS,
+        )
+        return self.store.lookup("forecast", source) is not None
+
+    def estimate_forecast_s(
+        self, handle_id: str, *, id_col: str | None, freq: Literal["D", "MS"]
+    ) -> float:
+        """Rough wall-clock seconds for an uncached forecast of this handle."""
+        n_ids = 1
+        if id_col is not None:
+            table = self.store.load(handle_id)
+            _require_columns(table.column_names, [id_col])
+            n_ids = max(len(set(table.column(id_col).to_pylist())), 1)
+        windows = DEFAULTS[freq]["n_windows"]
+        return n_ids * windows * _WINDOW_COST_S[freq]
+
+    def _candidates(
+        self,
+        *,
+        value_col: str,
+        id_col: str | None,
+        freq: str,
+        query_meta: dict | None,
+    ) -> tuple[list | None, list[str], str]:
+        """Models for the matching series spec, else the defaults."""
+        defaults = candidate_models(freq)
+        if id_col is None:
+            dims: list[str] = []
+        elif query_meta is not None and id_col not in query_meta.get("dimensions", []):
+            return None, [str(m) for m in defaults], "default"
+        else:
+            dims = [id_col]
+        for spec in self.memory.series:
+            if spec.metric != value_col or spec.freq != freq or spec.dimensions != dims:
+                continue
+            wanted = set(spec.recommended_models)
+            chosen = [m for m in defaults if str(m) in wanted and str(m) != "SeasonalNaive"]
+            if not chosen:
+                break
+            ordered = [m for name in spec.recommended_models for m in chosen if str(m) == name]
+            baseline = next(m for m in defaults if str(m) == "SeasonalNaive")
+            models = [*dict.fromkeys(ordered), baseline]
+            status = spec.recommended_models_status or "proposed"
+            return models, [str(m) for m in models], f"series:{spec.name} ({status})"
+        return None, [str(m) for m in defaults], "default"
+
     def forecast(
         self,
         handle_id: str,
@@ -157,9 +260,59 @@ class DataService:
         freq: Literal["D", "MS"],
         horizon: int | None = None,
         levels: tuple[int, int] = (80, 95),
+        progress: ProgressFn | None = None,
+        budget_s: float | None = None,
     ) -> SummaryCard:
+        if sorted(levels) != list(_FORECAST_LEVELS):
+            raise InvalidRequestError(
+                "forecast levels must be (80, 95)",
+                hint="omit levels; intervals are always 80% and 95%",
+            )
         if horizon is None:
             horizon = DEFAULTS[freq]["horizon"]
+        source = self._forecast_source(
+            handle_id,
+            freq=freq,
+            horizon=horizon,
+            value_col=value_col,
+            id_col=id_col,
+            time_col=time_col,
+            levels=levels,
+        )
+        cached = self.store.lookup("forecast", source)
+        if cached is not None:
+            return cached
+        with _forecast_lock(f"{self.store._root}\0{source}"):
+            cached = self.store.lookup("forecast", source)
+            if cached is not None:
+                return cached
+            return self._compute_forecast(
+                handle_id,
+                source=source,
+                time_col=time_col,
+                value_col=value_col,
+                id_col=id_col,
+                freq=freq,
+                horizon=horizon,
+                levels=levels,
+                progress=progress,
+                budget_s=budget_s,
+            )
+
+    def _compute_forecast(
+        self,
+        handle_id: str,
+        *,
+        source: str,
+        time_col: str,
+        value_col: str,
+        id_col: str | None,
+        freq: Literal["D", "MS"],
+        horizon: int,
+        levels: tuple[int, int],
+        progress: ProgressFn | None,
+        budget_s: float | None,
+    ) -> SummaryCard:
         table = self.store.load(handle_id)
         input_card = self.store.card(handle_id)
         query_meta = input_card.meta.get("query")
@@ -214,32 +367,29 @@ class DataService:
                 prepared.adjustments.append(
                     f"{uid} ends {end.date()}, before the series end {series_end.date()}"
                 )
-        run = run_forecast(
-            prepared,
-            freq=freq,
-            horizon=horizon,
-            levels=levels,
-            n_jobs=1,
+        models, candidate_names, candidates_source = self._candidates(
+            value_col=value_col, id_col=id_col, freq=freq, query_meta=query_meta
         )
+        if budget_s is None:
+            budget_s = get_settings().forecast_budget_s
+        # Fitting counts against the process-wide concurrency cap.
+        with get_gate().slot():
+            run = run_forecast(
+                prepared,
+                freq=freq,
+                horizon=horizon,
+                levels=levels,
+                models=models,
+                n_jobs=1,
+                progress=progress,
+                budget_s=budget_s,
+            )
         elapsed_s = time.perf_counter() - t0
         notes = list(run.adjustments)
         if not run.backtest.beats_baseline and _BASELINE_NOTE not in notes:
             notes.append(_BASELINE_NOTE)
         frame = run.forecast.loc[:, list(_FORECAST_COLUMNS)]
         forecast_table = pa.Table.from_pandas(frame, preserve_index=False)
-        source = json.dumps(
-            {
-                "input_handle": handle_id,
-                "freq": freq,
-                "horizon": horizon,
-                "value_col": value_col,
-                "id_col": id_col,
-                "time_col": time_col,
-                "levels": list(levels),
-            },
-            separators=(",", ":"),
-            sort_keys=True,
-        )
         kept = _kept_scores(run.backtest.scores, run.model)
         backtest_card = self.store.save(
             pa.Table.from_pandas(kept, preserve_index=False),
@@ -257,6 +407,11 @@ class DataService:
             "backtest_handle": backtest_card.handle_id,
             "backtest_summary": _backtest_summary(kept, run.model),
             "input_handle": handle_id,
+            "cutoff": self.engine.cutoff.isoformat() if self.engine.cutoff else None,
+            "data_end": data_end.isoformat(),
+            "windows_used": int(run.backtest.windows_used),
+            "candidates": candidate_names,
+            "candidates_source": candidates_source,
         }
         if kept["unique_id"].nunique() <= _BACKTEST_SERIES_LIMIT:
             meta["backtest"] = _backtest_rows(kept)

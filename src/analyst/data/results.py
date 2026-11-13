@@ -207,6 +207,8 @@ class ResultStore:
         return self._root / "index" / f"{key}.json"
 
     def load(self, handle_id: str) -> pa.Table:
+        # The card is written last: a parquet without one is an incomplete save.
+        self._card_path(handle_id)
         path = self._parquet_path(handle_id)
         return pq.read_table(path)
 
