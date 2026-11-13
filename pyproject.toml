@@ -45,5 +45,6 @@ filterwarnings = [
 markers = [
     "taxi: tests that require data/raw NYC taxi files",
     "slow: long-running tests",
+    "docker: needs a Docker daemon and the analyst-sandbox image (make sandbox-image)",
     "live: needs API keys and starts langgraph dev (uv run pytest -m live tests/live)",
 ]
