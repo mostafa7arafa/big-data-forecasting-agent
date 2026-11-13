@@ -13,6 +13,7 @@ from analyst.errors import UnknownNameError
 from analyst.verify.numbers import StatedNumber, intervals, matches
 
 MAX_CELLS = 2000
+MAX_DERIVATION_CELLS = 200
 _HANDLES_LINE = re.compile(r"^\s*handles:\s*(.+?)\s*$", re.MULTILINE | re.IGNORECASE)
 _HANDLE_ID = re.compile(r"r_[0-9a-f]{10}")
 
@@ -48,6 +49,7 @@ def _numeric_columns(table: pa.Table) -> list[list[float]]:
     ]
     if not cols:
         return []
+    cols = cols[: MAX_CELLS // 2]
     per_col = max(2, MAX_CELLS // len(cols))
     out: list[list[float]] = []
     for col in cols:
@@ -138,7 +140,22 @@ def collect_handles(messages, store: ResultStore) -> dict[str, HandleInfo]:
 
 def direct_handles(x: StatedNumber, handles: list[HandleInfo]) -> list[HandleInfo]:
     """Handles holding a cell that matches ``x`` at its stated precision."""
-    return [h for h in handles if any(matches(x, v) for v in h.values)]
+    spans = intervals(x)
+    found = []
+    for h in handles:
+        if not h.values:
+            continue
+        arr = np.array(h.values, dtype=float)
+        mask = np.zeros(arr.shape, dtype=bool)
+        for lo, hi in spans:
+            mask |= (arr >= lo) & (arr <= hi)
+        if any(matches(x, float(v)) for v in arr[mask]):
+            found.append(h)
+    return found
+
+
+def _derivable(cited: list[HandleInfo]) -> bool:
+    return sum(len(h.values) for h in cited) <= MAX_DERIVATION_CELLS
 
 
 def _derive_hit(cited: list[HandleInfo], spans, confirm) -> bool:
@@ -147,11 +164,11 @@ def _derive_hit(cited: list[HandleInfo], spans, confirm) -> bool:
     Allowed: two cells of the same column, or cells of two different cited
     handles. Cells of two different columns of one handle are not paired.
     """
-    cols = [
-        (hi, np.array(col, dtype=float))
-        for hi, h in enumerate(cited)
-        for col in h.column_lists()
-    ]
+    cols = []
+    for hi, h in enumerate(cited):
+        for col in h.column_lists():
+            uniq, counts = np.unique(np.array(col, dtype=float), return_counts=True)
+            cols.append((hi, uniq, counts))
 
     def hit(derived: np.ndarray) -> np.ndarray:
         mask = np.zeros(derived.shape, dtype=bool)
@@ -160,15 +177,15 @@ def _derive_hit(cited: list[HandleInfo], spans, confirm) -> bool:
         return mask
 
     with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
-        for ai, (ah, avals) in enumerate(cols):
-            for bi, (bh, bvals) in enumerate(cols):
+        for ai, (ah, avals, _) in enumerate(cols):
+            for bi, (bh, bvals, bcounts) in enumerate(cols):
                 if ah == bh and ai != bi:
                     continue
                 nonzero = bvals != 0
                 for i, a in enumerate(avals):
                     usable = np.ones(len(bvals), dtype=bool)
                     if ai == bi:
-                        usable[i] = False
+                        usable[i] = bcounts[i] >= 2
                     candidates = (
                         (a - bvals, usable),
                         ((a - bvals) / bvals * 100, usable & nonzero),
@@ -188,7 +205,7 @@ def trace_value(
     """A direct match, or (``derive``) a one-hop derivation over ``cited``."""
     if direct_handles(x, cited):
         return True
-    if not derive:
+    if not derive or not _derivable(cited):
         return False
     return _derive_hit(cited, intervals(x), lambda d: matches(x, d))
 
@@ -209,6 +226,8 @@ def trace_float(value: float, cited: list[HandleInfo]) -> bool:
 
     if any(confirm(v) for h in cited for v in h.values):
         return True
+    if not _derivable(cited):
+        return False
     spans = []
     for t in targets:
         pad = 2e-9 * max(abs(t), 1e-3)

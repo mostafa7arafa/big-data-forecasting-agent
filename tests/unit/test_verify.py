@@ -371,3 +371,50 @@ def test_scale_suffix_variants():
         for n in extract_numbers("1.2bn, 2.8m, 3 Million, 4 BILLION, 5 Bn")
     ]
     assert got == [(1.2, 1e9), (2.8, 1e6), (3, 1e6), (4, 1e9), (5, 1e9)]
+
+
+def test_spaced_single_letter_scales():
+    got = [
+        (n.value, n.scale)
+        for n in extract_numbers("2.8 M trips, 5 K, 1.2 B rides, 3 m")
+    ]
+    assert got == [(2.8, 1e6), (5, 1e3), (1.2, 1e9), (3, 1e6)]
+
+
+def test_derivation_cap():
+    import random
+
+    random.seed(0)
+    big = info(
+        "r_bbbbbbbbbb", [float(random.randint(300000, 500000)) for _ in range(300)]
+    )
+    for fake in ["12%", "7%", "1.3", "3.14"]:
+        assert not trace_value(sn(fake), [big])
+    forecast = info(
+        "r_aaaaaaaaaa", [2_808_154.0 + i * 1000 for i in range(8)], "forecast"
+    )
+    last = info("r_bbbbbbbbbb", [2_894_704.0 + i * 1000 for i in range(8)])
+    assert trace_value(sn("-3.0%"), [forecast, last])
+
+
+def test_untraceable_perf_and_cell_cap(tmp_path):
+    import random
+    import time
+
+    random.seed(1)
+    big = [
+        info(f"r_{i:010x}", [random.random() * 1e6 for _ in range(2000)])
+        for i in range(5)
+    ]
+    start = time.time()
+    assert not trace_value(sn("-123,456,789.123"), big)
+    assert time.time() - start < 0.6
+    from analyst.verify.trace import MAX_CELLS, _numeric_columns
+
+    wide = pa.table({f"c{i}": [1.0, 2.0, 3.0, 4.0] for i in range(1500)})
+    assert sum(len(c) for c in _numeric_columns(wide)) <= MAX_CELLS
+
+
+def test_clock_times_with_am_pm():
+    for text in ["at 10am", "at 10 am", "at 10 pm", "10 PM"]:
+        assert extract_numbers(text) == [], text

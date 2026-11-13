@@ -27,6 +27,7 @@ _MASKS = [
     re.compile(r"\b\d{4}-\d{1,2}\b"),
     re.compile(r"\b\d{1,2}/\d{4}\b"),
     re.compile(r"\b\d{1,2}:\d{2}(?::\d{2})?(?:\s?[ap]m\b)?", re.IGNORECASE),
+    re.compile(r"\b\d{1,2}\s?[ap]m\b", re.IGNORECASE),
     re.compile(
         rf"\b{_MONTH}\.? \d{{1,2}}(?!\d)(?:st|nd|rd|th)?(?:\s?[-\u2013]\s?\d{{1,2}}(?!\d))?"
         r"(?:,? \d{4})?"
@@ -46,7 +47,7 @@ _NUMBER = re.compile(
     r"(?<![\w.])(?<![A-Za-z]-)"
     r"(?P<sign>[-−–+])?(?P<dollar>\$)?"
     r"(?P<num>\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)"
-    r"(?:\s?(?P<suf>%|(?i:percent|billion|million|bn|mn)\b)|(?P<suf1>[kKmMB]\b))?"
+    r"(?:\s?(?:(?P<suf>%|(?i:percent|billion|million|bn|mn)\b)|(?P<suf1>[kKmMB]\b)))?"
 )
 
 
