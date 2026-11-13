@@ -1,0 +1,1 @@
+{"dependencies": ["."], "graphs": {"analyst": "./src/analyst/graph.py:graph"}, "env": ".env"}
