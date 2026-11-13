@@ -123,18 +123,29 @@ def collect_handles(messages, store: ResultStore) -> dict[str, HandleInfo]:
     found: dict[str, HandleInfo] = {}
     for message in messages:
         artifact = _get(message, "artifact")
-        if isinstance(artifact, dict) and isinstance(artifact.get("handle_id"), str):
-            hid = artifact["handle_id"]
-            loaded = load_handle_info(store, hid)
-            if loaded is not None:
-                found[hid] = HandleInfo(
-                    hid,
-                    str(artifact.get("produced_by", "")),
-                    bool(artifact.get("governed", False)),
-                    loaded.values,
-                    loaded.columns,
-                    loaded.levels,
-                )
+        entries: list[dict] = []
+        if isinstance(artifact, dict):
+            if isinstance(artifact.get("handle_id"), str):
+                entries = [artifact]
+            elif isinstance(artifact.get("handles"), list):
+                entries = [
+                    a
+                    for a in artifact["handles"]
+                    if isinstance(a, dict) and isinstance(a.get("handle_id"), str)
+                ]
+        if entries:
+            for entry in entries:
+                hid = entry["handle_id"]
+                loaded = load_handle_info(store, hid)
+                if loaded is not None:
+                    found[hid] = HandleInfo(
+                        hid,
+                        str(entry.get("produced_by", "")),
+                        bool(entry.get("governed", False)),
+                        loaded.values,
+                        loaded.columns,
+                        loaded.levels,
+                    )
             continue
         if is_background_notification(message):
             for line in _HANDLES_LINE.findall(_text(message)):
