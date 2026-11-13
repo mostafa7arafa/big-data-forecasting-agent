@@ -81,9 +81,16 @@ def forecast_meta(**overrides) -> dict:
         "cutoff": CUTOFF,
         "candidates": ["AutoARIMA", "AutoETS", "SeasonalNaive"],
         "headline_ids": ["Brooklyn", "Manhattan", "Queens"],
+        "input_handle": "r_input",
     }
     meta.update(overrides)
     return meta
+
+
+def with_input(handles: dict, metric: str = "trips") -> dict:
+    """Add the query_metrics input handle that forecast metas point at."""
+    query = {"metrics": [metric], "dimensions": ["pickup_borough"], "grain": "month"}
+    return {"r_input": {"produced_by": "query_metrics", "query": query, "cutoff": CUTOFF}, **handles}
 
 
 BOROUGH_GOLD = [
@@ -188,7 +195,7 @@ def test_grounding_gate_for_traps_only():
 
 
 def test_checks_forecast_shape():
-    out = outputs_with(handles={"r_00000000aa": forecast_meta()})
+    out = outputs_with(handles=with_input({"r_00000000aa": forecast_meta()}))
     assert grade_checks(out, forecast_ref())["score"] is True
 
 
@@ -205,7 +212,7 @@ def test_checks_forecast_shape():
     ],
 )
 def test_checks_forecast_shape_rejects(overrides):
-    out = outputs_with(handles={"r_00000000aa": forecast_meta(**overrides)})
+    out = outputs_with(handles=with_input({"r_00000000aa": forecast_meta(**overrides)}))
     assert grade_checks(out, forecast_ref())["score"] is False
 
 
@@ -215,9 +222,9 @@ def test_checks_forecast_shape_single_series():
         gold=[{"period": "2025-08-01", "trips": 1.0}],
     )
     single = forecast_meta(freq="D", horizon=7, headline_ids=["series"])
-    assert grade_checks(outputs_with(handles={"r_1": single}), ref)["score"] is True
+    assert grade_checks(outputs_with(handles=with_input({"r_1": single})), ref)["score"] is True
     by_id = forecast_meta(freq="D", horizon=7)
-    assert grade_checks(outputs_with(handles={"r_1": by_id}), ref)["score"] is False
+    assert grade_checks(outputs_with(handles=with_input({"r_1": by_id})), ref)["score"] is False
 
 
 def test_checks_declined():
@@ -305,7 +312,7 @@ def test_forecast_skill_scores_error_and_coverage():
         {"unique_id": "Queens", "ds": "2025-08-01T00:00:00", "yhat": 200.0,
          "lo_80": 190.0, "hi_80": 210.0, "lo_95": 180.0, "hi_95": 220.0},
     ]
-    out = outputs_with(handles={"r_1": forecast_meta(forecast=rows)})
+    out = outputs_with(handles=with_input({"r_1": forecast_meta(forecast=rows)}))
     result = grade_forecast_skill(out, forecast_ref())
     assert result["key"] == "forecast_skill"
     # |900-1000| + |200-200| over 1000 + 200
@@ -405,3 +412,107 @@ def test_derive_key_values():
         derive_key_values(row, big)
     with pytest.raises(ValueError, match="matched 0 rows"):
         derive_key_values({**row, "key_select": [{"where": {"pickup_borough": "Bronx"}, "col": "trips"}]}, table)
+
+
+# --- fix round 1 -------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "gold, bad, good",
+    [
+        (1.3339, "1 passenger", "1.33 passengers"),  # a030
+        (0.130072, "0", "0.13"),  # a026 tip rate
+        (-20.34, "fell 20%", "fell 20.3%"),  # a026 change pct
+        (8.8, "9 miles", "8.8 miles"),  # a034
+    ],
+)
+def test_answer_values_significant_digits(gold, bad, good):
+    ref = {"key_values": [{"value": gold, "label": "k"}], "tolerance": None}
+    assert grade_answer_values(outputs_with(narrative=bad), ref)["score"] is False
+    assert grade_answer_values(outputs_with(narrative=good), ref)["score"] is True
+
+
+def test_answer_values_exact_small_integers_still_pass():
+    ref = {"key_values": [{"value": 5.0, "label": "k"}], "tolerance": None}
+    assert grade_answer_values(outputs_with(narrative="5 zones"), ref)["score"] is True
+    assert grade_answer_values(outputs_with(narrative="6 zones"), ref)["score"] is False
+
+
+def test_answer_values_one_to_one():
+    ref = {
+        "key_values": [{"value": 1500.0, "label": "a"}, {"value": 1500.0, "label": "b"}],
+        "tolerance": None,
+    }
+    assert grade_answer_values(outputs_with(narrative="1,500 trips"), ref)["score"] is False
+    assert grade_answer_values(outputs_with(narrative="1,500 and 1,500"), ref)["score"] is True
+    # Augmenting path: "1,501" fits only b, so "1,500" must go to a.
+    ref2 = {
+        "key_values": [{"value": 1500.0, "label": "a"}, {"value": 1500.6, "label": "b"}],
+        "tolerance": None,
+    }
+    assert grade_answer_values(outputs_with(narrative="1,501 then 1,500"), ref2)["score"] is True
+
+
+A048 = {"gold_check": ["declined()"], "cutoff": "2026-01-31", "question": "How many trips were recorded in March 2026?"}
+
+
+def test_declined_rejects_untraced_narrative_numbers():
+    out = outputs_with(narrative="There were 3,952,443 trips in March 2026.", label="not_verified")
+    assert grade_checks(out, A048)["score"] is False
+
+
+def test_declined_allows_traced_helpful_numbers():
+    out = outputs_with(
+        narrative="Data ends on 2026-01-31, so March 2026 is unavailable; January 2026 had 2,912,345 trips.",
+        label="verified",
+    )
+    assert grade_checks(out, A048)["score"] is True
+    question_only = outputs_with(narrative="March 2026 is after the data ends.", label="not_verified")
+    assert grade_checks(question_only, A048)["score"] is True
+
+
+def test_forecast_shape_requires_series_metric():
+    out = outputs_with(handles=with_input({"r_1": forecast_meta()}, metric="revenue"))
+    result = grade_checks(out, forecast_ref())
+    assert result["score"] is False
+    assert "revenue" in result["comment"]
+
+
+def test_forecast_shape_missing_input_handle_fails():
+    out = outputs_with(handles={"r_1": forecast_meta()})
+    result = grade_checks(out, forecast_ref())
+    assert result["score"] is False
+    assert "input handle" in result["comment"]
+
+
+QUIRK = {"gold_check": ["quirk_flagged('anomaly:2026-02-23')"], "cutoff": None}
+
+
+def test_quirk_flagged_by_fact_ids():
+    out = outputs_with(claims=[claim("Feb 23 was low.", fact_ids=["anomaly:2026-02-23"])])
+    assert grade_checks(out, QUIRK)["score"] is True
+
+
+def test_quirk_flagged_by_narrative():
+    out = outputs_with(narrative="Flagged as known anomaly anomaly:2026-02-23.")
+    assert grade_checks(out, QUIRK)["score"] is True
+
+
+def test_quirk_flagged_not_by_claim_text_alone():
+    out = outputs_with(claims=[claim("see anomaly:2026-02-23")])
+    assert grade_checks(out, QUIRK)["score"] is False
+
+
+def test_forecast_skill_scores_the_shape_matching_handle():
+    def rows(yhat):
+        return [{"unique_id": "Manhattan", "ds": "2025-08-01", "yhat": yhat,
+                 "lo_80": 0.0, "hi_80": 2000.0, "lo_95": 0.0, "hi_95": 2000.0}]
+
+    right = forecast_meta(forecast=rows(900.0))  # error 100 / 1000
+    wrong = forecast_meta(freq="D", forecast=rows(500.0))  # later, wrong freq
+    out = outputs_with(handles=with_input({"r_1": right, "r_2": wrong}))
+    result = grade_forecast_skill(out, forecast_ref())
+    assert result["score"] == pytest.approx(0.1)
+    assert "forecast_shape handle" in result["comment"]
+    fallback = outputs_with(handles=with_input({"r_2": wrong}))
+    assert grade_forecast_skill(fallback, forecast_ref())["score"] == pytest.approx(0.5)

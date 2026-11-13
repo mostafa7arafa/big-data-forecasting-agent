@@ -11,7 +11,9 @@ A handle ``entry`` is the summary card's ``meta`` dict plus ``produced_by``
 (a nested ``{"meta": {...}, ...}`` entry is flattened too). Forecast entries
 should also carry ``forecast``: the forecast table as a list of row dicts
 (``unique_id, ds, yhat, lo_80, hi_80, lo_95, hi_95``), which
-``forecast_skill`` scores. ``outputs = {"error": ...}`` fails every gate.
+``forecast_skill`` scores. A forecast entry's ``input_handle`` must also be in
+``handles`` (its ``query`` meta names the metric that ``forecast_shape``
+checks). ``outputs = {"error": ...}`` fails every gate.
 
 ``reference`` is an eval row (see ``evals/datasets/agent_single_turn.jsonl``).
 Gold tables load from ``evals/gold/<id>.parquet``; a ``gold`` list of row
@@ -51,7 +53,6 @@ REQUIRED_FIELDS = (
 )
 # Claim values are exact data values; allow float noise only (as verify does).
 _CLAIM_REL = 1e-9
-_MIN_SIG_DIGITS = 3
 _HEADLINE_SHARE = 0.01
 
 Result = dict[str, Any]
@@ -233,15 +234,20 @@ def _verification(outputs: dict) -> dict | None:
     return outputs.get("verification") or _answer(outputs).get("verification")
 
 
-def _entries(outputs: dict) -> list[dict]:
-    entries = []
-    for entry in (outputs.get("handles") or {}).values():
+def _handle_map(outputs: dict) -> dict[str, dict]:
+    """Handle id -> flattened entry (card meta plus produced_by)."""
+    out: dict[str, dict] = {}
+    for handle_id, entry in (outputs.get("handles") or {}).items():
         if not isinstance(entry, dict):
             continue
         if isinstance(entry.get("meta"), dict):
             entry = {**{k: v for k, v in entry.items() if k != "meta"}, **entry["meta"]}
-        entries.append(entry)
-    return entries
+        out[str(handle_id)] = entry
+    return out
+
+
+def _entries(outputs: dict) -> list[dict]:
+    return list(_handle_map(outputs).values())
 
 
 def _is_forecast(entry: dict) -> bool:
@@ -286,9 +292,25 @@ def _sig_digits(stated: StatedNumber) -> int:
     return len(digits.lstrip("0"))
 
 
+def _exact_integer(stated: StatedNumber, gold: float) -> bool:
+    """A whole number stated in full (no scale, decimals or %) for an integer gold."""
+    return (
+        float(gold).is_integer()
+        and stated.scale == 1
+        and stated.decimals == 0
+        and not stated.percent
+    )
+
+
+def _min_sig_digits(gold: float) -> int:
+    return 3 if abs(gold) >= 10 else 2
+
+
 def _stated_matches(stated: StatedNumber, gold: float, tolerance: dict | None) -> bool:
     if tolerance is None:
-        if abs(gold) >= 1000 and _sig_digits(stated) < _MIN_SIG_DIGITS:
+        if _exact_integer(stated, gold):
+            return matches(stated, gold)  # full integers must match exactly
+        if _sig_digits(stated) < _min_sig_digits(gold):
             return False
         return matches(stated, gold)
     bases = [gold]
@@ -310,9 +332,13 @@ def grade_answer_values(outputs: dict, reference: dict) -> Result:
     """Gate: every key value is matched by a claim value or a narrative number.
 
     tolerance null: claim values match exactly (float noise only); narrative
-    numbers use the verify rounding rule and, when |gold| >= 1000, must carry
-    at least 3 significant digits ("2.89M" passes for 2,894,704; "2.9M" fails).
+    numbers use the verify rounding rule and must carry at least 3 significant
+    digits when |gold| >= 10, at least 2 below that ("2.89M" passes for
+    2,894,704, "2.9M" fails; "1.33" passes for 1.3339, "1" fails). A whole
+    number stated in full for an integer gold must match it exactly.
     tolerance {"rel": r}: both match within relative error r.
+
+    Matching is one-to-one: each answer number satisfies at most one key value.
     """
     key = "answer_values"
     if "error" in outputs:
@@ -323,14 +349,32 @@ def grade_answer_values(outputs: dict, reference: dict) -> Result:
     tolerance = reference.get("tolerance")
     claim_values = [float(v) for c in _claims(outputs) for v in (c.get("values") or []) if _number(v)]
     stated = extract_numbers(_answer(outputs).get("narrative") or "")
-    missing = []
-    for item in key_values:
-        gold = float(item["value"])
-        if any(_claim_matches(v, gold, tolerance) for v in claim_values):
-            continue
-        if any(_stated_matches(n, gold, tolerance) for n in stated):
-            continue
-        missing.append(f"{item.get('label', '?')}={gold:g}")
+    candidates: list[Callable[[float], bool]] = [
+        (lambda gold, v=v: _claim_matches(v, gold, tolerance)) for v in claim_values
+    ] + [(lambda gold, n=n: _stated_matches(n, gold, tolerance)) for n in stated]
+    options = [
+        [j for j, fits in enumerate(candidates) if fits(float(item["value"]))]
+        for item in key_values
+    ]
+    owner: dict[int, int] = {}  # answer-number index -> key-value index
+
+    def assign(i: int, seen: set[int]) -> bool:
+        # Augmenting path (bipartite matching): key values are few, so this is cheap.
+        for j in options[i]:
+            if j in seen:
+                continue
+            seen.add(j)
+            if j not in owner or assign(owner[j], seen):
+                owner[j] = i
+                return True
+        return False
+
+    matched = {i for i in range(len(key_values)) if assign(i, set())}
+    missing = [
+        f"{item.get('label', '?')}={float(item['value']):g}"
+        for i, item in enumerate(key_values)
+        if i not in matched
+    ]
     if missing:
         return _result(key, False, "missing: " + "; ".join(missing))
     return _result(key, True, f"matched {len(key_values)} key values")
@@ -370,16 +414,20 @@ def grade_grounding(outputs: dict, reference: dict) -> Result:
 # --- checks ----------------------------------------------------------------------
 
 
-def _check_forecast_shape(outputs: dict, reference: dict, series: str, freq: str, horizon: int) -> tuple[bool, str]:
+def _shape_match(
+    outputs: dict, reference: dict, series: str, freq: str, horizon: int
+) -> tuple[dict | None, str]:
+    """The first forecast handle meeting forecast_shape, or None with the reasons."""
     spec = _series_specs()[series]
-    forecasts = [e for e in _entries(outputs) if _is_forecast(e)]
+    handles = _handle_map(outputs)
+    forecasts = [e for e in handles.values() if _is_forecast(e)]
     if not forecasts:
-        return False, "no forecast handle"
+        return None, "no forecast handle"
     required: set[str] | None = None
     if spec["dimensions"]:
         gold = _gold_rows(reference)
         if not gold:
-            return False, "no gold actuals to resolve the series ids"
+            return None, "no gold actuals to resolve the series ids"
         id_col, value_col = spec["dimensions"][0], spec["metric"]
         totals: dict[str, float] = {}
         for row in gold:
@@ -408,10 +456,22 @@ def _check_forecast_shape(outputs: dict, reference: dict, series: str, freq: str
                 problems.append(f"ids {sorted(ids)} for a single series")
         elif not required <= ids or "series" in ids:
             problems.append(f"ids miss {sorted(required - ids)}")
+        source = handles.get(str(meta.get("input_handle")))
+        if source is None:
+            problems.append(f"input handle {meta.get('input_handle')!r} not in outputs")
+        else:
+            metrics = (source.get("query") or {}).get("metrics") or []
+            if spec["metric"] not in metrics:
+                problems.append(f"input metrics {metrics}, need {spec['metric']!r}")
         if not problems:
-            return True, f"forecast {series} {freq} h={horizon}"
+            return meta, f"forecast {series} {freq} h={horizon}"
         reasons.append(", ".join(problems))
-    return False, "forecast handle mismatch: " + " | ".join(reasons)
+    return None, "forecast handle mismatch: " + " | ".join(reasons)
+
+
+def _check_forecast_shape(outputs: dict, reference: dict, series: str, freq: str, horizon: int) -> tuple[bool, str]:
+    meta, comment = _shape_match(outputs, reference, series, freq, horizon)
+    return meta is not None, comment
 
 
 def _check_declined(outputs: dict, reference: dict) -> tuple[bool, str]:
@@ -421,14 +481,17 @@ def _check_declined(outputs: dict, reference: dict) -> tuple[bool, str]:
         return False, f"declined but stated claim values {values[:3]}"
     if not narrative:
         return False, "declined without saying why"
+    numbers = extract_numbers(narrative, exclude=reference.get("question") or "")
+    label = (_verification(outputs) or {}).get("label")
+    if numbers and label not in ("verified", "verified_off_model"):
+        return False, f"declined but stated untraced numbers {[n.raw for n in numbers[:3]]} (label {label!r})"
     return True, "declined with a reason"
 
 
 def _check_quirk_flagged(outputs: dict, reference: dict, *ids: str) -> tuple[bool, str]:
-    claims = _claims(outputs)
-    cited = {fid for c in claims for fid in c.get("fact_ids") or []}
-    text = " ".join([_answer(outputs).get("narrative") or ""] + [c.get("text") or "" for c in claims])
-    if cited & set(ids) or any(i in text for i in ids):
+    cited = {fid for c in _claims(outputs) for fid in c.get("fact_ids") or []}
+    narrative = _answer(outputs).get("narrative") or ""
+    if cited & set(ids) or any(i in narrative for i in ids):
         return True, f"flagged {'/'.join(ids)}"
     return False, f"did not cite {'/'.join(ids)}"
 
@@ -504,6 +567,13 @@ def grade_forecast_skill(outputs: dict, reference: dict) -> Result:
     forecasts = [e for e in _entries(outputs) if _is_forecast(e) and e.get("forecast")]
     if spec is None or not gold or not forecasts:
         return _result(key, None, "no forecast rows or no gold actuals")
+    chosen, which = forecasts[-1], "last forecast handle"
+    for check in reference.get("gold_check") or []:
+        name, args = parse_check(check)
+        if name == "forecast_shape":
+            meta, _ = _shape_match(outputs, reference, *args)
+            if meta is not None and meta.get("forecast"):
+                chosen, which = meta, "forecast_shape handle"
     id_col = spec["dimensions"][0] if spec["dimensions"] else None
     actual = {
         (str(row[id_col]) if id_col else "series", _day(row["period"])): float(row[spec["metric"]])
@@ -513,7 +583,7 @@ def grade_forecast_skill(outputs: dict, reference: dict) -> Result:
     errors = scale = 0.0
     inside = {80: 0, 95: 0}
     points = 0
-    for row in forecasts[-1]["forecast"]:
+    for row in chosen["forecast"]:
         y = actual.get((str(row["unique_id"]), _day(row["ds"])))
         if y is None:
             continue
@@ -529,7 +599,7 @@ def grade_forecast_skill(outputs: dict, reference: dict) -> Result:
         key,
         wape,
         f"wape={wape:.4f} coverage_80={inside[80] / points:.2f} "
-        f"coverage_95={inside[95] / points:.2f} points={points}/{len(actual)}",
+        f"coverage_95={inside[95] / points:.2f} points={points}/{len(actual)} ({which})",
     )
 
 
