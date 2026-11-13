@@ -107,6 +107,15 @@ def _is_ai_answer(message: dict) -> bool:
     return message.get("type") == "ai" and not message.get("tool_calls")
 
 
+_ACTIVE_RUNS = frozenset({"pending", "running"})
+
+
+async def _task_status(client, task: dict) -> str:
+    """The server-side status of the task thread's newest run (as background.py reads it)."""
+    runs = await client.runs.list(thread_id=task["thread_id"], limit=1)
+    return runs[0].get("status", "?") if runs else "no run"
+
+
 async def _scenario(url: str) -> None:
     from langgraph_sdk import get_client
 
@@ -131,8 +140,15 @@ async def _scenario(url: str) -> None:
             break
         await asyncio.sleep(2)
     assert tasks, "no background task started within 60 s"
+    task = next(iter(tasks.values()))
 
-    # 3. A side question is answered while the task runs.
+    # 3. A side question is answered while the task runs: the task must be
+    # running before the question is sent and still running once it is answered
+    # (an answer queued behind the forecast would fail here).
+    status = await _task_status(client, task)
+    assert status in _ACTIVE_RUNS, (
+        f"background task not running before the side question (status {status!r})"
+    )
     before = len(_messages(await client.threads.get_state(tid)))
     await client.runs.wait(
         tid,
@@ -141,8 +157,14 @@ async def _scenario(url: str) -> None:
         context=context,
         multitask_strategy="enqueue",
     )
+    status = await _task_status(client, task)
     after = _messages(await client.threads.get_state(tid))
     assert any(_is_ai_answer(m) for m in after[before:]), "side question unanswered"
+    if status not in _ACTIVE_RUNS:
+        pytest.fail(
+            f"background task already finished (status {status!r}) when the side answer "
+            "arrived; the answer did not prove chatting while the task runs"
+        )
 
     # 4. The notification arrives, then a verified answer.
     deadline = time.monotonic() + DONE_WAIT_S

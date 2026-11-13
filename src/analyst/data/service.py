@@ -413,12 +413,18 @@ class DataService:
         headline_kept = kept.loc[kept["unique_id"].map(str).isin(set(headline_ids))]
         # A budget-truncated run is returned but never served from the cache.
         complete = run.backtest.windows_used >= run.backtest.windows
+        # The evaluated windows are part of the handle identity, so a partial
+        # run and a later complete retry never overwrite each other.
         backtest_card = self.store.save(
             pa.Table.from_pandas(kept, preserve_index=False),
             produced_by="backtest",
             source=source + ":backtest",
             governed=input_card.governed,
             elapsed_s=elapsed_s,
+            meta={
+                "windows_used": int(run.backtest.windows_used),
+                "windows": int(run.backtest.windows),
+            },
             index=complete,
         )
         meta = {

@@ -715,3 +715,186 @@ def test_decline_with_a_causal_cue_is_not_a_causal_claim(tmp_path):
     # with a number stated it is an answer, and the scan applies
     stated = Answer(narrative="Trips fell to 2.89M because of the storm.", claims=[])
     assert "unsupported causal claim" in _run_q(stated, store).problems
+
+
+# --- CodeRabbit PR #3 ------------------------------------------------------------
+
+
+def test_four_digit_metric_values_are_numbers():
+    assert [n.value for n in extract_numbers("There were 2000 events")] == [2000]
+    assert [n.value for n in extract_numbers("Peak hour had 1999 trips")] == [1999]
+    assert [n.value for n in extract_numbers("2024 revenue was 12.5")] == [12.5]  # item 15: a year
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "In 2024 trips grew",
+        "since 2023",
+        "the summer of 2025",
+        "during 2024",
+        "until 2026",
+        "through 2025",
+        "from 2023 to 2025",
+        "by 2026",
+        "the year 2024",
+        "FY 2024",
+        "Q3 2025",
+        "in Q4 of 2025",
+        "March 2025",
+        "Sept 2024",
+        "2025 Q1",
+        "2025 January",
+        "2023-2025",
+        "2023–2025",
+        "2023 - 2025",
+        "between 2023 and 2025",
+        "The data covers 2023 through 2026",
+        "2023 to 2025 saw growth",
+        "Data runs 2023 until 2026",
+    ],
+)
+def test_calendar_years_are_not_numbers(text):
+    assert extract_numbers(text) == [], text
+
+
+def test_count_noun_makes_a_four_digit_number_a_value():
+    got = extract_numbers("In the busy month there were 2000 events")
+    assert [n.value for n in got] == [2000]
+
+
+def test_four_digit_count_traced(tmp_path):
+    store = ResultStore(tmp_path)
+    h = save(store, [42.0])
+    answer = Answer(
+        narrative="There were 2000 events.",
+        claims=[Claim(text="events", type="descriptive", handles=[h])],
+    )
+    result = run(answer, {}, store)
+    assert result.label == "not_verified"
+    assert "untraced number 2000" in result.problems
+
+
+def test_question_values_are_still_checked():
+    assert [n.raw for n in extract_numbers("Revenue was $100.", exclude="Was revenue $100?")] == ["$100"]
+    assert [n.value for n in extract_numbers("Revenue was 100.", exclude="Was revenue 100?")] == [100]
+    assert [n.value for n in extract_numbers("It took 42 minutes", exclude="Did it take 42 minutes?")] == [42]
+
+
+@pytest.mark.parametrize(
+    "answer, question",
+    [
+        ("The top 5 zones were", "What were the top five zones?"),
+        ("The 3 busiest zones were", "Name the 3 busiest zones"),
+        ("The 3 largest areas", "the three largest areas"),
+        ("Highest 4 values", "the 4 highest values"),
+        ("The 2 lowest days", "the 2 lowest days"),
+        ("The first 10 rows", "Show the first 10 rows"),
+        ("The last 6 entries", "the last six entries"),
+        ("Here are 3 charts", "Make 3 charts"),
+        ("Across 4 zones", "Compare 4 zones"),
+        ("The top 5 dropoff zones", "Which five dropoff zones received the most trips?"),  # a031
+        ("The top 3 groups", "top 3 groups by revenue"),
+        ("The 2 most active", "the 2 most active"),
+        ("The 2 least active", "the two least active"),
+    ],
+)
+def test_question_rank_and_count_numbers_exempt(answer, question):
+    assert extract_numbers(answer, exclude=question) == [], (answer, question)
+
+
+def test_question_exemption_run(tmp_path):
+    store = ResultStore(tmp_path)
+    h = save(store, [7.0])
+    answer = Answer(
+        narrative="Revenue was $100.",
+        claims=[Claim(text="revenue", type="descriptive", handles=[h])],
+    )
+    assert run(answer, {}, store, question="Was revenue $100?").label == "not_verified"
+
+
+@pytest.mark.parametrize(
+    "text, value",
+    [("1e6", 1e6), ("2.5E-3", 0.0025), ("3.10e2", 310.0), ("-1.5e3", -1500.0)],
+)
+def test_scientific_notation_is_one_number(text, value):
+    (n,) = extract_numbers(f"Revenue was {text} dollars")
+    assert n.value * n.scale == pytest.approx(value)
+    assert n.raw == text
+    assert matches(n, value)
+    assert not matches(n, 1.0)  # never just the mantissa
+
+
+def test_scientific_notation_precision():
+    (n,) = extract_numbers("about 2.5E-3")
+    assert matches(n, 0.00251) and not matches(n, 0.0026)
+    (m,) = extract_numbers("1e6")
+    assert matches(m, 1_200_000) and not matches(m, 1)
+    assert [x.value for x in extract_numbers("5 events")] == [5]
+
+
+def test_scientific_notation_not_traced_to_mantissa(tmp_path):
+    store = ResultStore(tmp_path)
+    h = save(store, [1.0])
+    answer = Answer(
+        narrative="Revenue was 1e6.",
+        claims=[Claim(text="revenue", type="descriptive", handles=[h])],
+    )
+    assert run(answer, {}, store).label == "not_verified"
+
+
+# --- CodeRabbit PR #3 follow-up (items 15-16) ----------------------------------------
+
+
+@pytest.mark.parametrize(
+    "text, raws",
+    [
+        ("2024 revenue was 12.5", ["12.5"]),
+        ("Volume rose to 2000 by March", []),
+        ("There were 2000 events", ["2000"]),
+        ("There were 2000 new trips", ["2000"]),
+        ("1999 rides and 2050 passengers", ["1999", "2050"]),
+        ("2000 records, 2001 orders, 2002 visits", ["2000", "2001", "2002"]),
+        ("$2000 in fees", ["$2000"]),
+        ("2,000 in fees", ["2,000"]),
+        ("2000.5 in fees", ["2000.5"]),
+        ("2000k in fees", ["2000k"]),
+        ("A total of 2000 was recorded", []),
+        ("2000 distinct users", ["2000"]),
+    ],
+)
+def test_bare_years_unless_counting_items(text, raws):
+    assert [n.raw for n in extract_numbers(text)] == raws, text
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Trips from December 22 to 28 were lower",
+        "Trips from Dec 22–28 were lower",
+        "Trips from Dec 22 - 28, 2025 were lower",
+        "Trips from 22 to 28 December were lower",
+        "the week of December 15 to 21, 2025",
+    ],
+)
+def test_day_ranges_are_dates(text):
+    assert extract_numbers(text) == [], text
+
+
+def test_day_range_does_not_swallow_values():
+    assert [n.raw for n in extract_numbers("December 22 to 28,412 trips")] == ["28,412"]
+
+
+@pytest.mark.parametrize(
+    "text, raws",
+    [
+        ("In 2024 trips grew", []),
+        ("Since 2025 trips rose 5%", ["5%"]),
+        ("during 2023 rides fell", []),
+        ("from 2023 rows were dropped", []),
+        ("There were 2000 events", ["2000"]),
+        ("rose to 2000 trips", ["2000"]),  # "to" is not a calendar preposition
+    ],
+)
+def test_calendar_preposition_beats_count_noun(text, raws):  # follow-up item 18
+    assert [n.raw for n in extract_numbers(text)] == raws, text

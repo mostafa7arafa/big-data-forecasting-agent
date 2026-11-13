@@ -2,7 +2,7 @@
 
 import math
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import ROUND_HALF_UP, Decimal
 
 _SCALES = {
@@ -53,8 +53,12 @@ _MASKS = [
     re.compile(r"\b\d{1,2}/\d{4}\b"),
     re.compile(r"\b\d{1,2}:\d{2}(?::\d{2})?(?:\s?[ap]m\b)?", re.IGNORECASE),
     re.compile(r"\b\d{1,2}\s?[ap]m\b", re.IGNORECASE),
+    # Day ranges are dates: "Dec 22-28", "December 22 to 28, 2025", "22 to 28 December".
     re.compile(
-        rf"\b{_MONTH}\.? {_DAY}(?:\s?[-\u2013]\s?{_DAY})?(?:,? \d{{4}}(?!\d))?"
+        rf"\b{_MONTH}\.? {_DAY}(?:\s?[-\u2013]\s?{_DAY}|\s+to\s+{_DAY})?(?:,? \d{{4}}(?!\d))?"
+    ),
+    re.compile(
+        rf"(?<![\d.,])\b{_DAY}\s+(?:to|[-\u2013])\s+{_DAY}(?: of)? {_MONTH}\b"
     ),
     re.compile(rf"(?<![\d.,])\b\d{{1,2}}(?:st|nd|rd|th)?(?: of)? {_MONTH}\b"),
     re.compile(r"\b\d+(?:st|nd|rd|th)\b"),
@@ -71,8 +75,34 @@ _NUMBER = re.compile(
     r"(?<![\w.])(?<![A-Za-z]-)"
     r"(?P<sign>[-−–+])?(?P<dollar>\$)?"
     r"(?P<num>\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)"
+    # Scientific notation ("1e6", "2.5E-3") is one value: the exponent is a scale.
+    r"(?:[eE](?P<exp>[-+]?\d+)\b)?"
     r"(?:\s?(?:(?P<suf>%|(?i:percent|billion|million|bn|mn)\b)|(?P<suf1>[kKmMB]\b)))?"
 )
+
+_YEAR_RANGE_BEFORE = re.compile(r"\b(?:19|20|21)\d{2}\s*[-–—/]\s*$")
+# A bare 1900-2100 integer is a year unless it counts items: followed
+# (optionally after one adjective) by a plural count noun ("2000 new trips").
+# ...but a calendar preposition right before it makes it a year anyway ("In 2024 trips grew").
+_CALENDAR_PREP_BEFORE = re.compile(
+    r"\b(?:in|since|during|until|through|from|of|before|after|for)\s+$", re.IGNORECASE
+)
+_COUNT_NOUN_AFTER = re.compile(
+    r"\s+(?:[A-Za-z-]+\s+)?(?:events|trips|rides|rows|records|people|passengers|vehicles"
+    r"|orders|items|cases|users|customers|visits|transactions)\b",
+    re.IGNORECASE,
+)
+
+
+# Question numbers exempt in the answer: ranks and counts of items only
+# ("top 5", "3 busiest", "first 10", "4 zones"); asserted values stay checked.
+_RANK_COUNT = [
+    re.compile(r"\btop\s+(\d+)\b", re.IGNORECASE),
+    re.compile(r"\b(?:first|last)\s+(\d+)\b", re.IGNORECASE),
+    re.compile(r"\b(\d+)\s+(?:busiest|largest|highest|lowest|most|least)\b", re.IGNORECASE),
+    # One modifier may sit between ("five dropoff zones").
+    re.compile(r"\b(\d+)\s+(?:[A-Za-z-]+\s+)?(?:zones?|hours?|days?|months?|charts?)\b", re.IGNORECASE),
+]
 
 
 @dataclass(frozen=True)
@@ -82,6 +112,8 @@ class StatedNumber:
     scale: float
     percent: bool
     raw: str
+    # Character offsets of ``raw`` in the source text ((-1, -1) when unknown).
+    span: tuple[int, int] = field(default=(-1, -1), compare=False)
 
 
 def _mask(text: str) -> str:
@@ -92,43 +124,59 @@ def _mask(text: str) -> str:
 
 def _extract(text: str) -> list[StatedNumber]:
     out: list[StatedNumber] = []
-    for m in _NUMBER.finditer(_mask(text)):
+    masked = _mask(text)
+    for m in _NUMBER.finditer(masked):
         digits = m.group("num")
         suffix = m.group("suf") or m.group("suf1")
+        exponent = m.group("exp")
+        sign = m.group("sign")
         if (
             suffix is None
-            and m.group("sign") is None
+            and exponent is None
             and m.group("dollar") is None
             and re.fullmatch(r"\d{4}", digits)
             and 1900 <= int(digits) <= 2100
+            and (sign is None or _YEAR_RANGE_BEFORE.search(masked[: m.start("num")]))
+            and (
+                _CALENDAR_PREP_BEFORE.search(masked, 0, m.start())
+                or not _COUNT_NOUN_AFTER.match(masked, m.end("num"))
+            )
         ):
             continue
         value = float(digits.replace(",", ""))
-        if m.group("sign") in ("-", "−", "–"):
+        if sign in ("-", "−", "–"):
             value = -value
         decimals = len(digits.split(".")[1]) if "." in digits else 0
         percent = suffix is not None and suffix.lower() in ("%", "percent")
+        scale = _SCALES.get(suffix.lower(), 1) if suffix else 1
+        if exponent is not None:
+            scale *= 10.0 ** int(exponent)
         out.append(
             StatedNumber(
                 value=value,
                 decimals=decimals,
-                scale=_SCALES.get(suffix.lower(), 1) if suffix else 1,
+                scale=scale,
                 percent=percent,
                 raw=m.group(0).strip(),
+                span=(m.start(), m.start() + len(m.group(0).rstrip())),
             )
         )
     return out
 
 
 def extract_numbers(text: str, *, exclude: str = "") -> list[StatedNumber]:
-    """Numbers stated in ``text``, minus calendar tokens and those in ``exclude``."""
+    """Numbers stated in ``text``, minus calendar tokens and the rank/count
+    numbers of ``exclude`` (the question): "top five zones" in the question
+    exempts "top 5" in the answer, but "Was revenue $100?" exempts nothing."""
     numbers = _extract(text)
     if not exclude:
         return numbers
-    # "top five zones" in the question exempts "top 5" in the answer.
     exclude = _NUMBER_WORD.sub(lambda m: _NUMBER_WORDS[m.group(0).lower()], exclude)
-    skip = {_key(n) for n in _extract(exclude)}
-    return [n for n in numbers if _key(n) not in skip]
+    skip = {float(m.group(1)) for pattern in _RANK_COUNT for m in pattern.finditer(exclude)}
+    return [
+        n for n in numbers
+        if not (n.scale == 1 and not n.percent and n.value > 0 and _key(n) in skip)
+    ]
 
 
 def _key(n: StatedNumber) -> float:

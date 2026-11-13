@@ -248,3 +248,23 @@ def test_query_metrics_time_range_wrong_length_is_rejected():
 
     with pytest.raises(ValidationError):
         invoke(query_metrics, {**MONTH, "time_range": ["2024-01-01"]})
+
+
+def test_tool_content_capped_with_artifact_kept():
+    handle = _handle()
+    title = "T" * 5000
+    args = {
+        "kind": "line",
+        "title": title,
+        "handle": handle,
+        "x": "period",
+        "y": "total_amount",
+    }
+    msg = invoke(make_chart, args)
+    assert msg.status == "success"
+    assert len(msg.content) <= 4096
+    assert msg.content.endswith("… (truncated)")
+    assert msg.artifact["chart"]["title"] == title
+    bad = invoke(make_chart, {**args, "y": "y" * 5000})
+    assert bad.status == "error"
+    assert len(bad.content) <= 4096 and bad.content.endswith("… (truncated)")

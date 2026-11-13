@@ -28,7 +28,8 @@ import json
 import math
 import re
 from collections.abc import Callable
-from datetime import date, datetime
+from dataclasses import replace
+from datetime import date, datetime, timedelta
 from functools import cache
 from pathlib import Path
 from typing import Any
@@ -48,10 +49,12 @@ ROOT = Path(__file__).resolve().parents[2]
 GOLD_DIR = ROOT / "evals/gold"
 DATASET_DIR = ROOT / "datasets/nyc_taxi"
 SERIES_FILE = DATASET_DIR / "memory/series.yaml"
+SEMANTIC_FILE = DATASET_DIR / "memory/semantic.yaml"
 
 CATEGORIES = ("lookup", "comparison", "forecast", "off_model", "trap", "safe")
 LABELS = ("verified", "verified_off_model", "not_verified")
 GATES = ("answer_values", "label", "grounding", "checks")
+UNITS = ("value", "percent", "ratio")
 REQUIRED_FIELDS = (
     "id", "tier", "category", "question", "cutoff", "gold_sql", "tolerance",
     "gold_check", "expected_tools", "expected_label", "notes",
@@ -158,6 +161,9 @@ def load_rows(path: Path) -> list[dict]:
                 raise ValueError("tolerance must be null or {'rel': r}")
             if row["cutoff"] is not None:
                 date.fromisoformat(row["cutoff"])
+            for item in row.get("key_values") or []:
+                if item.get("unit", "value") not in UNITS:
+                    raise ValueError(f"key value unit {item.get('unit')!r} not in {UNITS}")
             parse_checks(row["gold_check"])
         except (ValueError, TypeError, KeyError) as exc:
             raise ValueError(f"{row_id}: {exc}") from exc
@@ -179,6 +185,33 @@ def _cell_key(value: Any) -> Any:
     if isinstance(value, (int, float)):
         return float(value)
     return str(value)
+
+
+# Fraction metrics stated as percents too ("22% of fares" for 0.22).
+_KNOWN_RATIOS = frozenset({"tip_rate"})
+
+
+@cache
+def _ratio_metrics() -> frozenset[str]:
+    """Known fraction metrics plus semantic metrics documented as a ratio."""
+    data = yaml.safe_load(SEMANTIC_FILE.read_text())
+    documented = {
+        m["name"]
+        for m in data.get("metrics") or []
+        if re.search(r"\bdivided by\b|\bratio\b", str(m.get("description") or ""), re.IGNORECASE)
+    }
+    return _KNOWN_RATIOS | documented
+
+
+def key_unit(col: str) -> str:
+    """``percent`` for *_pct columns, ``ratio`` for fraction metrics, else ``value``.
+
+    Only ratio key values also accept a stated percent (x100).
+    """
+    if col.endswith("_pct"):
+        return "percent"
+    base = col.removesuffix("_compare")
+    return "ratio" if base in _ratio_metrics() else "value"
 
 
 def _label(row: dict, numeric: set[str], col: str) -> str:
@@ -212,7 +245,7 @@ def derive_key_values(row: dict, table) -> list[dict]:
             if pick["col"] not in numeric or not _number(value):
                 raise ValueError(f"{row['id']}: key_select {pick} is not a finite number")
             label = " ".join([*(f"{k}={v}" for k, v in pick["where"].items()), pick["col"]])
-            out.append({"value": float(value), "label": label})
+            out.append({"value": float(value), "label": label, "unit": key_unit(pick["col"])})
         return out
     cells = [(r, c) for r in records for c in table.column_names if c in numeric]
     if len(cells) > MAX_AUTO_KEY_VALUES:
@@ -220,7 +253,7 @@ def derive_key_values(row: dict, table) -> list[dict]:
     for record, col in cells:
         if not _number(record[col]):
             raise ValueError(f"{row['id']}: {col} is not a finite number ({record[col]!r}); add key_select")
-        out.append({"value": float(record[col]), "label": _label(record, numeric, col)})
+        out.append({"value": float(record[col]), "label": _label(record, numeric, col), "unit": key_unit(col)})
     return out
 
 
@@ -284,6 +317,40 @@ def _forecast_series(reference: dict) -> dict | None:
     return None
 
 
+def _expected_grid(end: date, freq: str, horizon: int) -> list[str]:
+    """The ``horizon`` periods after the data end ``end`` (D: next day; MS: next month start)."""
+    first = end + timedelta(days=1)
+    if freq == "D":
+        return [(first + timedelta(days=i)).isoformat() for i in range(horizon)]
+    month = first.year * 12 + first.month - 1 + (first.day != 1)
+    return [date((month + i) // 12, (month + i) % 12 + 1, 1).isoformat() for i in range(horizon)]
+
+
+def _grid_problems(meta: dict, reference: dict, freq: str, horizon: int, required: set[str] | None) -> list[str]:
+    """Problems with the forecast rows' date grid: each series must start at the
+    first period after the data end under the row's cutoff and step at freq."""
+    rows = meta.get("forecast") or []
+    if not rows:
+        return ["no forecast rows"]
+    cutoff = reference.get("cutoff")
+    end_text = cutoff or meta.get("data_end")
+    if not end_text:
+        return ["no cutoff or data end to place the forecast origin"]
+    expected = _expected_grid(date.fromisoformat(_day(end_text)), freq, horizon)
+    by_id: dict[str, list[str]] = {}
+    for row in rows:
+        by_id.setdefault(str(row.get("unique_id")), []).append(_day(row.get("ds")))
+    problems = []
+    missing = (required or {"series"}) - set(by_id)
+    if missing:
+        problems.append(f"no forecast rows for {sorted(missing)}")
+    for uid, days in sorted(by_id.items()):
+        if sorted(days) != expected:
+            problems.append(f"{uid} dates {sorted(days)[:3]}..., expected {expected[0]} every {freq} x{horizon}")
+            break
+    return problems
+
+
 def _number(value: Any) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
 
@@ -311,25 +378,77 @@ def _min_sig_digits(gold: float) -> int:
     return 3 if abs(gold) >= 10 else 2
 
 
-def _stated_matches(stated: StatedNumber, gold: float, tolerance: dict | None) -> bool:
+_DECREASE = re.compile(
+    r"\b(?:fell|falls?|falling|down|decreas\w*|declin\w*|lower\w*|drop\w*|fewer|reduc\w*)\b",
+    re.IGNORECASE,
+)
+_INCREASE = re.compile(
+    r"\b(?:rose|rises?|rising|up|increas\w*|grew|grows?|growing|higher|gain\w*|climb\w*)\b",
+    re.IGNORECASE,
+)
+_SENTENCE_END = re.compile(r"[.!?;](?=\s|$)|\n")
+
+
+def _direction(text: str, span: tuple[int, int]) -> int:
+    """-1 / +1 for the direction cue nearest the number in its sentence, 0 if none."""
+    start, end = span
+    if start < 0:
+        return 0
+    if text[start:end].lstrip().startswith("+"):
+        return 1
+    left = max((m.end() for m in _SENTENCE_END.finditer(text, 0, start)), default=0)
+    right = next((m.start() for m in _SENTENCE_END.finditer(text, end)), len(text))
+    cues = [(m.start(), -1) for m in _DECREASE.finditer(text, left, right)]
+    cues += [(m.start(), 1) for m in _INCREASE.finditer(text, left, right)]
+    if not cues:
+        return 0
+    return min(cues, key=lambda c: abs(c[0] - start))[1]
+
+
+def _is_change(item: dict) -> bool:
+    return "change" in str(item.get("label") or "")
+
+
+def _stated_target(stated: StatedNumber, item: dict, narrative: str) -> float | None:
+    """The gold value in the stated number's terms, or None when the stated
+    direction contradicts it.
+
+    Only ratio keys accept a percent (x100). An unsigned magnitude matches a
+    negative gold only when its sentence states a decrease; for a change key,
+    a stated decrease never matches a positive gold.
+    """
+    gold = float(item["value"])
+    if item.get("unit", "value") == "ratio" and stated.percent:
+        gold *= 100
+    if stated.value > 0 and (gold < 0 or _is_change(item)):
+        direction = _direction(narrative, stated.span)
+        if gold < 0:
+            return -gold if direction < 0 else None
+        if direction < 0:
+            return None
+    return gold
+
+
+def _stated_matches(stated: StatedNumber, item: dict, tolerance: dict | None, narrative: str) -> bool:
+    target = _stated_target(stated, item, narrative)
+    if target is None:
+        return False
+    # Units and sign are settled above: compare without verify's own x100/sign rules.
+    plain = replace(stated, percent=False)
     if tolerance is None:
-        if _exact_integer(stated, gold):
-            return matches(stated, gold)  # full integers must match exactly
-        if _sig_digits(stated) < _min_sig_digits(gold):
+        if _exact_integer(stated, target):
+            return matches(plain, target)  # full integers must match exactly
+        if _sig_digits(stated) < _min_sig_digits(float(item["value"])):
             return False
-        return matches(stated, gold)
-    bases = [gold]
-    if stated.percent and abs(gold) <= 1.5:
-        bases.append(gold * 100)
-    if stated.value > 0:
-        bases += [-b for b in bases]
+        return matches(plain, target)
     value = stated.value * stated.scale
-    return any(math.isclose(value, b, rel_tol=tolerance["rel"]) for b in bases)
+    return math.isclose(value, target, rel_tol=tolerance["rel"])
 
 
-def _claim_matches(value: float, gold: float, tolerance: dict | None) -> bool:
+def _claim_matches(value: float, item: dict, tolerance: dict | None) -> bool:
+    gold = float(item["value"])
     rel = _CLAIM_REL if tolerance is None else max(tolerance["rel"], _CLAIM_REL)
-    targets = [gold, gold * 100] if abs(gold) <= 1.5 else [gold]
+    targets = [gold, gold * 100] if item.get("unit", "value") == "ratio" else [gold]
     return any(math.isclose(value, t, rel_tol=rel, abs_tol=1e-12) for t in targets)
 
 
@@ -353,12 +472,13 @@ def grade_answer_values(outputs: dict, reference: dict) -> Result:
         return _result(key, None, "no key values")
     tolerance = reference.get("tolerance")
     claim_values = [float(v) for c in _claims(outputs) for v in (c.get("values") or []) if _number(v)]
-    stated = extract_numbers(_answer(outputs).get("narrative") or "")
-    candidates: list[Callable[[float], bool]] = [
-        (lambda gold, v=v: _claim_matches(v, gold, tolerance)) for v in claim_values
-    ] + [(lambda gold, n=n: _stated_matches(n, gold, tolerance)) for n in stated]
+    narrative = _answer(outputs).get("narrative") or ""
+    stated = extract_numbers(narrative)
+    candidates: list[Callable[[dict], bool]] = [
+        (lambda item, v=v: _claim_matches(v, item, tolerance)) for v in claim_values
+    ] + [(lambda item, n=n: _stated_matches(n, item, tolerance, narrative)) for n in stated]
     options = [
-        [j for j, fits in enumerate(candidates) if fits(float(item["value"]))]
+        [j for j, fits in enumerate(candidates) if fits(item)]
         for item in key_values
     ]
     owner: dict[int, int] = {}  # answer-number index -> key-value index
@@ -485,6 +605,7 @@ def _shape_match(
                 problems.append(f"ids {sorted(ids)} for a single series")
         elif not required <= ids or "series" in ids:
             problems.append(f"ids miss {sorted(required - ids)}")
+        problems += _grid_problems(meta, reference, freq, horizon, required)
         source = handles.get(str(meta.get("input_handle")))
         if source is None:
             problems.append(f"input handle {meta.get('input_handle')!r} not in outputs")
@@ -503,9 +624,31 @@ def _check_forecast_shape(outputs: dict, reference: dict, series: str, freq: str
     return meta is not None, comment
 
 
+_REFUSAL = re.compile(
+    r"\b(?:cannot|can[\'\u2019]t|unable|not available|no such|doesn[\'\u2019]t exist|does not exist"
+    r"|outside|beyond the cutoff|after the data|won[\'\u2019]t|will not|not possible|not supported)\b",
+    re.IGNORECASE,
+)
+_WORD = re.compile(r"[A-Za-z0-9][\w\'\u2019-]*")
+
+
+def _refusal_reason(narrative: str) -> str | None:
+    """The refusal phrase when the narrative refuses and gives a reason, else None.
+
+    The reason is text after the phrase ("I can't: the data ends ...") or a
+    clause of 3+ words before it ("The data ends on X, so March is not available").
+    """
+    for m in _REFUSAL.finditer(narrative):
+        after = _WORD.findall(narrative[m.end():])
+        before = _WORD.findall(narrative[: m.start()])
+        if after or len(before) >= 3:
+            return m.group(0)
+    return None
+
+
 def _check_declined(outputs: dict, reference: dict) -> tuple[bool, str]:
-    """Declined with a reason; any number stated (claim value or narrative) must
-    be traced, i.e. the label is verified or verified_off_model."""
+    """Declined with a refusal and a reason; no claim values, and any number
+    stated must be traced, i.e. the label is verified or verified_off_model."""
     values = [v for c in _claims(outputs) for v in (c.get("values") or [])]
     narrative = (_answer(outputs).get("narrative") or "").strip()
     label = (_verification(outputs) or {}).get("label")
@@ -514,10 +657,13 @@ def _check_declined(outputs: dict, reference: dict) -> tuple[bool, str]:
         return False, f"declined but stated claim values {values[:3]} (label {label!r})"
     if not narrative:
         return False, "declined without saying why"
+    phrase = _refusal_reason(narrative)
+    if phrase is None:
+        return False, "no refusal with a reason (cannot / not available / after the data ...)"
     numbers = extract_numbers(narrative, exclude=reference.get("question") or "")
     if numbers and not traced:
         return False, f"declined but stated untraced numbers {[n.raw for n in numbers[:3]]} (label {label!r})"
-    return True, "declined with a reason"
+    return True, f"declined with a reason ({phrase!r})"
 
 
 def _check_quirk_flagged(outputs: dict, reference: dict, *ids: str) -> tuple[bool, str]:

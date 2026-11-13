@@ -17,6 +17,16 @@ logger = logging.getLogger(__name__)
 
 Result = tuple[str, dict[str, Any] | None]
 
+MAX_CONTENT_CHARS = 4096
+_TRUNCATED = "… (truncated)"
+
+
+def cap(text: str) -> str:
+    """Bound tool content at ``MAX_CONTENT_CHARS``, marking a cut."""
+    if len(text) <= MAX_CONTENT_CHARS:
+        return text
+    return text[: MAX_CONTENT_CHARS - len(_TRUNCATED)] + _TRUNCATED
+
 
 def service_for(runtime: ToolRuntime[AnalystContext]) -> DataService:
     ctx = runtime.context
@@ -41,20 +51,26 @@ def run_tool(
 ) -> Result:
     """Run a tool body; turn failures into ``status="error"`` tool messages.
 
+    Content (and error text) is capped at 4,096 chars; the artifact is untouched.
+
     Errors are raised as ``ToolException`` and the tools set
     ``handle_tool_error=True``, so langchain emits a ToolMessage with
     ``status="error"`` carrying the text.
     """
     progress(runtime, name, f"{name} started")
     try:
-        return body()
+        content, artifact = body()
     except AnalystError as exc:
-        raise ToolException(f"ERROR: {exc.message}\nHINT: {exc.hint}") from exc
-    except ToolException:
-        raise
+        raise ToolException(cap(f"ERROR: {exc.message}\nHINT: {exc.hint}")) from exc
+    except ToolException as exc:
+        if len(str(exc)) <= MAX_CONTENT_CHARS:
+            raise
+        raise ToolException(cap(str(exc))) from exc
     except Exception as exc:
         logger.exception("internal error in %s", name)
         raise ToolException(f"ERROR: internal error in {name}") from exc
+    # Every tool's content stays a bounded summary; the artifact is kept whole.
+    return cap(content), artifact
 
 
 def data_tool(name: str, **kwargs: Any) -> Callable[[Callable[..., Result]], BaseTool]:

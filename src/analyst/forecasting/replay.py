@@ -203,7 +203,10 @@ def replay(
             for row in id_rows:
                 row["relative_mae"] = _ratio(row["mae"], baseline, perfect=1.0)
             rows.extend(id_rows)
+    # Suppressed above to keep output readable; reported here as one adjustment.
+    adjustments = [f"AutoARIMA: {arima_warnings} convergence warnings"] if arima_warnings else []
     return ReplayReport(pd.DataFrame(rows, columns=[
         "cutoff", "unique_id", "model", *SCORE_COLUMNS, "train_end", "horizon",
         "scored_points", "forecast_mean", "actual_mean",
-    ]), horizons=horizons, dropped_ids=dropped_ids, failed_fits=failed_fits)
+    ]), horizons=horizons, dropped_ids=dropped_ids, failed_fits=failed_fits,
+        adjustments=adjustments)

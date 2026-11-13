@@ -256,3 +256,36 @@ def test_experiment_prefix_names_the_resolved_model(monkeypatch):
         assert script.experiment_prefix("anthropic:claude-x", "abc1234") == "anthropic-claude-x-abc1234"
     finally:
         get_settings.cache_clear()
+
+
+def test_limit_must_be_positive():
+    script = _eval_script()
+    for bad in ("0", "-1"):
+        with pytest.raises(SystemExit):
+            script.parse_args(["--limit", bad])
+    assert script.parse_args(["--limit", "2"]).limit == 2
+    assert script.parse_args([]).limit is None
+
+
+def test_dry_run_repeats_reps_times(monkeypatch, capsys):
+    script = _eval_script()
+    calls = []
+
+    async def fake_run_local(rows, *, model):
+        calls.append([r["id"] for r in rows])
+        return [
+            {"id": r["id"], "category": r["category"], "outputs": {}, "results": [], "passed": True}
+            for r in rows
+        ]
+
+    monkeypatch.setattr(script, "run_local", fake_run_local)
+    rows = [{"id": "a001", "category": "lookup"}, {"id": "a002", "category": "lookup"}]
+    script.run_dry(rows, None, reps=3)
+    assert calls == [["a001", "a002"]] * 3
+    out = capsys.readouterr().out
+    assert "over 6 runs" in out
+    assert "rep 3/3" in out
+    monkeypatch.setattr(script, "load_rows", lambda path: rows)
+    calls.clear()
+    script.main(["--dry-run", "--reps", "2"])
+    assert len(calls) == 2

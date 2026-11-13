@@ -57,11 +57,18 @@ def experiment_prefix(model: str | None, sha: str) -> str:
     return f"{slug(resolved_model(model))}-{sha}"
 
 
+def positive_int(text: str) -> int:
+    value = int(text)
+    if value < 1:
+        raise argparse.ArgumentTypeError(f"must be >= 1, got {value}")
+    return value
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--model", default=None, help="model spec (default: provider default)")
-    p.add_argument("--reps", type=int, default=1)
-    p.add_argument("--limit", type=int, default=None)
+    p.add_argument("--reps", type=positive_int, default=1, help="repetitions (dry runs too)")
+    p.add_argument("--limit", type=positive_int, default=None, help="first N rows (>= 1)")
     p.add_argument("--ids", nargs="*", default=None, help="only these row ids")
     p.add_argument("--dry-run", action="store_true", help="run locally, no LangSmith")
     return p.parse_args(argv)
@@ -73,15 +80,20 @@ def select(rows: list[dict], ids: list[str] | None, limit: int | None) -> list[d
         if unknown:
             raise SystemExit(f"unknown ids: {sorted(unknown)}")
         rows = [r for r in rows if r["id"] in set(ids)]
-    return rows[:limit] if limit else rows
+    return rows if limit is None else rows[:limit]
 
 
-def run_dry(rows: list[dict], model: str | None) -> None:
-    results = asyncio.run(run_local(rows, model=model))
-    for r in results:
-        failed = [x["key"] for x in r["results"] if x["score"] is False]
-        error = r["outputs"].get("error")
-        print(f"{r['id']} {r['category']:<10} {'PASS' if r['passed'] else 'FAIL'} {error or ','.join(failed)}")
+def run_dry(rows: list[dict], model: str | None, reps: int = 1) -> None:
+    """Run and grade locally ``reps`` times; the summary covers every repetition."""
+    results: list[dict] = []
+    for rep in range(1, reps + 1):
+        batch = asyncio.run(run_local(rows, model=model))
+        for r in batch:
+            failed = [x["key"] for x in r["results"] if x["score"] is False]
+            error = r["outputs"].get("error")
+            tag = f" rep {rep}/{reps}" if reps > 1 else ""
+            print(f"{r['id']}{tag} {r['category']:<10} {'PASS' if r['passed'] else 'FAIL'} {error or ','.join(failed)}")
+        results.extend(batch)
     print("\n" + format_summary(summarize(results)))
 
 
@@ -138,7 +150,7 @@ def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     rows = select(load_rows(DATASET_FILE), args.ids, args.limit)
     if args.dry_run:
-        run_dry(rows, args.model)
+        run_dry(rows, args.model, reps=args.reps)
     else:
         asyncio.run(run_experiment(rows, args))
 

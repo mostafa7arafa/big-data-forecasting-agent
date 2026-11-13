@@ -84,6 +84,17 @@ def forecast_meta(**overrides) -> dict:
         "input_handle": "r_input",
     }
     meta.update(overrides)
+    if "forecast" not in overrides:
+        # Rows on the expected grid: the first period after the cutoff, every freq.
+        import pandas as pd
+
+        start = "2025-08-01"
+        dates = pd.date_range(start, periods=meta["horizon"], freq=meta["freq"])
+        meta["forecast"] = [
+            {"unique_id": uid, "ds": d.isoformat(), "yhat": 1.0, "lo_80": 0.0,
+             "hi_80": 2.0, "lo_95": 0.0, "hi_95": 3.0}
+            for uid in meta["headline_ids"] for d in dates
+        ]
     return meta
 
 
@@ -146,7 +157,7 @@ def test_answer_values_small_numbers_round_at_stated_precision():
 
 
 def test_answer_values_percent_of_fraction():
-    ref = {"key_values": [{"value": 0.0299, "label": "share"}], "tolerance": None}
+    ref = {"key_values": [{"value": 0.0299, "label": "share", "unit": "ratio"}], "tolerance": None}
     assert grade_answer_values(outputs_with(narrative="3.0% of trips"), ref)["score"] is True
 
 
@@ -400,11 +411,13 @@ def test_derive_key_values():
     table = pa.table({"pickup_borough": ["Manhattan", "Queens"], "trips": [10, 20]})
     row = {"id": "x", "category": "lookup"}
     assert derive_key_values(row, table) == [
-        {"value": 10.0, "label": "Manhattan trips"},
-        {"value": 20.0, "label": "Queens trips"},
+        {"value": 10.0, "label": "Manhattan trips", "unit": "value"},
+        {"value": 20.0, "label": "Queens trips", "unit": "value"},
     ]
     picked = {**row, "key_select": [{"where": {"pickup_borough": "Queens"}, "col": "trips"}]}
-    assert derive_key_values(picked, table) == [{"value": 20.0, "label": "pickup_borough=Queens trips"}]
+    assert derive_key_values(picked, table) == [
+        {"value": 20.0, "label": "pickup_borough=Queens trips", "unit": "value"}
+    ]
     assert derive_key_values({**row, "key_select": []}, table) == []
     assert derive_key_values({**row, "category": "forecast"}, table) == []
     big = pa.table({"trips": list(range(25))})
@@ -463,7 +476,7 @@ def test_declined_rejects_untraced_narrative_numbers():
 
 def test_declined_allows_traced_helpful_numbers():
     out = outputs_with(
-        narrative="Data ends on 2026-01-31, so March 2026 is unavailable; January 2026 had 2,912,345 trips.",
+        narrative="Data ends on 2026-01-31, so March 2026 is not available; January 2026 had 2,912,345 trips.",
         label="verified",
     )
     assert grade_checks(out, A048)["score"] is True
@@ -505,17 +518,19 @@ def test_quirk_flagged_not_by_claim_text_alone():
 
 def test_forecast_skill_scores_the_shape_matching_handle():
     def rows(yhat):
-        return [{"unique_id": "Manhattan", "ds": "2025-08-01", "yhat": yhat,
-                 "lo_80": 0.0, "hi_80": 2000.0, "lo_95": 0.0, "hi_95": 2000.0}]
+        # Every required series; Queens and Brooklyn are exact.
+        return [{"unique_id": uid, "ds": "2025-08-01", "yhat": y,
+                 "lo_80": 0.0, "hi_80": 2000.0, "lo_95": 0.0, "hi_95": 2000.0}
+                for uid, y in (("Manhattan", yhat), ("Queens", 200.0), ("Brooklyn", 50.0))]
 
-    right = forecast_meta(forecast=rows(900.0))  # error 100 / 1000
+    right = forecast_meta(forecast=rows(900.0))  # error 100 / 1250
     wrong = forecast_meta(freq="D", forecast=rows(500.0))  # later, wrong freq
     out = outputs_with(handles=with_input({"r_1": right, "r_2": wrong}))
     result = grade_forecast_skill(out, forecast_ref())
-    assert result["score"] == pytest.approx(0.1)
+    assert result["score"] == pytest.approx(100 / 1250)
     assert "forecast_shape handle" in result["comment"]
     fallback = outputs_with(handles=with_input({"r_2": wrong}))
-    assert grade_forecast_skill(fallback, forecast_ref())["score"] == pytest.approx(0.5)
+    assert grade_forecast_skill(fallback, forecast_ref())["score"] == pytest.approx(500 / 1250)
 
 
 # --- final fix wave ------------------------------------------------------------
@@ -523,7 +538,7 @@ def test_forecast_skill_scores_the_shape_matching_handle():
 
 def test_declined_allows_claim_values_when_verified():
     out = outputs_with(
-        narrative="Data ends on 2026-01-31, so March 2026 is unavailable; January 2026 had 2,912,345 trips.",
+        narrative="Data ends on 2026-01-31, so March 2026 is not available; January 2026 had 2,912,345 trips.",
         claims=[claim("January 2026 had 2,912,345 trips", values=[2_912_345])],
         label="verified",
     )
@@ -606,3 +621,221 @@ def test_a044_accepts_the_gap_quirk_id_for_a_cause():
             claims=[claim("The drop coincides with the known data gap.", type_="causal", fact_ids=[fid])],
         )
         assert grade_checks(out, a044)["score"] is True, fid
+
+
+# --- CodeRabbit PR #3 ------------------------------------------------------------
+
+
+def _change_ref(gold: float, tolerance=None, unit: str = "percent", label: str = "trips_change_pct") -> dict:
+    return {"key_values": [{"value": gold, "label": label, "unit": unit}], "tolerance": tolerance}
+
+
+@pytest.mark.parametrize("tolerance", [None, {"rel": 1e-06}])
+def test_answer_values_negative_change_needs_stated_decrease(tolerance):
+    ref = _change_ref(-5.23, tolerance)  # a007
+    assert grade_answer_values(outputs_with(narrative="Trips increased by 5.23%."), ref)["score"] is False
+    assert grade_answer_values(outputs_with(narrative="Trips rose 5.23% year over year."), ref)["score"] is False
+    assert grade_answer_values(outputs_with(narrative="Trips changed 5.23%."), ref)["score"] is False
+    assert grade_answer_values(outputs_with(narrative="Trips fell 5.23%."), ref)["score"] is True
+    assert grade_answer_values(outputs_with(narrative="Trips were 5.23% lower."), ref)["score"] is True
+    assert grade_answer_values(outputs_with(narrative="A 5.23% drop in trips."), ref)["score"] is True
+    assert grade_answer_values(outputs_with(narrative="Trips changed -5.23%."), ref)["score"] is True
+
+
+@pytest.mark.parametrize("tolerance", [None, {"rel": 1e-06}])
+def test_answer_values_positive_change_rejects_stated_decrease(tolerance):
+    ref = _change_ref(16.25, tolerance)  # a022
+    assert grade_answer_values(outputs_with(narrative="Trips fell 16.25%."), ref)["score"] is False
+    assert grade_answer_values(outputs_with(narrative="Trips declined by 16.25%."), ref)["score"] is False
+    assert grade_answer_values(outputs_with(narrative="Trips rose 16.25%."), ref)["score"] is True
+    assert grade_answer_values(outputs_with(narrative="Trips changed by 16.25%."), ref)["score"] is True
+    assert grade_answer_values(outputs_with(narrative="Trips changed by +16.25%."), ref)["score"] is True
+
+
+def test_answer_values_direction_is_the_nearest_cue_in_the_sentence():
+    ref = {
+        "key_values": [
+            {"value": 3391937.0, "label": "trips", "unit": "value"},
+            {"value": 3578943.0, "label": "trips_compare", "unit": "value"},
+            {"value": -5.23, "label": "trips_change_pct", "unit": "percent"},
+        ],
+        "tolerance": {"rel": 1e-06},
+    }
+    good = "Trips fell 5.23% to 3,391,937, down from 3,578,943. Revenue rose."
+    assert grade_answer_values(outputs_with(narrative=good), ref)["score"] is True
+    bad = "Trips fell in Queens. Overall they rose 5.23% to 3,391,937 from 3,578,943."
+    assert grade_answer_values(outputs_with(narrative=bad), ref)["score"] is False
+
+
+@pytest.mark.parametrize("tolerance", [None, {"rel": 1e-06}])
+def test_answer_values_percent_unit_never_scaled_by_100(tolerance):
+    ref = _change_ref(1.06, tolerance, label="avg_fare_change_pct")  # a024
+    assert grade_answer_values(outputs_with(narrative="Average fare rose 106%."), ref)["score"] is False
+    assert grade_answer_values(outputs_with(claims=[claim(values=[106.0])]), ref)["score"] is False
+    assert grade_answer_values(outputs_with(narrative="Average fare rose 1.06%."), ref)["score"] is True
+    assert grade_answer_values(outputs_with(claims=[claim(values=[1.06])]), ref)["score"] is True
+
+
+@pytest.mark.parametrize("tolerance", [None, {"rel": 1e-03}])
+def test_answer_values_ratio_unit_accepts_percent(tolerance):
+    ref = _change_ref(0.2206376, tolerance, unit="ratio", label="Credit card tip_rate")  # a009
+    assert grade_answer_values(outputs_with(narrative="Card tips were 22.06% of fares."), ref)["score"] is True
+    assert grade_answer_values(outputs_with(narrative="Card tip rate 0.2206."), ref)["score"] is True
+    assert grade_answer_values(outputs_with(claims=[claim(values=[22.06376])]), ref)["score"] is True
+    value = _change_ref(0.2206376, tolerance, unit="value", label="x")
+    assert grade_answer_values(outputs_with(narrative="Card tips were 22.06% of fares."), value)["score"] is False
+    assert grade_answer_values(outputs_with(claims=[claim(values=[22.06376])]), value)["score"] is False
+
+
+def test_derive_key_values_units():
+    import pyarrow as pa
+
+    from evals.graders.agent import derive_key_values
+
+    table = pa.table({
+        "trips": [10], "trips_compare": [12], "trips_change_pct": [-16.67],
+        "tip_rate": [0.13], "tip_rate_compare": [0.16], "airport_share_pct": [7.99],
+        "share_2023_pct": [87.9], "change_pp": [-1.37], "avg_fare": [19.8],
+    })
+    units = {kv["label"]: kv["unit"] for kv in derive_key_values({"id": "x", "category": "lookup"}, table)}
+    assert units == {
+        "trips": "value", "trips_compare": "value", "trips_change_pct": "percent",
+        "tip_rate": "ratio", "tip_rate_compare": "ratio", "airport_share_pct": "percent",
+        "share_2023_pct": "percent", "change_pp": "value", "avg_fare": "value",
+    }
+
+
+def test_eval_set_key_values_carry_units():
+    units = {
+        kv["label"]: kv["unit"] for row in load_rows(EVAL_SET) for kv in row["key_values"]
+    }
+    assert units["Credit card tip_rate"] == "ratio"
+    assert units["tip_rate_compare"] == "ratio"
+    assert units["avg_fare_change_pct"] == "percent"
+    assert units["trips"] == "value"
+    assert set(units.values()) <= {"value", "percent", "ratio"}
+
+
+def test_load_rows_rejects_unknown_unit(tmp_path: Path):
+    row = {
+        "id": "a998", "tier": 1, "category": "lookup", "question": "q", "cutoff": None,
+        "gold_sql": "SELECT 1", "key_values": [{"value": 1.0, "label": "x", "unit": "pct"}],
+        "tolerance": None, "gold_check": [], "expected_tools": [], "expected_label": None, "notes": "",
+    }
+    path = tmp_path / "rows.jsonl"
+    path.write_text(json.dumps(row) + "\n")
+    with pytest.raises(ValueError, match="a998"):
+        load_rows(path)
+
+
+@pytest.mark.parametrize(
+    "narrative",
+    [
+        "Hello.",
+        "Sure, here you go.",
+        "I cannot.",
+    ],
+)
+def test_declined_requires_refusal_with_reason(narrative):
+    assert grade_checks(outputs_with(narrative=narrative, label="not_verified"), A048)["score"] is False
+
+
+@pytest.mark.parametrize(
+    "narrative",
+    [
+        "I can't answer that: the data ends on 2026-01-31.",
+        "March 2026 is after the data ends on 2026-01-31.",
+        "That month is beyond the cutoff of 2026-01-31, so I won't estimate it.",
+        "There is no such column in the dataset.",
+        "I'm unable to report March 2026 because the data stops in January.",
+    ],
+)
+def test_declined_accepts_refusal_with_reason(narrative):
+    assert grade_checks(outputs_with(narrative=narrative, label="not_verified"), A048)["score"] is True
+
+
+def test_declined_rejects_claim_values_without_trace():
+    out = outputs_with(
+        narrative="March 2026 is not available because data ends in January.",
+        claims=[claim(values=[1.0])],
+        label="not_verified",
+    )
+    assert grade_checks(out, A048)["score"] is False
+
+
+def _grid(ids, start: str, freq: str, horizon: int) -> list[dict]:
+    import pandas as pd
+
+    dates = pd.date_range(start, periods=horizon, freq=freq)
+    return [
+        {"unique_id": uid, "ds": d.isoformat(), "yhat": 1.0, "lo_80": 0.0, "hi_80": 2.0,
+         "lo_95": 0.0, "hi_95": 3.0}
+        for uid in ids for d in dates
+    ]
+
+
+@pytest.mark.parametrize(
+    "rows",
+    [
+        _grid(["Brooklyn", "Manhattan", "Queens"], "2025-09-01", "MS", 1),  # one period late
+        _grid(["Brooklyn", "Manhattan", "Queens"], "2026-11-01", "MS", 1),  # "today"
+        _grid(["Brooklyn", "Manhattan", "Queens"], "2025-07-01", "MS", 1),  # origin, not after
+        _grid(["Brooklyn", "Manhattan"], "2025-08-01", "MS", 1),  # Queens has no rows
+        [],
+    ],
+)
+def test_forecast_shape_checks_the_date_grid(rows):
+    out = outputs_with(handles=with_input({"r_1": forecast_meta(forecast=rows)}))
+    result = grade_checks(out, forecast_ref())
+    assert result["score"] is False, result["comment"]
+
+
+def test_forecast_shape_daily_grid_steps_by_day():
+    ref = forecast_ref(
+        gold_check=["forecast_shape('daily_trips', 'D', 7)"],
+        gold=[{"period": "2025-08-01", "trips": 1.0}],
+    )
+
+    def meta(rows):
+        return forecast_meta(freq="D", horizon=7, headline_ids=["series"], forecast=rows)
+
+    good = _grid(["series"], "2025-08-01", "D", 7)
+    assert grade_checks(outputs_with(handles=with_input({"r_1": meta(good)})), ref)["score"] is True
+    gappy = _grid(["series"], "2025-08-01", "2D", 7)
+    assert grade_checks(outputs_with(handles=with_input({"r_1": meta(gappy)})), ref)["score"] is False
+    late = _grid(["series"], "2025-08-02", "D", 7)
+    assert grade_checks(outputs_with(handles=with_input({"r_1": meta(late)})), ref)["score"] is False
+    short = _grid(["series"], "2025-08-01", "D", 6)
+    assert grade_checks(outputs_with(handles=with_input({"r_1": meta(short)})), ref)["score"] is False
+
+
+def test_expected_grid_matches_a_real_service_forecast(synthetic_dataset, tmp_path):
+    from datetime import date
+
+    from analyst.data.service import DataService
+    from analyst.semantic.compiler import MetricQuery
+    from evals.graders.agent import _expected_grid
+
+    svc = DataService(synthetic_dataset, cutoff=date(2024, 2, 15), store_root=tmp_path)
+    handle = svc.query_metrics(MetricQuery(metrics=["event_count"], grain="day")).handle_id
+    card = svc.forecast(handle, value_col="event_count", freq="D", horizon=3)
+    days = sorted(str(d)[:10] for d in svc.store.load(card.handle_id).column("ds").to_pylist())
+    assert days == _expected_grid(date(2024, 2, 15), "D", 3) == ["2024-02-16", "2024-02-17", "2024-02-18"]
+    assert _expected_grid(date(2025, 7, 31), "MS", 2) == ["2025-08-01", "2025-09-01"]
+    assert _expected_grid(date(2025, 12, 31), "MS", 2) == ["2026-01-01", "2026-02-01"]
+
+
+def test_ratio_stated_as_percent_keeps_the_gold_precision_rule():
+    ref = _change_ref(0.130072, None, unit="ratio", label="tip_rate")  # a026
+    assert grade_answer_values(outputs_with(narrative="Tips were 13% of fares."), ref)["score"] is True
+    assert grade_answer_values(outputs_with(narrative="Tips were 0.13 of fares."), ref)["score"] is True
+    assert grade_answer_values(outputs_with(narrative="Tips were 10% of fares."), ref)["score"] is False
+
+
+@pytest.mark.parametrize(
+    "narrative",
+    ["There were 5.23% fewer trips.", "A 5.23% reduction in trips.", "Trips were reduced by 5.23%."],
+)
+def test_answer_values_fewer_and_reduction_are_decreases(narrative):  # follow-up item 17
+    assert grade_answer_values(outputs_with(narrative=narrative), _change_ref(-5.23))["score"] is True
+    assert grade_answer_values(outputs_with(narrative=narrative), _change_ref(5.23))["score"] is False

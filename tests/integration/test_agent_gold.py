@@ -39,6 +39,7 @@ def test_frozen_gold_matches_fresh_run(engine, row):
     assert [k["label"] for k in derived] == [k["label"] for k in stored]
     for got, want in zip(derived, stored, strict=True):
         assert got["value"] == pytest.approx(want["value"], rel=1e-9)
+        assert got["unit"] == want["unit"]
 
 
 def test_every_gold_check_parses():
@@ -50,3 +51,34 @@ def test_no_gold_parquet_without_gold_sql():
     for row in ROWS:
         if row["gold_sql"] is None:
             assert not (ROOT / "evals/gold" / f"{row['id']}.parquet").exists(), row["id"]
+
+
+@pytest.mark.parametrize(
+    "row_id, dimensions, grain, freq, id_col",
+    [
+        ("a035", ["pickup_borough"], "month", "MS", "pickup_borough"),
+        ("a036", [], "day", "D", None),
+    ],
+)
+def test_real_forecast_passes_forecast_shape(tmp_path, row_id, dimensions, grain, freq, id_col):
+    """A real service forecast at the row's cutoff meets forecast_shape, date grid included."""
+    from datetime import date
+
+    from langchain_core.messages import ToolMessage
+
+    from analyst.data.service import DataService
+    from analyst.semantic.compiler import MetricQuery
+    from evals.graders.agent import grade_checks
+    from evals.target import _handle_entries
+
+    row = next(r for r in ROWS if r["id"] == row_id)
+    _, args = parse_checks(row["gold_check"])[0]
+    svc = DataService(load_dataset("nyc_taxi"), cutoff=date.fromisoformat(row["cutoff"]), store_root=tmp_path)
+    query = svc.query_metrics(MetricQuery(metrics=["trips"], dimensions=dimensions, grain=grain))
+    card = svc.forecast(query.handle_id, value_col="trips", id_col=id_col, freq=freq, horizon=args[2])
+    message = ToolMessage(
+        content="", tool_call_id="t", artifact={"handle_id": card.handle_id, "produced_by": "forecast", "governed": True}
+    )
+    outputs = {"answer": {"narrative": "", "claims": []}, "handles": _handle_entries([message], svc.store)}
+    result = grade_checks(outputs, row)
+    assert result["score"] is True, result["comment"]

@@ -37,9 +37,12 @@ class MetricQuery(BaseModel):
         default=None,
         description=(
             "previous_period compares with the immediately preceding equal-length "
-            "range. same_period_last_year compares with the same range one year "
-            "earlier; without a grain, the whole time_range is compared with the "
-            "same range one year earlier, as one total."
+            "range. same_period_last_year compares with the range about one year "
+            "earlier: shifted 364 days for hour/day grain and 52 weeks for week "
+            "grain (weekday-aligned, so Jan 1-2 compares with the same weekdays, "
+            "not the same dates), and 12 months (same calendar dates) for month "
+            "grain or no grain; with no grain, the whole time_range is compared "
+            "with the same range one year earlier, as one total."
         ),
     )
     share: bool = False

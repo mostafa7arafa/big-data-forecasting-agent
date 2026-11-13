@@ -621,3 +621,25 @@ def test_only_impute_quirks_are_changed():
         (df.loc[20, "y"] + df.loc[22, "y"]) / 2
     )
     assert len(result.adjustments) == 1
+
+
+@pytest.mark.parametrize("freq, dates", [("D", ["2024-01-01", "2024-01-03"]), ("MS", ["2024-01-01", "2024-03-01"])])
+def test_unobserved_additive_series_rejected_before_zero_fill(freq, dates):
+    frame = pd.DataFrame({"ds": pd.to_datetime(dates), "y": [np.nan, np.nan]})
+    with pytest.raises(ValueError, match="no observed values"):
+        prepare_series(
+            frame,
+            freq=freq,
+            data_end=datetime(2024, 6, 30, 23),
+            id_col=None,
+            time_col="ds",
+            value_col="y",
+            additive=True,
+        )
+    # One observed value is enough: the gap is a real zero.
+    frame.loc[0, "y"] = 5.0
+    result = prepare_series(
+        frame, freq=freq, data_end=datetime(2024, 6, 30, 23),
+        id_col=None, time_col="ds", value_col="y", additive=True,
+    )
+    assert result.df.y.notna().all()

@@ -205,6 +205,9 @@ def prepare_series(
             adjustments.append(f"dropped partial period {last.date()}")
         if group.empty:
             raise InvalidRequestError("series too short after dropping partial period")
+        # Before zero-filling: synthetic zeros must not make an unobserved series look valid.
+        if group.y.isna().all():
+            raise InvalidRequestError(f"cannot impute series {uid!r}: no observed values")
         full_index = pd.date_range(group.index.min(), group.index.max(), freq=freq)
         if not group.index.isin(full_index).all():
             raise InvalidRequestError(f"dates must be aligned to {freq}")

@@ -241,3 +241,23 @@ def test_cache_key_tracks_candidates_and_level_order(synthetic_service, monkeypa
     )
     svc.memory = svc.memory.model_copy(update={"series": [spec]})
     assert not svc.forecast_is_cached(h, id_col=None, **kw)
+
+
+def test_partial_and_complete_backtests_get_distinct_handles(synthetic_service, monkeypatch):
+    svc = synthetic_service
+    h = _daily_handle(svc)
+    kw = {"value_col": "event_count", "freq": "D", "horizon": 7}
+    monkeypatch.setattr(
+        "analyst.data.service.run_forecast",
+        lambda series, **k: _fake_run(windows_used=4, windows=12),
+    )
+    partial = svc.forecast(h, **kw)
+    monkeypatch.setattr(
+        "analyst.data.service.run_forecast",
+        lambda series, **k: _fake_run(windows_used=12, windows=12),
+    )
+    full = svc.forecast(h, **kw)
+    assert partial.meta["backtest_handle"] != full.meta["backtest_handle"]
+    partial_bt = svc.store.card(partial.meta["backtest_handle"])
+    assert partial_bt.meta["windows_used"] == 4 and partial_bt.meta["windows"] == 12
+    assert svc.store.card(full.meta["backtest_handle"]).meta["windows_used"] == 12

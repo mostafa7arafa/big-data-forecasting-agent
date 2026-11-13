@@ -2,6 +2,7 @@
 
     uv run python scripts/build_gold.py              # SQL gold set (q*.parquet)
     uv run python scripts/build_gold.py --set agent  # agent eval set (a*.parquet + key_values)
+    uv run python scripts/build_gold.py --set agent --keys-only  # key_values from the frozen a*.parquet
 
 Gold always runs on the full data (no cutoff): forecast rows freeze the real
 future. Parquets that belong to neither set are removed as orphans.
@@ -50,13 +51,16 @@ def build_sql(engine: Engine) -> int:
     return len(rows)
 
 
-def build_agent(engine: Engine) -> int:
+def build_agent(engine: Engine | None) -> int:
+    """Freeze the agent gold and derive key_values (with units); with no engine,
+    derive them from the already frozen parquets (float aggregates may not
+    re-run bit-identically, so this keeps the frozen gold untouched)."""
     rows = load_rows(AGENT_SET)
     for row in rows:
         if row["gold_sql"] is None:
             row["key_values"] = []
             continue
-        table = _freeze(engine, row)
+        table = _freeze(engine, row) if engine is not None else pq.read_table(GOLD / f"{row['id']}.parquet")
         row["key_values"] = derive_key_values(row, table)
     AGENT_SET.write_text("".join(json.dumps(row) + "\n" for row in rows))
     return len(rows)
@@ -76,10 +80,18 @@ def remove_orphans() -> list[str]:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--set", choices=("sql", "agent"), default="sql", dest="which")
+    parser.add_argument(
+        "--keys-only", action="store_true", help="agent set: re-derive key_values from the frozen parquets"
+    )
     args = parser.parse_args()
+    if args.keys_only and args.which != "agent":
+        parser.error("--keys-only needs --set agent")
     GOLD.mkdir(parents=True, exist_ok=True)
-    engine = Engine(load_dataset("nyc_taxi"))
-    count = build_agent(engine) if args.which == "agent" else build_sql(engine)
+    if args.keys_only:
+        count = build_agent(None)
+    else:
+        engine = Engine(load_dataset("nyc_taxi"))
+        count = build_agent(engine) if args.which == "agent" else build_sql(engine)
     orphans = remove_orphans()
     print(f"{count} rows OK, {len(orphans)} orphans", flush=True)
 
