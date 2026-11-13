@@ -245,3 +245,38 @@ def test_failed_result_unlinks_staged_frames(svc, monkeypatch, restarted):
     install(monkeypatch, [ExecResult(False, "", "boom", [f], restarted=restarted)])
     assert invoke("pass").status == "error"
     assert not f.path.exists()
+
+
+def test_wide_long_frames_keep_every_handle_line(svc, monkeypatch):
+    frames = [
+        frame(
+            svc,
+            f"w{i}",
+            pa.table({f"col_{j}_{'n' * 40}": ["x" * 400] * 3 for j in range(30)}),
+            f"w{i}.parquet",
+        )
+        for i in range(6)
+    ]
+    install(monkeypatch, [ExecResult(True, "y" * 9000, None, frames)])
+    msg = invoke("pass")
+    assert len(msg.content) <= 4096
+    for art in msg.artifact["handles"]:
+        assert f"handle: {art['handle_id']}" in msg.content
+    assert "(rows omitted; use describe)" in msg.content
+
+
+def test_clearing_stub_uses_entry_produced_by():
+    from analyst.middleware.clearing import stub_for
+
+    msg = ToolMessage(
+        content="x",
+        tool_call_id="1",
+        artifact={
+            "handles": [
+                {"handle_id": "r_aaaaaaaaaa", "produced_by": "run_python"},
+                {"handle_id": "r_bbbbbbbbbb", "produced_by": "other_tool"},
+            ]
+        },
+    )
+    text = stub_for(msg)
+    assert "r_aaaaaaaaaa (run_python)" in text and "r_bbbbbbbbbb (other_tool)" in text

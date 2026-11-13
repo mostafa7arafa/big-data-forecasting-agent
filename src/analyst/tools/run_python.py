@@ -24,6 +24,10 @@ from analyst.tools._common import (
 MAX_CODE_CHARS = 20_000
 MAX_CARD_COLUMNS = 8
 MAX_ECHO_ROWS = 5
+MAX_ECHO_ROW_CHARS = 300
+ECHO_BUDGET = 1500
+MAX_COLUMNS_CHARS = 200
+_OMITTED = "(rows omitted; use describe)"
 _LOST = "variables were lost; reload handles with load()"
 _CODE_ERROR_HINT = (
     "fix the code and run it again; variables from earlier cells are still defined"
@@ -44,7 +48,39 @@ def _thread_id(runtime: ToolRuntime[AnalystContext]) -> str:
 def _columns(names: list[str]) -> str:
     shown = ", ".join(names[:MAX_CARD_COLUMNS])
     extra = len(names) - MAX_CARD_COLUMNS
-    return f"{shown}, … (+{extra} more)" if extra > 0 else shown
+    text = f"{shown}, … (+{extra} more)" if extra > 0 else shown
+    return (
+        text if len(text) <= MAX_COLUMNS_CHARS else text[: MAX_COLUMNS_CHARS - 1] + "…"
+    )
+
+
+def _echo_row(row: dict) -> str:
+    text = "  " + json.dumps(row, default=str)
+    if len(text) > MAX_ECHO_ROW_CHARS:
+        text = text[: MAX_ECHO_ROW_CHARS - 1] + "…"
+    return text
+
+
+def _echo_lines(echoes: list[tuple[str, list[str]]], budget: int) -> list[str]:
+    """Echoed rows within ``budget`` chars; a marker when some were left out."""
+    out: list[str] = []
+    used = 0
+    omitted = False
+    label = len(echoes) > 1
+    for handle_id, rows in echoes:
+        block = ([f"rows of {handle_id}:"] if label else []) + rows
+        for line in block:
+            if used + len(line) + 1 > min(budget, ECHO_BUDGET):
+                omitted = True
+                break
+            out.append(line)
+            used += len(line) + 1
+        else:
+            continue
+        break
+    if omitted:
+        out.append(_OMITTED)
+    return out
 
 
 def _ingest(
@@ -52,10 +88,11 @@ def _ingest(
     code_sha: str,
     frames: list[SavedFrame],
     elapsed_s: float,
-) -> tuple[list[str], list[dict]]:
+) -> tuple[list[str], list[dict], list[tuple[str, list[str]]]]:
     store = service_for(runtime).store
     lines: list[str] = []
     artifacts: list[dict] = []
+    echoes: list[tuple[str, list[str]]] = []
     for frame in frames:
         try:
             try:
@@ -81,8 +118,11 @@ def _ingest(
         )
         if table.num_rows <= MAX_ECHO_ROWS:
             # Full precision, so the model can cite values exactly as stored.
-            for row in table.to_pylist():
-                lines.append("  " + json.dumps(row, default=str))
+            try:
+                rows = [_echo_row(row) for row in table.to_pylist()]
+            except Exception:  # noqa: BLE001 - an odd cell only loses the echo
+                rows = []
+            echoes.append((card.handle_id, rows))
         artifacts.append(
             {
                 "handle_id": card.handle_id,
@@ -90,7 +130,7 @@ def _ingest(
                 "governed": False,
             }
         )
-    return lines, artifacts
+    return lines, artifacts, echoes
 
 
 def _discard(frames: list[SavedFrame]) -> None:
@@ -122,12 +162,16 @@ def _run(code: str, runtime: ToolRuntime[AnalystContext]) -> Result:
             hint=_CODE_ERROR_HINT,
         )
     code_sha = hashlib.sha256(code.encode()).hexdigest()[:16]
-    lines, artifacts = _ingest(runtime, code_sha, res.saved, elapsed)
+    lines, artifacts, echoes = _ingest(runtime, code_sha, res.saved, elapsed)
     parts = [res.stdout.rstrip()] if res.stdout.strip() else []
     if res.truncated:
         parts.append("(stdout truncated)")
     # Cards must survive the cap: bound stdout so the handle lines always fit.
     card_text = "\n".join(lines)
+    room = MAX_CONTENT_CHARS - len(card_text) - 2
+    echo = _echo_lines(echoes, max(0, room - len(_OMITTED) - 1))
+    if echo:
+        card_text = "\n".join([card_text, *echo]) if card_text else "\n".join(echo)
     budget = max(0, MAX_CONTENT_CHARS - len(card_text) - 2)
     head = cap("\n".join(parts)) if parts else ""
     if len(head) > budget:
