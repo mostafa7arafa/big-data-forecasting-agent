@@ -11,9 +11,12 @@ import json
 import os
 import queue
 import re
+import shutil
+import stat
 import subprocess
 import threading
 import uuid
+from dataclasses import replace
 from datetime import date
 from pathlib import Path
 
@@ -45,6 +48,7 @@ def docker_argv(in_dir: Path, out_dir: Path, image: str, name: str | None = None
         "--read-only",
         "--pids-limit", "128",
         "--memory", "2g",
+        "--memory-swap", "2g",
         "--cpus", "2",
         "--user", _user(),
         "--tmpfs", "/tmp:rw,noexec,nosuid,size=64m",
@@ -56,9 +60,18 @@ def docker_argv(in_dir: Path, out_dir: Path, image: str, name: str | None = None
 
 
 class DockerSandbox:
-    def __init__(self, *, in_dir: Path, out_dir: Path, image: str, timeout_s: float) -> None:
+    def __init__(
+        self, *, in_dir: Path, out_dir: Path, image: str, timeout_s: float,
+        staging_dir: Path | None = None,
+    ) -> None:
         self.in_dir = Path(in_dir)
         self.out_dir = Path(out_dir)
+        # Host-only (never mounted): saved files are copied here after validation.
+        self.staging_dir = (
+            Path(staging_dir) if staging_dir is not None
+            else self.out_dir.with_name(self.out_dir.name + ".staged")
+        )
+        self._notice = ""
         self.image = image
         self.timeout_s = timeout_s
         self._lock = threading.Lock()
@@ -101,7 +114,10 @@ class DockerSandbox:
         if proc is None:
             return
         if name:
-            subprocess.run(["docker", "kill", name], capture_output=True, check=False, timeout=15)
+            try:
+                subprocess.run(["docker", "kill", name], capture_output=True, check=False, timeout=15)
+            except (subprocess.TimeoutExpired, OSError):
+                pass
         try:
             proc.kill()
         except OSError:
@@ -124,6 +140,9 @@ class DockerSandbox:
     # -- protocol -------------------------------------------------------------
     def run(self, code: str) -> ExecResult:
         with self._lock:
+            if self._proc is not None and self._proc.poll() is not None:
+                # Died between calls: tell the model its variables are gone.
+                self._notice = "sandbox had exited; restarted, variables were lost"
             if self._proc is None or self._proc.poll() is not None:
                 self._kill()
                 self._start()
@@ -147,7 +166,11 @@ class DockerSandbox:
                     raise ValueError("bad response")
             except ValueError:
                 return self._restarted(self._exit_error())
-            return self._to_result(resp)
+            res = self._to_result(resp)
+            if self._notice:
+                note, self._notice = self._notice, ""
+                res = replace(res, error=f"{note}\n{res.error}" if res.error else note, restarted=True)
+            return res
 
     def _exit_error(self) -> str:
         tail = "".join(self._stderr)[-_STDERR_TAIL:].strip()
@@ -163,7 +186,13 @@ class DockerSandbox:
                 msg = f"rejected saved path outside {CONTAINER_OUT}: {cpath!r}"
                 error = f"{error}\n{msg}" if error else msg
                 continue
-            saved.append(SavedFrame(str(item["name"]), self.out_dir / fname, int(item["rows"])))
+            try:
+                staged = self._stage(fname)
+            except OSError as exc:
+                msg = f"rejected saved file {fname!r}: {exc}"
+                error = f"{error}\n{msg}" if error else msg
+                continue
+            saved.append(SavedFrame(str(item["name"]), staged, int(item["rows"])))
         return ExecResult(
             ok=bool(resp.get("ok")) and error == resp.get("error"),
             stdout=str(resp.get("stdout", "")),
@@ -171,6 +200,35 @@ class DockerSandbox:
             saved=saved,
             truncated=bool(resp.get("truncated")),
         )
+
+    def _stage(self, fname: str) -> Path:
+        """Copy a container-written file to host-only staging, refusing links.
+
+        The scratch dir is container-writable, so the file may be a symlink to a
+        host path (cutoff bypass) or a hardlink; open with O_NOFOLLOW, require a
+        regular single-link file, copy from the open fd, then remove the scratch file.
+        """
+        src = self.out_dir / fname
+        if src.parent.resolve() != self.out_dir.resolve():
+            raise OSError("path escapes the output directory")
+        fd = os.open(src, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0))
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode):
+                raise OSError("not a regular file")
+            if st.st_nlink != 1:
+                raise OSError("file has multiple hard links")
+            self.staging_dir.mkdir(parents=True, exist_ok=True)
+            dest = self.staging_dir / f"{uuid.uuid4().hex}.parquet"
+            with os.fdopen(fd, "rb", closefd=False) as fin, open(dest, "xb") as fout:
+                shutil.copyfileobj(fin, fout)
+        finally:
+            os.close(fd)
+        try:
+            os.unlink(src)
+        except OSError:
+            pass
+        return dest
 
     def close(self) -> None:
         with self._lock:
@@ -187,6 +245,10 @@ def _safe_thread_dir(thread_id: str) -> str:
     return f"{slug}-{hashlib.sha256(thread_id.encode()).hexdigest()[:10]}"
 
 
+def _safe_name(name: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]+", "-", name).strip(".-") or "dataset"
+
+
 def get_sandbox(thread_id: str, dataset: str, cutoff: date | None) -> Sandbox:
     key = (thread_id, dataset, cutoff)
     with _registry_lock:
@@ -194,9 +256,11 @@ def get_sandbox(thread_id: str, dataset: str, cutoff: date | None) -> Sandbox:
         if sb is None:
             settings = get_settings()
             segment = cutoff.isoformat() if cutoff is not None else "full"
+            rel = Path(_safe_thread_dir(thread_id)) / _safe_name(dataset) / segment
             sb = DockerSandbox(
                 in_dir=segment_root(dataset, cutoff),
-                out_dir=settings.artifacts_dir / "sandbox" / _safe_thread_dir(thread_id) / segment,
+                out_dir=settings.artifacts_dir / "sandbox" / rel,
+                staging_dir=settings.artifacts_dir / "sandbox-staging" / rel,
                 image=settings.sandbox_image,
                 timeout_s=settings.sandbox_timeout_s,
             )
@@ -209,4 +273,7 @@ def close_all() -> None:
         boxes = list(_registry.values())
         _registry.clear()
     for sb in boxes:
-        sb.close()
+        try:
+            sb.close()
+        except Exception:  # noqa: BLE001, S110 - keep closing the rest
+            pass

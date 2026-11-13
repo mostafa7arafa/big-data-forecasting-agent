@@ -1,3 +1,5 @@
+import io
+import os
 import subprocess
 from datetime import date
 from pathlib import Path
@@ -33,7 +35,7 @@ def tmp_dirs(tmp_path):
 def test_argv_has_every_hardening_flag():
     argv = docker_argv(Path("/a"), Path("/b"), "img", "analyst-sbx-x")
     for flag in ["--network", "none", "--cap-drop", "ALL", "--read-only", "--pids-limit", "128",
-                 "--memory", "2g", "--cpus", "2", "no-new-privileges", "--user", "--tmpfs",
+                 "--memory", "2g", "--memory-swap", "--cpus", "2", "no-new-privileges", "--user", "--tmpfs",
                  "--rm", "-i", "analyst-sbx-x"]:
         assert flag in argv
     joined = " ".join(argv)
@@ -49,14 +51,81 @@ def test_thread_dir_cannot_escape_or_collide():
     assert "/" not in a and ".." not in a and a != b
 
 
-def test_saved_path_rewrite_and_reject(tmp_path):
+def _resp(*names):
+    return {"ok": True, "stdout": "", "error": None, "truncated": False, "saved": [
+        {"name": n, "path": f"/artifacts/out/{n}.parquet", "rows": 1} for n in names]}
+
+
+def _box(tmp_path):
     sb = DockerSandbox(in_dir=tmp_path / "i", out_dir=tmp_path / "o", image="x", timeout_s=1)
+    sb.out_dir.mkdir(parents=True)
+    return sb
+
+
+def test_symlink_in_scratch_rejected(tmp_path):
+    secret = tmp_path / "secret.parquet"
+    secret.write_bytes(b"beyond-cutoff")
+    sb = _box(tmp_path)
+    (sb.out_dir / "x.parquet").symlink_to(secret)
+    res = sb._to_result(_resp("x"))
+    assert not res.ok and not res.saved and "rejected" in res.error
+    assert secret.read_bytes() == b"beyond-cutoff"
+
+
+def test_hardlink_in_scratch_rejected(tmp_path):
+    secret = tmp_path / "secret.parquet"
+    secret.write_bytes(b"data")
+    sb = _box(tmp_path)
+    os.link(secret, sb.out_dir / "h.parquet")
+    res = sb._to_result(_resp("h"))
+    assert not res.ok and not res.saved and "hard links" in res.error
+
+
+def test_normal_file_is_staged_outside_out_dir(tmp_path):
+    sb = _box(tmp_path)
+    (sb.out_dir / "n.parquet").write_bytes(b"abc")
+    res = sb._to_result(_resp("n"))
+    assert res.ok
+    (f,) = res.saved
+    assert sb.out_dir not in f.path.parents and f.path.read_bytes() == b"abc"
+    assert not (sb.out_dir / "n.parquet").exists()
+
+
+def test_exited_between_calls_reports_restart(tmp_path, monkeypatch):
+    sb = _box(tmp_path)
+
+    class Dead:
+        def poll(self):
+            return 1
+
+    sb._proc = Dead()
+    monkeypatch.setattr(sb, "_kill", lambda: setattr(sb, "_proc", None))
+
+    class Live:
+        def __init__(self):
+            self.stdin = io.StringIO()
+
+        def poll(self):
+            return None
+
+    def fake_start():
+        sb._proc = Live()
+        sb._lines.put('{"id": "1", "ok": true, "stdout": "1\\n", "error": null, "saved": [], "truncated": false}\n')
+
+    monkeypatch.setattr(sb, "_start", fake_start)
+    res = sb.run("print(1)")
+    assert res.ok and res.restarted and "variables were lost" in res.error
+
+
+def test_saved_path_rewrite_and_reject(tmp_path):
+    sb = _box(tmp_path)
+    (sb.out_dir / "a-1.parquet").write_bytes(b"x")
     res = sb._to_result({"ok": True, "stdout": "", "error": None, "truncated": False, "saved": [
         {"name": "a-1", "path": "/artifacts/out/a-1.parquet", "rows": 3},
         {"name": "b", "path": "/artifacts/out/../etc/b.parquet", "rows": 1},
         {"name": "c", "path": "/tmp/c.parquet", "rows": 1},
     ]})
-    assert [f.path for f in res.saved] == [tmp_path / "o" / "a-1.parquet"]
+    assert len(res.saved) == 1 and res.saved[0].name == "a-1"
     assert not res.ok and "rejected" in res.error
 
 
@@ -72,7 +141,7 @@ def test_save_returns_host_path(tmp_dirs):
     r = tmp_dirs.run("import pandas as pd\nsave(pd.DataFrame({'a': [1, 2]}), 'demo')")
     assert r.ok, r.error
     (f,) = r.saved
-    assert f.path.parent == tmp_dirs.out_dir and f.rows == 2
+    assert tmp_dirs.out_dir not in f.path.parents and f.rows == 2
     assert len(pd.read_parquet(f.path)) == 2
 
 
