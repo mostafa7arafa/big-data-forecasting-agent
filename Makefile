@@ -1,4 +1,4 @@
-.PHONY: test test-taxi lint replay dev
+.PHONY: test test-taxi lint replay dev eval-agent
 
 test:
 	uv run pytest -m "not taxi and not live"
@@ -15,3 +15,6 @@ replay:
 
 dev:
 	uv run langgraph dev --n-jobs-per-worker 10
+
+eval-agent:
+	uv run python scripts/eval_agent.py

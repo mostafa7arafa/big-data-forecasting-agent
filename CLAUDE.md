@@ -16,7 +16,7 @@ An AI data analyst over ~162M NYC taxi trips (DuckDB over Parquet) that answers 
 - One implementer at a time. Briefs, dispatches, reports, reviews live in the ledger directory.
 
 ## Commands
-- `make test` (unit, synthetic data) · `make test-taxi` (integration, needs `data/raw`) · `make lint` · `make replay` (model cutoff replay → `docs/results/`) · `make dev` (LangGraph Studio on the `analyst` graph via `langgraph dev`; needs `.env` keys)
+- `make test` (unit, synthetic data) · `make test-taxi` (integration, needs `data/raw`) · `make lint` · `make replay` (model cutoff replay → `docs/results/`) · `make dev` (LangGraph Studio on the `analyst` graph via `langgraph dev`; needs `.env` keys) · `make eval-agent` (50-question agent eval as a LangSmith experiment; `--dry-run` runs locally; needs `.env` keys)
 - Data: `scripts/download_data.sh` (45 monthly files 2023-01..2026-09 into `data/raw/`, resumable)
 
 ## Rules that bite
