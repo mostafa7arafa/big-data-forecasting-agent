@@ -137,6 +137,7 @@ def test_forecast_slow_refused_when_background_enabled(monkeypatch):
     msg = invoke(forecast, {"handle_id": _handle(), **FC}, background=True)
     assert msg.status == "error"
     assert "start_async_task" in msg.content and "worker" in msg.content
+    assert 'start_async_task(description, subagent_type="worker")' in msg.content
 
 
 def test_forecast_runs_inline_when_background_disabled(monkeypatch):

@@ -44,6 +44,9 @@ step from cited handle values; anything longer gets its own query.
 hedged ("coincides with", "may reflect", "consistent with") and cites a \
 context fact id in `fact_ids` (see the `context_facts` topic). Without a \
 fact, describe what happened, not why.
+- When you flag a known data quirk, put its quirk id as listed by \
+`read_knowledge("quirks")` (e.g. "gap:2023-09-21") in the claim's `fact_ids`. \
+A causal claim still needs a context fact id as well.
 - List chart specs in `charts` and any SQL you ran in `sql`.
 - Status sentences are not part of the answer and are never checked."""
 
@@ -51,9 +54,10 @@ BACKGROUND_POLICY = """\
 ## Background work
 Long work runs as a background task: any forecast that is not cached and is \
 daily or covers several series, and any investigation of three or more data \
-steps. Tell the user in one sentence what you started, keep answering, and \
-cite the handles the task reports back when it finishes. Monthly \
-single-series forecasts and cached forecasts run inline."""
+steps. Start one with `start_async_task(description, subagent_type="worker")`, \
+giving the full task in the description. Tell the user in one sentence what you \
+started, keep answering, and cite the handles the task reports back when it \
+finishes. Monthly single-series forecasts and cached forecasts run inline."""
 
 INLINE_POLICY = "Run all work inline in this turn; there are no background tasks."
 

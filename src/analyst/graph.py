@@ -21,6 +21,7 @@ from datetime import date
 from functools import lru_cache
 from typing import Any, Literal
 
+from deepagents import AsyncSubAgentMiddleware
 from langchain.agents import create_agent
 from langchain.agents.structured_output import StructuredOutputError
 from langchain_core.language_models import BaseChatModel
@@ -37,6 +38,13 @@ from langgraph.runtime import Runtime
 from langgraph.types import Command
 from pydantic import ValidationError
 
+from analyst.background import (
+    ASYNC_TASK_TOOL_NAMES,
+    WORKER,
+    BackgroundGuard,
+    is_background_notification,
+)
+from analyst.config import get_settings
 from analyst.context import AnalystContext
 from analyst.data.registry import get_service
 from analyst.middleware import analyst_middleware
@@ -54,14 +62,9 @@ __all__ = ["LABEL_CHIPS", "build_graph", "graph", "label_chip"]
 SOURCE_KEY = "source"
 _VERIFY_SOURCE = "verify"
 _PLAN_SOURCE = "plan"
-#: tag the Agent Server puts on a background task's completion message
-#: (``additional_kwargs["lc_source"]`` today; ``source`` kept for older shapes).
-_BACKGROUND_SOURCE = "async_subagent"
-_BACKGROUND_KEYS = ("lc_source", SOURCE_KEY)
-
-#: the async-task tools the analyst can start background work with. Task 11
-#: fills this; until then background work is off whatever the context says.
-ASYNC_TASK_TOOLS: list = []
+#: the async-task tools the analyst starts background work with. Background
+#: work (prompt policy, forecast refusal) is on only while this is non-empty.
+ASYNC_TASK_TOOLS: list[str] = sorted(ASYNC_TASK_TOOL_NAMES)
 
 RETRY_TEXT = (
     "Verification failed: {problems}. Fix the answer: cite handles for every "
@@ -95,16 +98,6 @@ def _source(message: Any) -> str | None:
     return None
 
 
-def _is_background_note(message: Any) -> bool:
-    for location in ("additional_kwargs", "response_metadata"):
-        meta = getattr(message, location, None)
-        if isinstance(meta, dict) and any(
-            meta.get(key) == _BACKGROUND_SOURCE for key in _BACKGROUND_KEYS
-        ):
-            return True
-    return False
-
-
 def _text(message: BaseMessage) -> str:
     content = message.content
     if isinstance(content, str):
@@ -126,7 +119,7 @@ def _question(messages: Sequence[BaseMessage]) -> HumanMessage | None:
         if (
             isinstance(message, HumanMessage)
             and _source(message) not in (_VERIFY_SOURCE, _PLAN_SOURCE)
-            and not _is_background_note(message)
+            and not is_background_notification(message)
         ):
             return message
     return None
@@ -204,10 +197,16 @@ def build_graph(
         spec: str | None, dataset: str, cutoff: date | None, background: bool
     ):
         memory = get_service(dataset, cutoff).memory
+        settings = get_settings()
         return create_agent(
             resolve_model(spec),
             tools=DATA_TOOLS,
-            middleware=[*analyst_middleware(), *extra],
+            middleware=[
+                *analyst_middleware(settings),
+                AsyncSubAgentMiddleware(async_subagents=[WORKER]),
+                BackgroundGuard(settings.max_background_tasks),
+                *extra,
+            ],
             system_prompt=build_system_prompt(
                 memory, dataset=dataset, cutoff=cutoff, background=background
             ),
@@ -226,7 +225,7 @@ def build_graph(
             "retries": 0,
         }
         messages = state["messages"]
-        if messages and _is_background_note(messages[-1]):
+        if messages and is_background_notification(messages[-1]):
             return reset
         question = _question(messages)
         if question is None:
@@ -267,10 +266,14 @@ def build_graph(
         # Stream state snapshots so the work done so far survives a
         # structured-output failure; that failure must never escape the graph
         # (it becomes the answer node's "no structured answer" path).
+        # Background task records ride through the inner agent and back.
+        tasks = dict(state.get("async_tasks") or {})
         last: dict[str, Any] = {"messages": messages}
         try:
             async for snapshot in agent.astream(
-                {"messages": messages}, context=ctx, stream_mode="values"
+                {"messages": messages, "async_tasks": tasks},
+                context=ctx,
+                stream_mode="values",
             ):
                 last = snapshot
         except (StructuredOutputError, ValidationError, ValueError):
@@ -282,7 +285,10 @@ def build_graph(
         new = _drop_structured_response(
             list(last["messages"][len(messages) :]), structured=draft is not None
         )
-        return {"messages": new, "draft": draft}
+        update: dict[str, Any] = {"messages": new, "draft": draft}
+        if last.get("async_tasks") and last["async_tasks"] != tasks:
+            update["async_tasks"] = last["async_tasks"]
+        return update
 
     async def verify(
         state: AnalystState, runtime: Runtime[AnalystContext]

@@ -354,20 +354,27 @@ def test_prompt_cutoff_and_background_toggle():
     assert len(off) < len(on)
 
 
-def test_langgraph_json_points_at_graph(monkeypatch):
+def test_langgraph_json_points_at_graph(monkeypatch, tmp_path):
     config = json.loads((REPO / "langgraph.json").read_text())
     assert config == {
         "dependencies": ["."],
-        "graphs": {"analyst": "./src/analyst/graph.py:graph"},
+        "graphs": {
+            "analyst": "./src/analyst/graph.py:graph",
+            "worker": "./src/analyst/worker.py:graph",
+        },
         "env": ".env",
     }
-    path, _, attr = config["graphs"]["analyst"].partition(":")
-    assert (REPO / path).is_file()
     for var in ("ANALYST_DATASET", "OPENAI_API_KEY", "OPENROUTER_API_KEY"):
         monkeypatch.delenv(var, raising=False)
+    monkeypatch.chdir(tmp_path)  # no .env: the graphs import without keys
     get_settings.cache_clear()
-    module = importlib.reload(importlib.import_module("analyst.graph"))
-    assert hasattr(getattr(module, attr), "ainvoke")
+    assert get_settings().openai_api_key is None
+    for name, spec in config["graphs"].items():
+        path, _, attr = spec.partition(":")
+        assert (REPO / path).is_file()
+        module_name = "analyst." + Path(path).stem
+        module = importlib.reload(importlib.import_module(module_name))
+        assert hasattr(getattr(module, attr), "ainvoke"), name
 
 
 # --- fix round 1 -----------------------------------------------------------
@@ -433,15 +440,70 @@ def test_plan_malformed_result_is_empty_plan():
     assert out["answer"].verification.label == "verified"
 
 
-def test_background_policy_off_until_async_tools_exist():
+def test_background_policy_on_with_async_tools():
+    from analyst.graph import ASYNC_TASK_TOOLS
+
+    assert "start_async_task" in ASYNC_TASK_TOOLS
     model = ScriptedModel(
         script=[no_plan(), tool_turn(call("query_metrics", COUNT, "c1")), cite_total]
     )
     ctx = AnalystContext(dataset="events", background=True)
     run(model, [HumanMessage("how many events?")], context=ctx)
     system = model.seen[1][0].content
-    assert "## Background work" not in system
-    assert "no background tasks" in system
+    assert "## Background work" in system
+    assert 'start_async_task(description, subagent_type="worker")' in system
+
+
+def test_plan_skipped_for_real_notification_shape():
+    from langchain_core.messages.notification import add_notification_metadata
+
+    note = add_notification_metadata(
+        HumanMessage(content=[{"type": "text", "text": "Task t1 finished."}]),
+        source="async_subagent",
+        data={"task_id": "t1", "agent_name": "worker", "status": "success"},
+    )
+    model = ScriptedModel(
+        script=[tool_turn(call("query_metrics", COUNT, "c1")), cite_total]
+    )
+    out = run(model, [HumanMessage("how many events?"), note])
+    assert out["plan"] == []
+    assert out["answer"].verification.label == "verified"
+    assert not model.script
+
+
+def test_async_tasks_survive_the_analyst_node():
+    task = {
+        "task_id": "t1",
+        "agent_name": "worker",
+        "thread_id": "t1",
+        "run_id": "r1",
+        "status": "success",
+        "created_at": "2026-01-01T00:00:00Z",
+        "last_checked_at": "2026-01-01T00:00:00Z",
+        "last_updated_at": "2026-01-01T00:00:00Z",
+    }
+    model = ScriptedModel(
+        script=[no_plan(), tool_turn(call("query_metrics", COUNT, "c1")), cite_total]
+    )
+    graph = build_graph(model=model)
+    out = asyncio.run(
+        graph.ainvoke(
+            {
+                "messages": [HumanMessage("how many events?")],
+                "async_tasks": {"t1": task},
+            },
+            context=CTX,
+        )
+    )
+    assert out["async_tasks"]["t1"]["status"] == "success"
+
+
+def test_prompt_quirk_ids_in_fact_ids():
+    memory = registry.get_service("events", None).memory
+    p = build_system_prompt(memory, dataset="ds", cutoff=None, background=False)
+    assert 'read_knowledge("quirks")' in p
+    assert "gap:2023-09-21" in p and "fact_ids" in p
+    assert "context fact id" in p  # causal claims still need a context fact
 
 
 # --- fix round 2 -----------------------------------------------------------
@@ -611,3 +673,53 @@ def test_raw_structured_response_not_persisted(strategy):
     assert any(m.tool_calls and m.content == "Pulling the totals." for m in ai)
     assert any(isinstance(m, ToolMessage) and m.tool_call_id == "c1" for m in messages)
     assert messages[-1].content.startswith(out["answer"].narrative + "\n\n")
+
+
+def test_task_cap_sees_thread_tasks(monkeypatch):
+    """The analyst's inner agent gets the thread's task records, so the cap holds."""
+    from analyst.background import AsyncSubAgentMiddleware
+
+    async def no_pull(self, tasks):  # no Agent Server in unit tests
+        return {}
+
+    monkeypatch.setattr(AsyncSubAgentMiddleware, "_apull", no_pull)
+    tasks = {
+        f"t{i}": {
+            "task_id": f"t{i}",
+            "agent_name": "worker",
+            "thread_id": f"t{i}",
+            "run_id": f"r{i}",
+            "status": "running",
+            "created_at": "2026-01-01T00:00:00Z",
+            "last_checked_at": "2026-01-01T00:00:00Z",
+            "last_updated_at": "2026-01-01T00:00:00Z",
+        }
+        for i in range(3)
+    }
+    start = call(
+        "start_async_task",
+        {"description": "forecast daily", "subagent_type": "worker"},
+        "s1",
+    )
+    model = ScriptedModel(
+        script=[
+            no_plan(),
+            tool_turn(start),
+            tool_turn(call("query_metrics", COUNT, "c1")),
+            cite_total,
+        ]
+    )
+    graph = build_graph(model=model)
+    out = asyncio.run(
+        graph.ainvoke(
+            {"messages": [HumanMessage("forecast daily events")], "async_tasks": tasks},
+            context=AnalystContext(dataset="events", background=True),
+        )
+    )
+    refused = next(
+        m
+        for m in out["messages"]
+        if isinstance(m, ToolMessage) and m.tool_call_id == "s1"
+    )
+    assert refused.status == "error" and "limit 3" in refused.content
+    assert set(out["async_tasks"]) == set(tasks)

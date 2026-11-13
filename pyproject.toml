@@ -45,4 +45,5 @@ filterwarnings = [
 markers = [
     "taxi: tests that require data/raw NYC taxi files",
     "slow: long-running tests",
+    "live: needs API keys and starts langgraph dev (uv run pytest -m live tests/live)",
 ]

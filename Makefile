@@ -1,7 +1,7 @@
 .PHONY: test test-taxi lint replay dev
 
 test:
-	uv run pytest -m "not taxi"
+	uv run pytest -m "not taxi and not live"
 
 test-taxi:
 	uv run pytest -m taxi

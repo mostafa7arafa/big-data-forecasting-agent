@@ -1,6 +1,6 @@
 """Answer schema and graph state shared by the agent, verifier and UI."""
 
-from typing import Annotated, Literal, TypedDict
+from typing import Annotated, Any, Literal, NotRequired, TypedDict
 
 from langgraph.graph.message import add_messages
 from pydantic import BaseModel, Field, field_validator
@@ -66,6 +66,13 @@ class Plan(BaseModel):
     steps: list[str] = Field(default_factory=list)
 
 
+def _merge_tasks(
+    existing: dict[str, Any] | None, update: dict[str, Any] | None
+) -> dict[str, Any]:
+    """Background task records by task id; an update replaces a task's record."""
+    return {**(existing or {}), **(update or {})}
+
+
 class AnalystState(TypedDict):
     messages: Annotated[list, add_messages]
     plan: list[str]
@@ -73,3 +80,5 @@ class AnalystState(TypedDict):
     answer: Answer | None
     verification: Verification | None
     retries: int
+    #: background tasks started with ``start_async_task`` (deepagents records).
+    async_tasks: NotRequired[Annotated[dict[str, Any], _merge_tasks]]

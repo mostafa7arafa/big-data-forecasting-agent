@@ -8,6 +8,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.types as pat
 
+from analyst.background import is_background_notification
 from analyst.data.results import ResultStore
 from analyst.errors import UnknownNameError
 from analyst.verify.numbers import StatedNumber, intervals, matches
@@ -90,14 +91,6 @@ def _get(message: object, name: str):
     return getattr(message, name, None)
 
 
-def _is_worker_note(message: object) -> bool:
-    for location in ("additional_kwargs", "response_metadata", "metadata"):
-        meta = _get(message, location)
-        if isinstance(meta, dict) and meta.get("source") == "async_subagent":
-            return True
-    return False
-
-
 def _text(message: object) -> str:
     content = _get(message, "content")
     if isinstance(content, str):
@@ -127,7 +120,7 @@ def collect_handles(messages, store: ResultStore) -> dict[str, HandleInfo]:
                 loaded.columns if loaded else [],
             )
             continue
-        if _is_worker_note(message):
+        if is_background_notification(message):
             for line in _HANDLES_LINE.findall(_text(message)):
                 for hid in _HANDLE_ID.findall(line):
                     if hid in found:

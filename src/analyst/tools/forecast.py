@@ -48,8 +48,8 @@ def forecast(
                     f"forecast estimated at {estimate:.0f}s, over the "
                     f"{settings.inline_forecast_limit_s:.0f}s inline limit",
                     hint=(
-                        "call start_async_task for the worker subagent and pass "
-                        "the same forecast arguments"
+                        'call start_async_task(description, subagent_type="worker") '
+                        "with the full task, including these forecast arguments"
                     ),
                 )
         card = service.forecast(
