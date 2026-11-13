@@ -3,8 +3,9 @@
 Served by ``langgraph dev`` as graph ``worker``. It has the data tools only (no
 async-task tools, so it cannot start more background work), runs everything
 inline, and ends its report with a ``handles:`` line the analyst's verifier
-reads. Its dataset and cutoff come from the forwarded run context and the task
-header (see :mod:`analyst.background`); without either every tool fails closed.
+reads. Its dataset and cutoff come from the task's required context header,
+narrowed by the forwarded run context (see :mod:`analyst.background`); without
+a header every tool fails closed.
 
 Like the analyst graph, the module imports without API keys: a missing key
 fails the first model call instead, with the provider's hint.
@@ -39,6 +40,10 @@ the step. Read `read_knowledge("quirks")` before trusting an odd period.
 - Run every forecast and query yourself, inline: you cannot start background tasks.
 - Tool results are summary cards with handle ids (`r_…`). Every number you report \
 comes from a tool result; never invent, estimate or recall one.
+- Never report a number you computed yourself (sums, totals, averages, row or \
+period counts). If the task needs one, get it from a tool (`query_metrics` with \
+the right grain and time_range, or `run_sql`). Your report lists only numbers \
+present in the results of the handles you cite.
 - Write a short report of what you found, naming the handle each number came from.
 - End your report with exactly one line "handles: r_…, r_…" listing every handle \
 id you used."""

@@ -43,6 +43,7 @@ from analyst.background import (
     WORKER,
     BackgroundGuard,
     is_background_notification,
+    task_context_for_notification,
 )
 from analyst.config import get_settings
 from analyst.context import AnalystContext
@@ -65,6 +66,8 @@ _PLAN_SOURCE = "plan"
 #: the async-task tools the analyst starts background work with. Background
 #: work (prompt policy, forecast refusal) is on only while this is non-empty.
 ASYNC_TASK_TOOLS: list[str] = sorted(ASYNC_TASK_TOOL_NAMES)
+#: inner-agent state the thread keeps between turns (background task records).
+_CARRIED_KEYS = ("async_tasks", "background_contexts")
 
 RETRY_TEXT = (
     "Verification failed: {problems}. Fix the answer: cite handles for every "
@@ -165,9 +168,27 @@ def _drop_structured_response(
     return kept
 
 
-def _context(runtime: Runtime[AnalystContext]) -> AnalystContext:
+def _narrow(ctx: AnalystContext, wake: Any) -> AnalystContext:
+    """``ctx`` narrowed to a woken task's recorded start context.
+
+    A run started by a background notification carries whatever context the
+    worker sent back; the task's recorded dataset and cutoff win, and the
+    earlier cutoff applies, so a wake-up never widens what the task saw.
+    """
+    if not isinstance(wake, dict) or not wake.get("dataset"):
+        return ctx
+    recorded = wake.get("cutoff")
+    recorded = date.fromisoformat(recorded) if recorded else None
+    if wake["dataset"] != ctx.dataset:
+        return replace(ctx, dataset=wake["dataset"], cutoff=recorded)
+    cutoffs = [c for c in (ctx.cutoff, recorded) if c is not None]
+    return replace(ctx, cutoff=min(cutoffs) if cutoffs else None)
+
+
+def _context(runtime: Runtime[AnalystContext], wake: Any = None) -> AnalystContext:
     """The run's context with background work gated on the async-task tools.
 
+    ``wake`` is the turn's ``wake_context`` (see :func:`_narrow`).
     Blocking (settings may read ``.env``): call it through ``asyncio.to_thread``.
     """
     ctx = runtime.context
@@ -175,6 +196,7 @@ def _context(runtime: Runtime[AnalystContext]) -> AnalystContext:
         ctx = AnalystContext.from_settings()
     elif isinstance(ctx, dict):
         ctx = AnalystContext.from_settings(**ctx)
+    ctx = _narrow(ctx, wake)
     background = ctx.background and bool(ASYNC_TASK_TOOLS)
     return ctx if ctx.background == background else replace(ctx, background=background)
 
@@ -223,14 +245,19 @@ def build_graph(
             "draft": None,
             "verification": None,
             "retries": 0,
+            "wake_context": None,
         }
         messages = state["messages"]
         if messages and is_background_notification(messages[-1]):
+            # Decided once per turn: later nodes see verify feedback last.
+            reset["wake_context"] = task_context_for_notification(
+                messages[-1], state.get("background_contexts")
+            )
             return reset
         question = _question(messages)
         if question is None:
             return reset
-        ctx = await asyncio.to_thread(_context, runtime)
+        ctx = await asyncio.to_thread(_context, runtime, None)
         chat = await asyncio.to_thread(resolve_model, ctx.model)
         planner = chat.with_structured_output(Plan)
         try:
@@ -248,7 +275,7 @@ def build_graph(
         return {**reset, "plan": list(result.steps)}
 
     async def analyst(state: AnalystState, runtime: Runtime[AnalystContext]) -> dict:
-        ctx = await asyncio.to_thread(_context, runtime)
+        ctx = await asyncio.to_thread(_context, runtime, state.get("wake_context"))
         agent = await asyncio.to_thread(
             analyst_agent, ctx.model, ctx.dataset, ctx.cutoff, ctx.background
         )
@@ -267,11 +294,11 @@ def build_graph(
         # structured-output failure; that failure must never escape the graph
         # (it becomes the answer node's "no structured answer" path).
         # Background task records ride through the inner agent and back.
-        tasks = dict(state.get("async_tasks") or {})
+        carried = {key: dict(state.get(key) or {}) for key in _CARRIED_KEYS}
         last: dict[str, Any] = {"messages": messages}
         try:
             async for snapshot in agent.astream(
-                {"messages": messages, "async_tasks": tasks},
+                {"messages": messages, **carried},
                 context=ctx,
                 stream_mode="values",
             ):
@@ -286,8 +313,9 @@ def build_graph(
             list(last["messages"][len(messages) :]), structured=draft is not None
         )
         update: dict[str, Any] = {"messages": new, "draft": draft}
-        if last.get("async_tasks") and last["async_tasks"] != tasks:
-            update["async_tasks"] = last["async_tasks"]
+        for key, before in carried.items():
+            if last.get(key) and last[key] != before:
+                update[key] = last[key]
         return update
 
     async def verify(
@@ -296,7 +324,7 @@ def build_graph(
         draft = state.get("draft")
         if draft is None:
             return Command(goto="answer")
-        ctx = await asyncio.to_thread(_context, runtime)
+        ctx = await asyncio.to_thread(_context, runtime, state.get("wake_context"))
         messages = state["messages"]
         question = _question(messages)
 

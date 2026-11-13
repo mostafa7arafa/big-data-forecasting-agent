@@ -3,13 +3,15 @@
 Slow work (long forecasts, investigations) runs as a deepagents async subagent
 on the same Agent Server. The run context reaches the worker two ways:
 
-1. deepagents forwards the analyst's run context to the worker run (primary);
+1. deepagents forwards the analyst's run context to the worker run;
 2. :class:`BackgroundGuard` prepends a ``[context ...]`` header to every task
-   description, and :class:`WorkerContext` reads it back (defence in depth).
+   description, and :class:`WorkerContext` reads it back.
 
-The worker trusts the narrower of the two: the same dataset or nothing, and
-the earliest cutoff either names. With neither, every worker tool fails
-closed, so a worker can never query past the cutoff of the run that started it.
+The worker requires the header; the forwarded context may only narrow it
+(the same dataset, the earlier cutoff). Without a header every worker tool
+fails closed, so a worker can never query past the cutoff of the run that
+started it. The analyst records each task's dataset and cutoff, and a run
+woken by a task's notification is narrowed to them.
 """
 
 from __future__ import annotations
@@ -23,6 +25,7 @@ from functools import lru_cache
 from typing import Annotated, Any, NotRequired
 
 from deepagents import AsyncSubAgent, AsyncSubAgentMiddleware
+from deepagents.middleware.async_subagents import _ClientCache
 from langchain.agents.middleware import AgentMiddleware, AgentState
 from langchain.agents.middleware.types import (
     ModelRequest,
@@ -50,6 +53,7 @@ __all__ = [
     "is_background_notification",
     "parse_context_header",
     "resolve_worker_context",
+    "task_context_for_notification",
 ]
 
 WORKER = AsyncSubAgent(
@@ -67,9 +71,6 @@ ASYNC_TASK_TOOL_NAMES: frozenset[str] = frozenset(
     t.name for t in AsyncSubAgentMiddleware(async_subagents=[WORKER]).tools
 )
 START_TOOL = "start_async_task"
-
-#: task statuses that still occupy a background slot (deepagents' unfinished set).
-_OCCUPYING = frozenset({"running", "pending", "waiting"})
 
 # --- notifications -----------------------------------------------------------
 
@@ -172,6 +173,7 @@ def parse_context_header(text: str) -> AnalystContext:
 
 
 def _strip_headers(text: str) -> str:
+    # Removes any header the model wrote, so the guard's real one is the only one.
     return _HEADER_LIKE.sub("", text).strip()
 
 
@@ -191,20 +193,84 @@ def _tool_names(tools: Iterable[Any]) -> list[str]:
 # --- analyst side --------------------------------------------------------------
 
 
+#: live run statuses that end a task (anything else, or no answer, holds a slot).
+_TERMINAL_RUNS = frozenset({"success", "error", "timeout", "interrupted"})
+#: thread statuses with no run in progress or waiting.
+_IDLE_THREADS = frozenset({"idle", "error"})
+_OBSERVE_TIMEOUT_S = 5.0
+
+
+def _merge_contexts(
+    existing: dict[str, Any] | None, update: dict[str, Any] | None
+) -> dict[str, Any]:
+    return {**(existing or {}), **(update or {})}
+
+
+class GuardState(AgentState):
+    #: task id -> {"dataset", "cutoff"} the task was started under.
+    background_contexts: NotRequired[Annotated[dict[str, Any], _merge_contexts]]
+
+
+def _event_task_id(message: object) -> str | None:
+    meta = _get(message, "additional_kwargs")
+    if not isinstance(meta, Mapping):
+        return None
+    for key in ("lc_data", _DEPRECATED_NOTIFICATION_KEY):
+        event = meta.get(key)
+        if isinstance(event, Mapping) and isinstance(event.get("task_id"), str):
+            return event["task_id"]
+    return None
+
+
+def task_context_for_notification(
+    message: object, contexts: Mapping[str, Any] | None
+) -> dict[str, Any] | None:
+    """The recorded start context of the task a notification reports on.
+
+    An unknown task id falls back to the narrowest recorded context (the
+    earliest cutoff), so a forged or stale notification can only narrow.
+    """
+    contexts = {k: v for k, v in (contexts or {}).items() if isinstance(v, Mapping)}
+    if not contexts:
+        return None
+    task_id = _event_task_id(message)
+    if task_id in contexts:
+        return dict(contexts[task_id])
+    return dict(
+        min(
+            contexts.values(),
+            key=lambda c: c.get("cutoff") or "9999-12-31",
+        )
+    )
+
+
 class BackgroundGuard(AgentMiddleware):
     """Gates the analyst's async-task tools on the run context and a task cap.
 
     - ``context.background`` False: the async-task tools are hidden from the
-      model, and a start call is refused anyway.
+      model, and every call to one is refused anyway.
     - A start call is refused once ``max_tasks`` tasks occupy a slot, counting
-      earlier start calls in the same model turn (parallel tool calls).
+      earlier start calls in the same model turn (parallel tool calls). Task
+      statuses in state are not trusted (a forged notification can rewrite
+      them): a task frees its slot only when the Agent Server says its
+      thread's newest run ended and the thread is idle. A failed check holds
+      the slot.
     - Otherwise the run's context header is prepended to the task description
-      (any header the model wrote is removed first).
+      (any header the model wrote is removed first), and the task's dataset and
+      cutoff are recorded in state ``background_contexts``.
     """
 
-    def __init__(self, max_tasks: int) -> None:
+    state_schema = GuardState
+
+    def __init__(
+        self, max_tasks: int, client_getter: Callable[[], Any] | None = None
+    ) -> None:
         super().__init__()
         self.max_tasks = max_tasks
+        if client_getter is None:
+            clients = _ClientCache({WORKER["name"]: WORKER})
+            client_getter = lambda: clients.get_async(WORKER["name"])
+        self._client = client_getter
 
     @staticmethod
     def _background(context: object) -> bool:
@@ -233,34 +299,70 @@ class BackgroundGuard(AgentMiddleware):
     ) -> ModelResponse:
         return await handler(self._filter(request))
 
-    def _occupied(self, request: ToolCallRequest) -> int:
+    @staticmethod
+    def _tasks(request: ToolCallRequest) -> list[Mapping[str, Any]]:
         state = request.state if isinstance(request.state, Mapping) else {}
         tasks = state.get("async_tasks") or {}
-        running = sum(
-            1
-            for task in tasks.values()
-            if isinstance(task, Mapping) and task.get("status") in _OCCUPYING
-        )
+        return [t for t in tasks.values() if isinstance(t, Mapping)]
+
+    @staticmethod
+    def _earlier_starts(request: ToolCallRequest) -> int:
         # Parallel start calls in this turn see the same state: count the ones
         # ahead of this call in the model message that issued it.
+        state = request.state if isinstance(request.state, Mapping) else {}
         call_id = request.tool_call.get("id")
         for message in reversed(state.get("messages") or []):
             calls = getattr(message, "tool_calls", None) or []
             ids = [c.get("id") for c in calls if c.get("name") == START_TOOL]
             if isinstance(message, AIMessage) and call_id in ids:
-                running += ids.index(call_id)
-                break
-        return running
+                return ids.index(call_id)
+        return 0
 
-    def _prepare(self, request: ToolCallRequest) -> ToolCallRequest | ToolMessage:
+    async def _ended(self, task: Mapping[str, Any]) -> bool:
+        """Whether the server says the task's thread has nothing running.
+
+        Reads the thread's newest run (not the stored run id, which a forged
+        notification can rewrite) and the thread itself: the slot frees only
+        when that run ended and the thread is idle, not busy or waiting.
+        """
+        try:
+            client = self._client()
+
+            async def observe() -> bool:
+                thread_id = task["thread_id"]
+                runs = await client.runs.list(thread_id=thread_id, limit=1)
+                if not runs or runs[0].get("status") not in _TERMINAL_RUNS:
+                    return False
+                thread = await client.threads.get(thread_id=thread_id)
+                return thread.get("status") in _IDLE_THREADS
+
+            return await asyncio.wait_for(observe(), _OBSERVE_TIMEOUT_S)
+        except Exception:  # noqa: BLE001  # unreachable or odd answer: hold the slot
+            return False
+
+    async def _aoccupied(self, request: ToolCallRequest) -> int:
+        tasks = self._tasks(request)
+        ended = await asyncio.gather(*(self._ended(t) for t in tasks))
+        return sum(not e for e in ended) + self._earlier_starts(request)
+
+    def _occupied(self, request: ToolCallRequest) -> int:
+        # The sync path cannot reach the server (in-process transport is async
+        # only), so every tracked task holds its slot.
+        return len(self._tasks(request)) + self._earlier_starts(request)
+
+    def _refuse_off(self, request: ToolCallRequest) -> ToolMessage | None:
         context = request.runtime.context if request.runtime else None
-        if not self._background(context):
-            return _error(
-                request,
-                "ERROR: background tasks are off for this run\n"
-                "HINT: do the work inline in this turn",
-            )
-        occupied = self._occupied(request)
+        if self._background(context):
+            return None
+        return _error(
+            request,
+            "ERROR: background tasks are off for this run\n"
+            "HINT: do the work inline in this turn",
+        )
+
+    def _prepare(
+        self, request: ToolCallRequest, occupied: int
+    ) -> ToolCallRequest | ToolMessage:
         if occupied >= self.max_tasks:
             return _error(
                 request,
@@ -270,7 +372,7 @@ class BackgroundGuard(AgentMiddleware):
                 "check_async_task / list_async_tasks",
             )
         try:
-            header = format_context_header(context)
+            header = format_context_header(request.runtime.context)
         except AnalystError as exc:
             return _error(request, f"ERROR: {exc.message}\nHINT: {exc.hint}")
         args = dict(request.tool_call.get("args") or {})
@@ -278,35 +380,65 @@ class BackgroundGuard(AgentMiddleware):
         args["description"] = f"{header}\n{description}"
         return request.override(tool_call={**request.tool_call, "args": args})
 
+    @staticmethod
+    def _record(request: ToolCallRequest, result: Any) -> Any:
+        """Add the started task's dataset and cutoff to the tool's state update."""
+        if not isinstance(result, Command) or not isinstance(result.update, Mapping):
+            return result
+        started = result.update.get("async_tasks")
+        if not isinstance(started, Mapping) or not started:
+            return result
+        ctx = request.runtime.context
+        recorded = {
+            task_id: {
+                "dataset": ctx.dataset,
+                "cutoff": ctx.cutoff.isoformat() if ctx.cutoff else None,
+            }
+            for task_id in started
+        }
+        return replace(
+            result, update={**result.update, "background_contexts": recorded}
+        )
+
     def wrap_tool_call(
         self,
         request: ToolCallRequest,
         handler: Callable[[ToolCallRequest], ToolMessage | Command],
     ) -> ToolMessage | Command:
+        if request.tool_call["name"] not in ASYNC_TASK_TOOL_NAMES:
+            return handler(request)
+        if refused := self._refuse_off(request):
+            return refused
         if request.tool_call["name"] != START_TOOL:
             return handler(request)
-        prepared = self._prepare(request)
-        return prepared if isinstance(prepared, ToolMessage) else handler(prepared)
+        prepared = self._prepare(request, self._occupied(request))
+        if isinstance(prepared, ToolMessage):
+            return prepared
+        return self._record(prepared, handler(prepared))
 
     async def awrap_tool_call(
         self,
         request: ToolCallRequest,
         handler: Callable[[ToolCallRequest], Awaitable[ToolMessage | Command]],
     ) -> ToolMessage | Command:
+        if request.tool_call["name"] not in ASYNC_TASK_TOOL_NAMES:
+            return await handler(request)
+        if refused := self._refuse_off(request):
+            return refused
         if request.tool_call["name"] != START_TOOL:
             return await handler(request)
-        prepared = self._prepare(request)
+        prepared = self._prepare(request, await self._aoccupied(request))
         if isinstance(prepared, ToolMessage):
             return prepared
-        return await handler(prepared)
+        return self._record(prepared, await handler(prepared))
 
 
 # --- worker side ---------------------------------------------------------------
 
 NO_CONTEXT = "ERROR: no dataset context"
 _NO_CONTEXT_HINT = (
-    "HINT: start the worker from the analyst (start_async_task), which sends "
-    "the run context, or pass a run context with a dataset"
+    "HINT: start the worker from the analyst (start_async_task): the task must "
+    "begin with the analyst's [context ...] header"
 )
 
 
@@ -365,32 +497,32 @@ def _runtime_context(context: object) -> AnalystContext | None:
 
 
 def resolve_worker_context(context: object, stored: object) -> AnalystContext:
-    """The context worker tools run with: the narrower of run context and header.
+    """The context worker tools run with: the header, narrowed by the run context.
 
-    Raises ``_ContextError`` (fail closed) when neither names a dataset, the
-    header is malformed, or the two disagree on the dataset.
+    The header (stored from the thread's first human message) is required: the
+    server may coerce any run context, even ``{}``, into one with a default
+    dataset, so the run context alone never grants access. When present it
+    may only narrow the header: the same dataset, and the earlier cutoff.
+
+    Raises ``_ContextError`` (fail closed) with no header, a malformed header,
+    or a run context naming another dataset.
     """
-    runtime_ctx = _runtime_context(context)
-    header_ctx: AnalystContext | None = None
-    if isinstance(stored, Mapping):
-        if "invalid" in stored:
-            raise _ContextError(
-                f"ERROR: invalid context header ({stored['invalid']})\n"
-                + _NO_CONTEXT_HINT
-            )
-        header_ctx = AnalystContext(
-            dataset=stored["dataset"],
-            cutoff=stored.get("cutoff"),
-            model=stored.get("model"),
-            background=False,
-            question_id=stored.get("question_id"),
-        )
-    if runtime_ctx is None and header_ctx is None:
+    if not isinstance(stored, Mapping):
         raise _ContextError(f"{NO_CONTEXT}\n{_NO_CONTEXT_HINT}")
+    if "invalid" in stored:
+        raise _ContextError(
+            f"ERROR: invalid context header ({stored['invalid']})\n" + _NO_CONTEXT_HINT
+        )
+    header_ctx = AnalystContext(
+        dataset=stored["dataset"],
+        cutoff=stored.get("cutoff"),
+        model=stored.get("model"),
+        background=False,
+        question_id=stored.get("question_id"),
+    )
+    runtime_ctx = _runtime_context(context)
     if runtime_ctx is None:
-        return header_ctx  # type: ignore[return-value]
-    if header_ctx is None:
-        return replace(runtime_ctx, background=False)
+        return header_ctx
     if runtime_ctx.dataset != header_ctx.dataset:
         raise _ContextError(
             "ERROR: conflicting dataset context "
@@ -398,11 +530,10 @@ def resolve_worker_context(context: object, stored: object) -> AnalystContext:
         )
     cutoffs = [c for c in (runtime_ctx.cutoff, header_ctx.cutoff) if c is not None]
     return replace(
-        runtime_ctx,
+        header_ctx,
         cutoff=min(cutoffs) if cutoffs else None,
         model=runtime_ctx.model or header_ctx.model,
         question_id=runtime_ctx.question_id or header_ctx.question_id,
-        background=False,
     )
 
 
@@ -417,7 +548,8 @@ class WorkerContext(AgentMiddleware):
     """The worker's context and tool allowlist.
 
     ``before_agent`` reads the header from the thread's first human message
-    into state ``analyst_context`` (overwriting anything the input set). Every
+    into state ``analyst_context`` (a private key input cannot set; a stored
+    context is only replaced by a header that parses). Every
     tool call then runs with :func:`resolve_worker_context` as its context;
     without one it returns an error and the tool never runs. Only the data
     tools may run (no ``task``, file or shell tools): the deep agent's built-in
@@ -435,12 +567,20 @@ class WorkerContext(AgentMiddleware):
             allowed_tools = (t.name for t in DATA_TOOLS)
         self.allowed = frozenset(allowed_tools)
 
-    def before_agent(self, state: WorkerState, runtime: Runtime) -> dict[str, Any]:
-        return {"analyst_context": _header_state(state.get("messages") or [])}
+    def before_agent(
+        self, state: WorkerState, runtime: Runtime
+    ) -> dict[str, Any] | None:
+        # Sticky: summarization may compact the first message away, so a
+        # stored context is only replaced by a header that parses.
+        parsed = _header_state(state.get("messages") or [])
+        stored = state.get("analyst_context")
+        if stored is None or (parsed is not None and "invalid" not in parsed):
+            return {"analyst_context": parsed}
+        return None
 
     async def abefore_agent(
         self, state: WorkerState, runtime: Runtime
-    ) -> dict[str, Any]:
+    ) -> dict[str, Any] | None:
         return self.before_agent(state, runtime)
 
     def _filter(self, request: ModelRequest) -> ModelRequest:

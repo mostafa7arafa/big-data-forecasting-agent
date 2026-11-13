@@ -723,3 +723,114 @@ def test_task_cap_sees_thread_tasks(monkeypatch):
     )
     assert refused.status == "error" and "limit 3" in refused.content
     assert set(out["async_tasks"]) == set(tasks)
+
+
+def test_wake_up_run_narrowed_to_task_cutoff():
+    """A notification-started run with no cutoff runs under the task's cutoff."""
+    from langchain_core.messages.notification import add_notification_metadata
+
+    cutoff = date(2024, 1, 31)
+    note = add_notification_metadata(
+        HumanMessage(content=[{"type": "text", "text": "Task t1 finished."}]),
+        source="async_subagent",
+        data={"task_id": "t1", "agent_name": "worker", "status": "success"},
+    )
+    model = ScriptedModel(
+        script=[tool_turn(call("query_metrics", COUNT, "c1")), cite_total]
+    )
+    graph = build_graph(model=model)
+    out = asyncio.run(
+        graph.ainvoke(
+            {
+                "messages": [HumanMessage("how many events?"), note],
+                "background_contexts": {
+                    "t1": {"dataset": "events", "cutoff": cutoff.isoformat()}
+                },
+            },
+            context=AnalystContext(dataset="events", background=False),
+        )
+    )
+    assert "2024-01-31" in model.seen[0][0].content  # the system prompt
+    handle = handles_in(out["messages"])[0]
+    assert registry.get_service("events", cutoff).store.exists(handle)
+    assert not registry.get_service("events", None).store.exists(handle)
+    assert out["answer"].verification.label == "verified"
+    assert out["wake_context"] == {"dataset": "events", "cutoff": "2024-01-31"}
+
+
+def test_wake_context_cleared_on_user_turn():
+    model = ScriptedModel(
+        script=[no_plan(), tool_turn(call("query_metrics", COUNT, "c1")), cite_total]
+    )
+    graph = build_graph(model=model)
+    out = asyncio.run(
+        graph.ainvoke(
+            {
+                "messages": [HumanMessage("how many events?")],
+                "wake_context": {"dataset": "events", "cutoff": "2024-01-31"},
+            },
+            context=CTX,
+        )
+    )
+    assert out["wake_context"] is None
+    assert "2024-01-31" not in model.seen[1][0].content
+
+
+def test_start_async_task_through_the_graph(monkeypatch):
+    """A real start call: header injected, context forwarded, task recorded."""
+    from deepagents.middleware.async_subagents import _ClientCache
+
+    from analyst.background import AsyncSubAgentMiddleware, parse_context_header
+
+    launched: list[dict] = []
+
+    class FakeClient:
+        def __init__(self):
+            self.threads, self.runs = self, self
+
+        async def create(self, **kwargs):
+            if "assistant_id" in kwargs:  # runs.create
+                launched.append(kwargs)
+                return {"run_id": "run-1"}
+            return {"thread_id": "task-1"}  # threads.create
+
+    async def no_pull(self, tasks):
+        return {}
+
+    fake = FakeClient()
+    monkeypatch.setattr(_ClientCache, "get_async", lambda self, name: fake)
+    monkeypatch.setattr(AsyncSubAgentMiddleware, "_apull", no_pull)
+    cutoff = date(2024, 1, 31)
+    start = call(
+        "start_async_task",
+        {"description": "forecast daily events", "subagent_type": "worker"},
+        "s1",
+    )
+    model = ScriptedModel(
+        script=[
+            no_plan(),
+            tool_turn(start),
+            tool_turn(call("query_metrics", COUNT, "c1")),
+            cite_total,
+        ]
+    )
+    graph = build_graph(model=model)
+    out = asyncio.run(
+        graph.ainvoke(
+            {"messages": [HumanMessage("forecast daily events")]},
+            context=AnalystContext(dataset="events", cutoff=cutoff, background=True),
+        )
+    )
+    assert len(launched) == 1
+    run = launched[0]
+    assert run["assistant_id"] == "worker" and run["thread_id"] == "task-1"
+    description = run["input"]["messages"][0]["content"]
+    assert parse_context_header(description).cutoff == cutoff
+    assert description.endswith("forecast daily events")
+    assert run["context"]["dataset"] == "events"
+    assert run["context"]["cutoff"] == cutoff
+    assert out["async_tasks"]["task-1"]["status"] == "running"
+    assert out["background_contexts"]["task-1"] == {
+        "dataset": "events",
+        "cutoff": "2024-01-31",
+    }

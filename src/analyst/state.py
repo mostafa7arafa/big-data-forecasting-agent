@@ -69,7 +69,7 @@ class Plan(BaseModel):
 def _merge_tasks(
     existing: dict[str, Any] | None, update: dict[str, Any] | None
 ) -> dict[str, Any]:
-    """Background task records by task id; an update replaces a task's record."""
+    """Records by task id; an update replaces a task's record."""
     return {**(existing or {}), **(update or {})}
 
 
@@ -82,3 +82,7 @@ class AnalystState(TypedDict):
     retries: int
     #: background tasks started with ``start_async_task`` (deepagents records).
     async_tasks: NotRequired[Annotated[dict[str, Any], _merge_tasks]]
+    #: task id -> {"dataset", "cutoff"} each background task started under.
+    background_contexts: NotRequired[Annotated[dict[str, Any], _merge_tasks]]
+    #: this turn's woken task context (a run started by a notification), or None.
+    wake_context: NotRequired[dict[str, Any] | None]

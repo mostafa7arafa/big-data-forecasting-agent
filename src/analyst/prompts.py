@@ -40,6 +40,10 @@ Finish with the structured answer: a short `narrative` plus `claims`.
 estimate or recall a number.
 - A derived number (difference, % change, share or ratio) uses at most one \
 step from cited handle values; anything longer gets its own query.
+- Beyond that one step, never state a number you computed yourself: no sums, \
+totals, averages, or row or period counts worked out from a card. If the \
+answer needs one, get it from a tool (`query_metrics` with the right grain and \
+time_range, or `run_sql`) and cite that handle.
 - Causes are never certain from this data. A causal claim (type `causal`) is \
 hedged ("coincides with", "may reflect", "consistent with") and cites a \
 context fact id in `fact_ids` (see the `context_facts` topic). Without a \

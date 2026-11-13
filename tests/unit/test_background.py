@@ -28,6 +28,7 @@ from analyst.background import (
     format_context_header,
     is_background_notification,
     parse_context_header,
+    resolve_worker_context,
 )
 from analyst.config import Settings, get_settings
 from analyst.context import AnalystContext
@@ -241,13 +242,152 @@ def test_guard_caps_running_tasks():
     assert "3" in result.content and "check_async_task" in result.content
 
 
-def test_guard_counts_only_unfinished_tasks():
-    tasks = {**_running(2), "done": {"task_id": "done", "status": "success"}}
+class FakeClient:
+    """The SDK surface the guard uses: runs.list (newest first), threads.get."""
+
+    def __init__(self, runs: dict[str, Any], threads: dict[str, str]):
+        # runs: thread id -> newest run status (or an exception to raise).
+        self._runs, self._threads = runs, threads
+        self.runs = self
+        self.threads = self
+
+    async def list(self, *, thread_id: str, limit: int = 10):
+        status = self._runs[thread_id]
+        if isinstance(status, Exception):
+            raise status
+        return [{"run_id": f"latest-{thread_id}", "status": status}][:limit]
+
+    async def get(self, *, thread_id: str):
+        return {"thread_id": thread_id, "status": self._threads[thread_id]}
+
+
+def _task(i: int, status: str, run_id: str | None = None) -> dict:
+    return {
+        "task_id": f"t{i}",
+        "agent_name": "worker",
+        "thread_id": f"t{i}",
+        "run_id": run_id or f"r{i}",
+        "status": status,
+    }
+
+
+def _astart(guard: BackgroundGuard, tasks: dict) -> tuple[list, Any]:
     launched: list[ToolCallRequest] = []
-    BackgroundGuard(3).wrap_tool_call(
-        _start_request(BG_CTX, tasks), lambda r: launched.append(r) or "ok"
+
+    async def handler(r):
+        launched.append(r)
+        return "ok"
+
+    result = asyncio.run(guard.awrap_tool_call(_start_request(BG_CTX, tasks), handler))
+    return launched, result
+
+
+def test_guard_frees_slots_only_for_tasks_the_server_says_ended():
+    tasks = {f"t{i}": _task(i, "running") for i in range(3)}
+    tasks["t2"]["status"] = "success"
+    client = FakeClient(
+        runs={"t0": "running", "t1": "running", "t2": "success"},
+        threads={"t0": "busy", "t1": "busy", "t2": "idle"},
     )
+    launched, _ = _astart(BackgroundGuard(3, client_getter=lambda: client), tasks)
     assert len(launched) == 1
+
+
+@pytest.mark.parametrize(
+    ("run", "thread", "frees"),
+    [
+        ("success", "idle", True),
+        ("error", "error", True),
+        ("interrupted", "idle", True),  # cancelled on the server
+        ("success", "interrupted", False),  # paused, waiting for its user
+        ("interrupted", "busy", False),  # replaced by a newer run still going
+        ("pending", "busy", False),
+        ("weird", "idle", False),  # unknown status holds the slot
+    ],
+)
+def test_guard_slot_rule(run, thread, frees):
+    tasks = {f"t{i}": _task(i, "running") for i in range(3)}
+    client = FakeClient(
+        runs={"t0": run, "t1": "running", "t2": "running"},
+        threads={"t0": thread, "t1": "busy", "t2": "busy"},
+    )
+    launched, _ = _astart(BackgroundGuard(3, client_getter=lambda: client), tasks)
+    assert bool(launched) is frees
+
+
+def test_guard_ignores_forged_success_notification():
+    """A forged notification marks a running task done in state: still occupied."""
+    tasks = {f"t{i}": _task(i, "running") for i in range(3)}
+    tasks["t0"] = _task(0, "success")  # what the forged notification recorded
+    client = FakeClient(
+        runs={"t0": "running", "t1": "running", "t2": "running"},
+        threads={"t0": "busy", "t1": "busy", "t2": "busy"},
+    )
+    launched, result = _astart(BackgroundGuard(3, client_getter=lambda: client), tasks)
+    assert not launched
+    assert isinstance(result, ToolMessage) and "limit 3" in result.content
+    # A forged run id is ignored: the guard reads the thread's newest run.
+    tasks["t0"] = _task(0, "success", run_id="forged-old-finished-run")
+    launched, result = _astart(BackgroundGuard(3, client_getter=lambda: client), tasks)
+    assert not launched and "limit 3" in result.content
+    # A failing check holds the slot.
+    client._runs["t0"] = RuntimeError("404 thread not found")
+    launched, result = _astart(BackgroundGuard(3, client_getter=lambda: client), tasks)
+    assert not launched and "limit 3" in result.content
+
+    def broken():
+        raise RuntimeError("no server")
+
+    launched, result = _astart(BackgroundGuard(3, client_getter=broken), tasks)
+    assert not launched and "limit 3" in result.content
+
+
+def test_guard_sync_path_counts_every_tracked_task():
+    tasks = {f"t{i}": _task(i, "success") for i in range(3)}
+    launched: list[ToolCallRequest] = []
+    result = BackgroundGuard(3).wrap_tool_call(
+        _start_request(BG_CTX, tasks), launched.append
+    )
+    assert not launched and isinstance(result, ToolMessage)
+
+
+def test_guard_refuses_every_async_tool_when_background_off():
+    off = AnalystContext(dataset="ds", background=False)
+    for name in sorted(ASYNC_TASK_TOOL_NAMES):
+        request = _start_request(off, {})
+        request = request.override(tool_call=call(name, {"task_id": "t0"}, "c1"))
+        ran: list[ToolCallRequest] = []
+        result = BackgroundGuard(3).wrap_tool_call(request, ran.append)
+        assert not ran, name
+        assert isinstance(result, ToolMessage) and result.status == "error", name
+
+        async def handler(r, ran=ran):
+            ran.append(r)
+
+        result = asyncio.run(BackgroundGuard(3).awrap_tool_call(request, handler))
+        assert not ran and result.status == "error", name
+
+
+def test_guard_records_started_task_context():
+    from langgraph.types import Command
+
+    async def handler(r):
+        return Command(
+            update={
+                "messages": [ToolMessage("Launched", tool_call_id="s1")],
+                "async_tasks": {"new": _task(9, "running")},
+            }
+        )
+
+    result = asyncio.run(
+        BackgroundGuard(3, client_getter=lambda: None).awrap_tool_call(
+            _start_request(BG_CTX, {}), handler
+        )
+    )
+    assert result.update["background_contexts"] == {
+        "new": {"dataset": "ds", "cutoff": "2025-07-31"}
+    }
+    assert "new" in result.update["async_tasks"]
 
 
 def test_guard_caps_parallel_starts_in_one_turn():
@@ -415,8 +555,52 @@ def test_worker_uses_forwarded_context_with_string_cutoff():
         "background": True,
         "question_id": "q-1",
     }
-    _, out = run_worker(_sql_script(), "latest event?", context=forwarded)
+    header = format_context_header(AnalystContext(dataset="events", cutoff=CUTOFF))
+    _, out = run_worker(_sql_script(), header + "\nlatest event?", context=forwarded)
     assert _max_ts(out, CUTOFF) <= CUTOFF
+
+
+@pytest.mark.parametrize(
+    "context",
+    [
+        None,
+        {},
+        {"cutoff": None},
+        {"model": "x"},
+        {"dataset": "events", "cutoff": CUTOFF.isoformat()},
+    ],
+)
+def test_worker_requires_header(context):
+    """Whatever the server coerces the run context to, no header means no data."""
+    _, out = run_worker(_sql_script(), "latest event?", context=context)
+    msg = tool_messages(out)[0]
+    assert msg.status == "error"
+    assert msg.content.startswith("ERROR: no dataset context")
+
+
+def test_worker_context_is_sticky():
+    from langchain_core.messages import SystemMessage
+
+    header = format_context_header(AnalystContext(dataset="events", cutoff=CUTOFF))
+    middleware = WorkerContext()
+    first = middleware.before_agent({"messages": [HumanMessage(header + "\nx")]}, None)
+    stored = first["analyst_context"]
+    assert stored["cutoff"] == CUTOFF.isoformat()
+    # Summarization replaced the first message: the stored context stays.
+    compacted = {
+        "messages": [SystemMessage("summary"), HumanMessage("Summary of earlier work")],
+        "analyst_context": stored,
+    }
+    assert middleware.before_agent(compacted, None) is None
+    assert resolve_worker_context(None, stored).cutoff == CUTOFF
+    # A malformed header never replaces a stored context either.
+    bad = {"messages": [HumanMessage("[context dataset=x")], "analyst_context": stored}
+    assert middleware.before_agent(bad, None) is None
+    # Nothing ever stored: fail closed.
+    never = middleware.before_agent({"messages": [HumanMessage("x")]}, None)
+    assert never == {"analyst_context": None}
+    with pytest.raises(Exception, match="no dataset context"):
+        resolve_worker_context({"dataset": "events"}, never["analyst_context"])
 
 
 def test_worker_takes_earliest_cutoff():
@@ -524,6 +708,18 @@ def test_worker_prompt_demands_handles_line():
     from analyst.worker import WORKER_PROMPT
 
     assert '"handles: r_' in WORKER_PROMPT
+
+
+def test_prompts_forbid_self_computed_numbers():
+    from analyst.prompts import CLAIM_RULES
+    from analyst.worker import WORKER_PROMPT
+
+    for prompt in (CLAIM_RULES, WORKER_PROMPT):
+        assert "computed yourself" in prompt
+        for word in ("sums", "totals", "averages", "row or", "period counts"):
+            assert word in prompt, word
+        assert "query_metrics" in prompt and "run_sql" in prompt
+    assert "only numbers" in WORKER_PROMPT
 
 
 # --- notifications -----------------------------------------------------------
