@@ -22,6 +22,7 @@ from analyst.forecasting.core import ProgressFn, prepare_series
 from analyst.forecasting.core import forecast as run_forecast
 from analyst.forecasting.models import DEFAULTS, candidate_models
 from analyst.memory.files import load_memory
+from analyst.memory.knowledge import describe_dimensions, describe_metrics
 from analyst.semantic.compiler import (
     FilterSpec,
     MetricQuery,
@@ -139,9 +140,9 @@ class DataService:
         if is_result_handle_id(target) and self.store.exists(target):
             return self.store.card(target).render()
         if target == "metrics":
-            return _describe_metrics(self.memory.semantic)
+            return describe_metrics(self.memory.semantic)
         if target == "dimensions":
-            return _describe_dimensions(self.memory.semantic)
+            return describe_dimensions(self.memory.semantic)
         if target.startswith("dimension:"):
             name = target.split(":", 1)[1]
             try:
@@ -509,32 +510,6 @@ def _backtest_rows(kept) -> list[dict]:
             }
         )
     return rows
-
-
-def _describe_metrics(model: SemanticModel) -> str:
-    lines: list[str] = []
-    for metric in model.metrics:
-        parts = [metric.name]
-        if metric.synonyms:
-            parts.append(f"synonyms={metric.synonyms}")
-        if metric.unit:
-            parts.append(f"unit={metric.unit}")
-        if metric.description:
-            parts.append(metric.description)
-        lines.append(": ".join(parts))
-    return "\n".join(lines)
-
-
-def _describe_dimensions(model: SemanticModel) -> str:
-    lines: list[str] = []
-    for dimension in model.dimensions:
-        parts = [dimension.name]
-        if dimension.synonyms:
-            parts.append(f"synonyms={dimension.synonyms}")
-        if dimension.description:
-            parts.append(dimension.description)
-        lines.append(": ".join(parts))
-    return "\n".join(lines)
 
 
 def _describe_dimension_values(

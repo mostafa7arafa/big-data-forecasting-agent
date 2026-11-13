@@ -100,6 +100,15 @@ class ContextFact(MemoryItem):
     label: str
     kind: Literal["holiday", "policy", "data"]
 
+    @property
+    def id(self) -> str:
+        """Stable citation id, e.g. ``cf_2024-01-02_holiday``.
+
+        Curated memory keeps one fact per (date, kind); claims cite this id
+        instead of the prose label.
+        """
+        return f"cf_{self.date.isoformat()}_{self.kind}"
+
 
 class Memory(BaseModel):
     semantic: SemanticModel
@@ -107,6 +116,25 @@ class Memory(BaseModel):
     series: list[SeriesSpec]
     context_facts: list[ContextFact]
     recap: str
+
+    def as_of(self, cutoff: date | None) -> "Memory":
+        """The memory as it stood at ``cutoff``.
+
+        Dated items whose start/date falls after the cutoff are dropped; an
+        item that starts before it is kept even when it ends later. The recap
+        is free prose and cannot be date-filtered, so it is emptied.
+        """
+        if cutoff is None:
+            return self
+        return self.model_copy(
+            update={
+                "quirks": [item for item in self.quirks if item.start <= cutoff],
+                "context_facts": [
+                    item for item in self.context_facts if item.date <= cutoff
+                ],
+                "recap": "",
+            }
+        )
 
 
 def _match[T: Dimension | Metric](items: list[T], name: str, kind: str) -> T:
