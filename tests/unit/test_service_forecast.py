@@ -135,6 +135,8 @@ def test_forecast_from_query_handle(daily_by_area):
         "id_col": "area",
         "time_col": "period",
         "levels": [80, 95],
+        "candidates": forecast_card.meta["candidates"],
+        "candidates_source": "default",
     }
     assert forecast_card.source == json.dumps(
         expected_source, separators=(",", ":"), sort_keys=True

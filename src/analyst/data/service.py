@@ -17,7 +17,7 @@ from analyst.data.dataset import DatasetConfig
 from analyst.data.engine import Coverage, Engine
 from analyst.data.gate import get_gate
 from analyst.data.results import ResultStore, SummaryCard, is_result_handle_id
-from analyst.errors import InvalidRequestError
+from analyst.errors import InvalidRequestError, UnknownNameError
 from analyst.forecasting.core import ProgressFn, prepare_series
 from analyst.forecasting.core import forecast as run_forecast
 from analyst.forecasting.models import DEFAULTS, candidate_models
@@ -170,8 +170,13 @@ class DataService:
         id_col: str | None,
         time_col: str,
         levels,
-    ) -> str:
-        return json.dumps(
+    ) -> tuple[str, list | None]:
+        """Cache key plus the candidate models it was built from."""
+        query_meta = self.store.card(handle_id).meta.get("query")
+        models, names, candidates_source = self._candidates(
+            value_col=value_col, id_col=id_col, freq=freq, query_meta=query_meta
+        )
+        source = json.dumps(
             {
                 "input_handle": handle_id,
                 "freq": freq,
@@ -179,11 +184,14 @@ class DataService:
                 "value_col": value_col,
                 "id_col": id_col,
                 "time_col": time_col,
-                "levels": list(levels),
+                "levels": sorted(levels),
+                "candidates": names,
+                "candidates_source": candidates_source,
             },
             separators=(",", ":"),
             sort_keys=True,
         )
+        return source, models
 
     def forecast_is_cached(
         self,
@@ -197,15 +205,18 @@ class DataService:
     ) -> bool:
         if horizon is None:
             horizon = DEFAULTS[freq]["horizon"]
-        source = self._forecast_source(
-            handle_id,
-            freq=freq,
-            horizon=horizon,
-            value_col=value_col,
-            id_col=id_col,
-            time_col=time_col,
-            levels=_FORECAST_LEVELS,
-        )
+        try:
+            source, _ = self._forecast_source(
+                handle_id,
+                freq=freq,
+                horizon=horizon,
+                value_col=value_col,
+                id_col=id_col,
+                time_col=time_col,
+                levels=_FORECAST_LEVELS,
+            )
+        except UnknownNameError:
+            return False
         return self.store.lookup("forecast", source) is not None
 
     def estimate_forecast_s(
@@ -270,7 +281,7 @@ class DataService:
             )
         if horizon is None:
             horizon = DEFAULTS[freq]["horizon"]
-        source = self._forecast_source(
+        source, models = self._forecast_source(
             handle_id,
             freq=freq,
             horizon=horizon,
@@ -289,6 +300,7 @@ class DataService:
             return self._compute_forecast(
                 handle_id,
                 source=source,
+                models=models,
                 time_col=time_col,
                 value_col=value_col,
                 id_col=id_col,
@@ -304,6 +316,7 @@ class DataService:
         handle_id: str,
         *,
         source: str,
+        models: list | None,
         time_col: str,
         value_col: str,
         id_col: str | None,
@@ -367,7 +380,7 @@ class DataService:
                 prepared.adjustments.append(
                     f"{uid} ends {end.date()}, before the series end {series_end.date()}"
                 )
-        models, candidate_names, candidates_source = self._candidates(
+        _, candidate_names, candidates_source = self._candidates(
             value_col=value_col, id_col=id_col, freq=freq, query_meta=query_meta
         )
         if budget_s is None:
@@ -391,12 +404,15 @@ class DataService:
         frame = run.forecast.loc[:, list(_FORECAST_COLUMNS)]
         forecast_table = pa.Table.from_pandas(frame, preserve_index=False)
         kept = _kept_scores(run.backtest.scores, run.model)
+        # A budget-truncated run is returned but never served from the cache.
+        complete = run.backtest.windows_used >= run.backtest.windows
         backtest_card = self.store.save(
             pa.Table.from_pandas(kept, preserve_index=False),
             produced_by="backtest",
             source=source + ":backtest",
             governed=input_card.governed,
             elapsed_s=elapsed_s,
+            index=complete,
         )
         meta = {
             "model": run.model,
@@ -423,6 +439,7 @@ class DataService:
             elapsed_s=elapsed_s,
             notes=notes,
             meta=meta,
+            index=complete,
         )
 
 

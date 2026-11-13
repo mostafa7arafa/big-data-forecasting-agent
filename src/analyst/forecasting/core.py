@@ -292,9 +292,10 @@ def backtest(
     without a median).
     On a zero-error baseline, relative MAE is 1 for zero error and inf otherwise.
     Zero training scale yields MASE 0 for perfect predictions and inf otherwise.
-    Each rolling-origin window is fitted on its own truncated series, oldest
-    first, so ``progress`` can report "backtest window i/n" and ``budget_s`` can
-    stop the loop once at least four windows are done and the budget is spent.
+    Each rolling-origin window is fitted on its own truncated series,
+    newest first, so ``progress`` can report "backtest window i/n" and
+    ``budget_s`` can stop the loop (keeping the most recent windows) once at
+    least four windows are done and the budget is spent.
     """
     _check_freq(freq)
     series = PreparedSeries(series.df, [])
@@ -338,8 +339,9 @@ def backtest(
     for i in range(1, windows + 1):
         if progress is not None:
             progress(f"backtest window {i}/{windows}")
-        # Window i ends step * (windows - i) periods before the series end.
-        window_df = series.df.loc[sizes >= step * (windows - i)]
+        # Newest first, so a budget stop keeps the most recent windows: window i
+        # ends step * (i - 1) periods before the series end.
+        window_df = series.df.loc[sizes >= step * (i - 1)]
         for model in ordered:
             name = str(model)
             if name in failed:

@@ -52,16 +52,26 @@ def test_windowed_backtest_matches_batched():
 
 def test_progress_reports_each_window():
     msgs = []
-    backtest(daily(n=400), freq="D", models=fast_models(), progress=msgs.append)
+    backtest(daily(n=400, noise=True), freq="D", models=fast_models(), progress=msgs.append)
     assert msgs[0] == "backtest window 1/12"
     assert msgs[-1].startswith("backtest window 12/12")
     assert len(msgs) == 12
 
 
-def test_budget_stops_after_min_windows():
+def test_budget_stops_after_min_windows(monkeypatch):
+    from analyst.forecasting import core
+
+    ends = []
+
+    class Spy(core.StatsForecast):
+        def cross_validation(self, df, **kwargs):
+            ends.append(df.ds.max())
+            return super().cross_validation(df=df, **kwargs)
+
+    monkeypatch.setattr(core, "StatsForecast", Spy)
     ticks = itertools.count()
     report = backtest(
-        daily(n=400),
+        daily(n=400, noise=True),
         freq="D",
         models=fast_models(),
         budget_s=100,
@@ -69,19 +79,24 @@ def test_budget_stops_after_min_windows():
     )
     assert report.windows_used == 4
     assert report.windows == 12
+    # Newest-first: the 4 kept windows are the 4 most recent origins.
+    last = daily(n=400, noise=True).df.ds.max()
+    assert sorted(set(ends), reverse=True) == [
+        last - pd.Timedelta(days=7 * k) for k in range(4)
+    ]
     assert "backtest stopped at 4/12 windows (time budget 100 s)" in report.adjustments
     assert set(report.scores.model) == {"AutoETS", "SeasonalNaive"}
 
 
 def test_budget_not_exceeded_runs_all_windows():
     report = backtest(
-        daily(n=400), freq="D", models=fast_models(), budget_s=1e9
+        daily(n=400, noise=True), freq="D", models=fast_models(), budget_s=1e9
     )
     assert report.windows_used == 12
     assert not any("time budget" in a for a in report.adjustments)
 
 
-def _fake_run(*, windows_used=3):
+def _fake_run(*, windows_used=3, windows=3):
     scores = pd.DataFrame(
         [
             {"unique_id": "x", "model": m, "mae": 1.0, "mase": 1.0, "relative_mae": r,
@@ -93,7 +108,7 @@ def _fake_run(*, windows_used=3):
         [{"unique_id": "x", "ds": datetime(2024, 3, 1), "yhat": 1.0, "lo_80": 0.5,
           "hi_80": 1.5, "lo_95": 0.2, "hi_95": 1.8}]
     )
-    report = BacktestReport(scores, "AutoETS", True, 3, 1, [], windows_used)
+    report = BacktestReport(scores, "AutoETS", True, windows, 1, [], windows_used)
     return ForecastRun(frame, "AutoETS", datetime(2024, 2, 29), report, [])
 
 
@@ -189,3 +204,40 @@ def test_estimate_forecast_s_monotonic(synthetic_service):
     ).handle_id
     many = svc.estimate_forecast_s(by_area, id_col="region_id", freq="D")
     assert 0 < one < many
+
+
+def test_budget_truncated_forecast_not_cached(synthetic_service, monkeypatch):
+    svc = synthetic_service
+    h = _daily_handle(svc)
+    monkeypatch.setattr(
+        "analyst.data.service.run_forecast",
+        lambda series, **kw: _fake_run(windows_used=4, windows=12),
+    )
+    kw = {"value_col": "event_count", "freq": "D", "horizon": 7}
+    card = svc.forecast(h, **kw)
+    assert card.meta["windows_used"] == 4
+    assert not svc.forecast_is_cached(h, id_col=None, **kw)
+    calls = []
+    monkeypatch.setattr(
+        "analyst.data.service.run_forecast",
+        lambda series, **k: calls.append(1) or _fake_run(),
+    )
+    full = svc.forecast(h, **kw)
+    assert calls and full.meta["windows_used"] == 3
+    assert svc.forecast_is_cached(h, id_col=None, **kw)
+
+
+def test_cache_key_tracks_candidates_and_level_order(synthetic_service, monkeypatch):
+    svc = synthetic_service
+    h = _daily_handle(svc)
+    monkeypatch.setattr(
+        "analyst.data.service.run_forecast", lambda series, **kw: _fake_run()
+    )
+    kw = {"value_col": "event_count", "freq": "D", "horizon": 7}
+    svc.forecast(h, levels=(95, 80), **kw)
+    assert svc.forecast_is_cached(h, id_col=None, **kw)
+    spec = svc.memory.series[0].model_copy(
+        update={"recommended_models": ["AutoETS"], "recommended_models_status": "approved"}
+    )
+    svc.memory = svc.memory.model_copy(update={"series": [spec]})
+    assert not svc.forecast_is_cached(h, id_col=None, **kw)

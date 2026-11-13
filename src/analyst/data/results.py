@@ -156,7 +156,9 @@ class ResultStore:
         elapsed_s: float,
         notes: list[str] = (),
         meta: dict | None = None,
+        index: bool = True,
     ) -> SummaryCard:
+        """Persist a result; ``index=False`` keeps it out of lookup() (no caching)."""
         meta = meta or {}
         handle_id = _make_handle(source, produced_by, meta)
         card = _build_card(
@@ -182,11 +184,15 @@ class ResultStore:
             card_tmp.write_text(
                 json.dumps(_card_to_json(card), indent=2), encoding="utf-8"
             )
-            index_tmp.write_text(json.dumps({"handle_id": handle_id}), encoding="utf-8")
+            if index:
+                index_tmp.write_text(
+                    json.dumps({"handle_id": handle_id}), encoding="utf-8"
+                )
             # Card last: its presence means the parquet is complete.
             os.replace(pq_tmp, pq_path)
             os.replace(card_tmp, card_path)
-            os.replace(index_tmp, index_path)
+            if index:
+                os.replace(index_tmp, index_path)
         finally:
             for tmp in (pq_tmp, card_tmp, index_tmp):
                 tmp.unlink(missing_ok=True)
