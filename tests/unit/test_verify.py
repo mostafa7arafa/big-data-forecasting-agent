@@ -1,6 +1,7 @@
 from datetime import date
 
 import pyarrow as pa
+import pytest
 from langchain_core.messages import HumanMessage, ToolMessage
 
 from analyst.data.results import ResultStore
@@ -418,3 +419,299 @@ def test_untraceable_perf_and_cell_cap(tmp_path):
 def test_clock_times_with_am_pm():
     for text in ["at 10am", "at 10 am", "at 10 pm", "10 PM"]:
         assert extract_numbers(text) == [], text
+
+
+# --- final fix wave ------------------------------------------------------------
+
+
+def _forecast_handle(store):
+    import datetime as dt
+
+    card = store.save(
+        pa.table(
+            {
+                "unique_id": ["series"],
+                "ds": [dt.date(2025, 8, 1)],
+                "yhat": [2_912_345.0],
+                "lo_80": [2_701_000.0],
+                "hi_80": [3_105_000.0],
+                "lo_95": [2_598_000.0],
+                "hi_95": [3_220_000.0],
+            }
+        ),
+        produced_by="forecast",
+        source="f",
+        governed=True,
+        elapsed_s=0.0,
+        meta={"levels": [80, 95]},
+    )
+    return card.handle_id
+
+
+def _forecast_claim(h):
+    return Claim(
+        text="August forecast",
+        type="forecast",
+        values=[2_912_345.0, 2_701_000.0, 3_105_000.0],
+        handles=[h],
+    )
+
+
+def test_forecast_interval_levels_are_traceable(tmp_path):
+    from analyst.verify import load_handle_info
+
+    store = ResultStore(tmp_path)
+    h = _forecast_handle(store)
+    handles = {h: load_handle_info(store, h)}
+    q = "Forecast total trips for August 2025."
+    for narrative in [
+        "August is forecast at 2.91M trips (80% interval 2.70M to 3.11M).",
+        (
+            "August is forecast at 2.91M trips, with an 80% interval of 2.70M to "
+            "3.11M and a 95% interval of 2.60M to 3.22M."
+        ),
+        "August is forecast at 2.91M trips; the 80% band is 2.70M to 3.11M.",
+        (
+            "August is forecast at 2.91M trips, between 2.70M and 3.11M with 80% "
+            "probability."
+        ),
+    ]:
+        result = run(
+            Answer(narrative=narrative, claims=[_forecast_claim(h)]),
+            handles,
+            store,
+            question=q,
+        )
+        assert result.label == "verified", (narrative, result.problems)
+
+
+def test_interval_level_phrases_are_not_claims():
+    for text in [
+        "80% interval",
+        "95% prediction interval",
+        "80% band",
+        "95% PI",
+        "95% confidence",
+    ]:
+        assert extract_numbers(text) == [], text
+    # a level that is not an interval phrase is still a claim
+    assert [n.value for n in extract_numbers("80% of trips")] == [80]
+
+
+def test_levels_do_not_trace_without_a_forecast_handle(tmp_path):
+    store = ResultStore(tmp_path)
+    h = save(store, [2_912_345.0])
+    answer = Answer(
+        narrative="Card payments were 95% of trips.",
+        claims=[Claim(text="c", type="descriptive", values=[2_912_345.0], handles=[h])],
+    )
+    assert run(answer, {}, store).label == "not_verified"
+
+
+def test_question_number_words_excluded():
+    got = extract_numbers("The top 5 zones were", exclude="What were the top five zones?")
+    assert got == []
+    got = extract_numbers("The top 12 zones", exclude="Show the Twelve busiest zones")
+    assert got == []
+    assert [n.value for n in extract_numbers("The top 5 zones", exclude="top zones")] == [5]
+
+
+def test_month_name_does_not_swallow_numbers():
+    def raws(text):
+        return [n.raw for n in extract_numbers(text)]
+
+    assert raws("In March 3.2M trips were recorded") == ["3.2M"]
+    assert raws("In March 3,412,005 trips were recorded") == ["3,412,005"]
+    assert raws("In March, 3.2M trips") == ["3.2M"]
+    assert raws("In May 45k trips") == ["45k"]
+    assert raws("In June 12% more trips") == ["12%"]
+    assert raws("In March 45 zones were busy") == ["45"]
+    assert raws("On Feb 23 25,812 trips") == ["25,812"]
+    assert raws("On Feb 23 2894704 trips") == ["2894704"]
+    assert raws("March 3, 2025 had 25,812 trips") == ["25,812"]
+    assert raws("Jan 1–7 saw 3.1M trips") == ["3.1M"]
+    assert raws("Jan 1–7, 2025: 3.1M trips") == ["3.1M"]
+
+
+def test_answer_without_claims_is_not_verified(tmp_path):
+    store = ResultStore(tmp_path)
+    plain = run(Answer(narrative="JFK is the busiest pickup zone.", claims=[]), {}, store)
+    assert plain.label == "not_verified"
+    assert plain.reason == "no claims (decline or acknowledgement)"
+    h = save(store, [2_894_704.0])
+    handles = {h: info(h, [2_894_704.0])}
+    stated = run(Answer(narrative="There were 2,894,704 trips.", claims=[]), handles, store)
+    assert stated.label == "not_verified" and stated.reason == "no evidence cited"
+
+
+def test_decline_is_not_verified_declined(tmp_path):
+    store = ResultStore(tmp_path)
+    answer = Answer(
+        narrative="The data ends on 2026-01-31, so March 2026 is not available.",
+        claims=[],
+    )
+    result = run(answer, {}, store, question="How many trips in March 2026?")
+    assert result.label == "not_verified"
+    assert result.reason == "no claims (decline or acknowledgement)"
+
+
+def test_claim_without_handles_is_not_verified(tmp_path):
+    store = ResultStore(tmp_path)
+    answer = Answer(
+        narrative="Manhattan dominates.",
+        claims=[Claim(text="Manhattan is busiest", type="descriptive")],
+    )
+    result = run(answer, {}, store)
+    assert result.label == "not_verified" and "claim cites no evidence" in result.problems
+
+
+def test_collect_handles_skips_artifacts_missing_from_store(tmp_path):
+    store = ResultStore(tmp_path)
+    tool = ToolMessage(
+        content="card",
+        tool_call_id="x",
+        artifact={"handle_id": "r_0123456789", "produced_by": "query_metrics", "governed": True},
+    )
+    assert collect_handles([tool], store) == {}
+
+
+def _memory_with_quirk() -> Memory:
+    from analyst.semantic.model import Quirk
+
+    memory = make_memory()
+    quirk = Quirk(kind="gap", start=date(2023, 9, 21), end=date(2023, 9, 24))
+    late = Quirk(kind="anomaly", start=date(2026, 6, 1))
+    return memory.model_copy(update={"quirks": [quirk, late]})
+
+
+def _run_q(answer, store, cutoff=date(2026, 3, 1)):
+    return verify_answer(
+        answer,
+        question="",
+        handles={},
+        memory=_memory_with_quirk(),
+        cutoff=cutoff,
+        store=store,
+    )
+
+
+def test_causal_cue_in_narrative_is_checked(tmp_path):
+    store = ResultStore(tmp_path)
+    h = save(store, [2_894_704.0])
+    answer = Answer(
+        narrative="Trips fell to 2.89M because of the snowstorm.",
+        claims=[Claim(text="Trips were 2.89M", type="descriptive", values=[2_894_704.0], handles=[h])],
+    )
+    result = _run_q(answer, store)
+    assert result.label == "not_verified"
+    assert "unsupported causal claim" in result.problems
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Trips fell, due to the storm.",
+        "The drop was CAUSED by weather.",
+        "Demand was driven by tourism.",
+        "This led to fewer trips.",
+        "Fewer trips as a result of the storm.",
+        "Fewer trips owing to rain.",
+        "More trips thanks to the parade.",
+        "The storm resulted in fewer trips.",
+        "The drop is attributable to rain.",
+    ],
+)
+def test_causal_cues_in_claim_text(tmp_path, text):
+    store = ResultStore(tmp_path)
+    h = save(store, [1.0])
+    answer = Answer(
+        narrative="Trips changed.",
+        claims=[Claim(text=text, type="descriptive", handles=[h])],
+    )
+    assert "unsupported causal claim" in _run_q(answer, store).problems
+
+
+def test_hedged_cause_needs_a_valid_cited_fact(tmp_path):
+    store = ResultStore(tmp_path)
+    h = save(store, [1.0])
+
+    def answer(narrative, fact_ids):
+        return Answer(
+            narrative=narrative,
+            claims=[Claim(text="Trips changed", type="descriptive", handles=[h], fact_ids=fact_ids)],
+        )
+
+    hedged = "The drop may be due to congestion pricing."
+    assert _run_q(answer(hedged, []), store).label == "not_verified"
+    assert _run_q(answer(hedged, ["policy:2025-01-05"]), store).label == "verified"
+    late = answer(hedged, ["policy:2026-06-01"])
+    assert _run_q(late, store).label == "not_verified"
+    unhedged = answer("The drop was due to congestion pricing.", ["policy:2025-01-05"])
+    assert _run_q(unhedged, store).label == "not_verified"
+
+
+def test_quirk_ids_license_hedged_causes(tmp_path):
+    store = ResultStore(tmp_path)
+    h = save(store, [1.0])
+    answer = Answer(
+        narrative="The drop coincides with the known data gap.",
+        claims=[
+            Claim(
+                text="The drop coincides with the known data gap",
+                type="causal",
+                handles=[h],
+                fact_ids=["gap:2023-09-21"],
+            )
+        ],
+    )
+    assert _run_q(answer, store).label == "verified"
+    late = answer.model_copy(
+        update={
+            "claims": [
+                answer.claims[0].model_copy(update={"fact_ids": ["anomaly:2026-06-01"]})
+            ]
+        }
+    )
+    assert _run_q(late, store).reason == "unsupported causal claim"
+
+
+def test_causal_cue_word_boundaries(tmp_path):
+    store = ResultStore(tmp_path)
+    h = save(store, [1.0])
+    answer = Answer(
+        narrative="Becauseless prose; the overdue report is ready.",
+        claims=[Claim(text="ok", type="descriptive", handles=[h])],
+    )
+    assert _run_q(answer, store).label == "verified"
+
+
+def test_causal_claim_text_is_scanned_per_sentence(tmp_path):
+    store = ResultStore(tmp_path)
+    h = save(store, [1.0])
+    answer = Answer(
+        narrative="Trips changed.",
+        claims=[
+            Claim(
+                text="This may reflect the fee. Trips fell because of it.",
+                type="causal",
+                handles=[h],
+                fact_ids=["policy:2025-01-05"],
+            )
+        ],
+    )
+    assert _run_q(answer, store).label == "not_verified"
+
+
+def test_decline_with_a_causal_cue_is_not_a_causal_claim(tmp_path):
+    store = ResultStore(tmp_path)
+    answer = Answer(
+        narrative="I can't answer that because the data ends on 2026-01-31.",
+        claims=[],
+    )
+    result = _run_q(answer, store)
+    assert result.label == "not_verified"
+    assert result.reason == "no claims (decline or acknowledgement)"
+    assert "unsupported causal claim" not in result.problems
+    # with a number stated it is an answer, and the scan applies
+    stated = Answer(narrative="Trips fell to 2.89M because of the storm.", claims=[])
+    assert "unsupported causal claim" in _run_q(stated, store).problems

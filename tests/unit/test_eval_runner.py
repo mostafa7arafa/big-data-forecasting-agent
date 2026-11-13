@@ -202,3 +202,57 @@ def test_summary_metrics_and_format():
     text = format_summary(s, experiment="exp-1", url="https://x/y")
     assert "exp-1 (https://x/y)" in text and "p95 5.0s" in text and "$0.0200" in text
     assert "n/a" in format_summary(summarize([{"category": "a", "passed": True, "results": []}]))
+
+
+# --- final fix wave ------------------------------------------------------------
+
+
+def _verdict(label, reason="r"):
+    return {"category": "lookup", "passed": label != "not_verified", "results": [],
+            "outputs": {"verification": {"label": label, "reason": reason}}}
+
+
+def test_label_distribution_summary():
+    rows = [
+        _verdict("verified"),
+        _verdict("verified"),
+        _verdict("verified_off_model"),
+        _verdict("not_verified", "untraced number 12%"),
+        _verdict("not_verified", "untraced number 12%"),
+        _verdict("not_verified", "no evidence cited"),
+        {"category": "lookup", "passed": False, "results": [], "outputs": {"error": "boom"}},
+    ]
+    s = summarize(rows)
+    assert s["label_distribution"] == {
+        "verified": 2, "verified_off_model": 1, "not_verified": 3, "no_label": 1,
+    }
+    assert s["not_verified_reasons"] == [("untraced number 12%", 2), ("no evidence cited", 1)]
+    text = format_summary(s)
+    line = next(x for x in text.splitlines() if x.startswith("Labels:"))
+    assert "verified 2" in line and "verified_off_model 1" in line and "not_verified 3" in line
+    assert "no_label 1" in line
+    assert "untraced number 12% (2)" in text
+
+
+def _eval_script():
+    import importlib.util
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parents[2] / "scripts/eval_agent.py"
+    spec = importlib.util.spec_from_file_location("eval_agent_script", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_experiment_prefix_names_the_resolved_model(monkeypatch):
+    from analyst.config import get_settings
+
+    script = _eval_script()
+    monkeypatch.setenv("ANALYST_MODEL", "openai:gpt-6-luna")
+    get_settings.cache_clear()
+    try:
+        assert script.experiment_prefix(None, "abc1234") == "openai-gpt-6-luna-abc1234"
+        assert script.experiment_prefix("anthropic:claude-x", "abc1234") == "anthropic-claude-x-abc1234"
+    finally:
+        get_settings.cache_clear()

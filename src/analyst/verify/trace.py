@@ -24,7 +24,9 @@ class HandleInfo:
     """A result handle's numeric cells. ``columns`` holds them per column.
 
     Derivations pair cells of one column, or cells of two different handles;
-    ``values`` alone (no ``columns``) counts as a single column.
+    ``values`` alone (no ``columns``) counts as a single column. ``levels`` are
+    a forecast's interval levels (card meta, e.g. 80 and 95): a stated number
+    may equal one directly, but they never enter a derivation.
     """
 
     handle_id: str
@@ -32,6 +34,7 @@ class HandleInfo:
     governed: bool
     values: list[float] = field(default_factory=list)
     columns: list[list[float]] = field(default_factory=list)
+    levels: list[float] = field(default_factory=list)
 
     def column_lists(self) -> list[list[float]]:
         return self.columns or ([self.values] if self.values else [])
@@ -82,7 +85,15 @@ def load_handle_info(store: ResultStore, handle_id: str) -> HandleInfo | None:
     except (UnknownNameError, OSError, ValueError):
         return None
     values = [v for col in columns for v in col]
-    return HandleInfo(handle_id, card.produced_by, card.governed, values, columns)
+    levels = card.meta.get("levels") if card.produced_by == "forecast" else None
+    levels = [
+        float(x)
+        for x in (levels if isinstance(levels, list) else [])
+        if isinstance(x, int | float) and not isinstance(x, bool)
+    ]
+    return HandleInfo(
+        handle_id, card.produced_by, card.governed, values, columns, levels
+    )
 
 
 def _get(message: object, name: str):
@@ -105,20 +116,25 @@ def _text(message: object) -> str:
 
 
 def collect_handles(messages, store: ResultStore) -> dict[str, HandleInfo]:
-    """Handles produced by tools in this run, plus those reported by workers."""
+    """Handles produced by tools in ``messages``, plus those reported by workers.
+
+    A handle missing from ``store`` is unknown and left out.
+    """
     found: dict[str, HandleInfo] = {}
     for message in messages:
         artifact = _get(message, "artifact")
         if isinstance(artifact, dict) and isinstance(artifact.get("handle_id"), str):
             hid = artifact["handle_id"]
             loaded = load_handle_info(store, hid)
-            found[hid] = HandleInfo(
-                hid,
-                str(artifact.get("produced_by", "")),
-                bool(artifact.get("governed", False)),
-                loaded.values if loaded else [],
-                loaded.columns if loaded else [],
-            )
+            if loaded is not None:
+                found[hid] = HandleInfo(
+                    hid,
+                    str(artifact.get("produced_by", "")),
+                    bool(artifact.get("governed", False)),
+                    loaded.values,
+                    loaded.columns,
+                    loaded.levels,
+                )
             continue
         if is_background_notification(message):
             for line in _HANDLES_LINE.findall(_text(message)):
@@ -132,13 +148,13 @@ def collect_handles(messages, store: ResultStore) -> dict[str, HandleInfo]:
 
 
 def direct_handles(x: StatedNumber, handles: list[HandleInfo]) -> list[HandleInfo]:
-    """Handles holding a cell that matches ``x`` at its stated precision."""
+    """Handles holding a cell (or interval level) that matches ``x`` as stated."""
     spans = intervals(x)
     found = []
     for h in handles:
-        if not h.values:
+        if not h.values and not h.levels:
             continue
-        arr = np.array(h.values, dtype=float)
+        arr = np.array(h.values + h.levels, dtype=float)
         mask = np.zeros(arr.shape, dtype=bool)
         for lo, hi in spans:
             mask |= (arr >= lo) & (arr <= hi)

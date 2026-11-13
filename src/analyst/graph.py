@@ -53,7 +53,7 @@ from analyst.prompts import PLAN_PROMPT, build_system_prompt
 from analyst.providers import get_model
 from analyst.state import AnalystState, Answer, Plan, Verification
 from analyst.tools import DATA_TOOLS
-from analyst.verify import collect_handles, verify_answer
+from analyst.verify import NO_CLAIMS, collect_handles, verify_answer
 
 logger = logging.getLogger(__name__)
 
@@ -128,7 +128,50 @@ def _question(messages: Sequence[BaseMessage]) -> HumanMessage | None:
     return None
 
 
+def _turn(messages: Sequence[BaseMessage]) -> Sequence[BaseMessage]:
+    """This turn's messages: those after the latest real user question.
+
+    A woken run's worker notification comes after that question, so its
+    handles count as this turn's. Without a question, every message counts.
+    """
+    question = _question(messages)
+    if question is None:
+        return messages
+    start = next(i for i, m in enumerate(messages) if m is question) + 1
+    return messages[start:]
+
+
 _ANSWER_TOOL = Answer.__name__
+
+
+def _without_answer_call(message: AIMessage, answer_ids: set[str]) -> AIMessage | None:
+    """``message`` minus its ``Answer`` tool call, or None when nothing else is left.
+
+    The call is removed from ``tool_calls`` and from any provider copies (content
+    blocks, raw ``additional_kwargs["tool_calls"]``) so no orphan call survives.
+    """
+    rest = [tc for tc in message.tool_calls if tc["id"] not in answer_ids]
+    if not rest:
+        return None
+    update: dict[str, Any] = {"tool_calls": rest}
+    if isinstance(message.content, list):
+        update["content"] = [
+            block
+            for block in message.content
+            if not (
+                isinstance(block, dict)
+                and (block.get("id") in answer_ids or block.get("call_id") in answer_ids)
+            )
+        ]
+    raw = message.additional_kwargs.get("tool_calls")
+    if isinstance(raw, list):
+        update["additional_kwargs"] = {
+            **message.additional_kwargs,
+            "tool_calls": [
+                tc for tc in raw if not (isinstance(tc, dict) and tc.get("id") in answer_ids)
+            ],
+        }
+    return message.model_copy(update=update)
 
 
 def _drop_structured_response(
@@ -139,7 +182,8 @@ def _drop_structured_response(
     The answer node posts the visible final answer, so the agent's own copy is
     clutter: under the tool strategy an ``Answer`` tool call and its tool
     message, under the provider strategy the closing JSON-text AI message.
-    Status lines, data tool calls and their results stay.
+    Status lines, data tool calls and their results stay, including data calls
+    made in the same AI message as the ``Answer`` call.
     """
     answer_ids = {
         tc["id"]
@@ -148,15 +192,14 @@ def _drop_structured_response(
         for tc in m.tool_calls
         if tc["name"] == _ANSWER_TOOL
     }
-    kept = [
-        m
-        for m in new
-        if not (
-            isinstance(m, AIMessage)
-            and any(tc["name"] == _ANSWER_TOOL for tc in m.tool_calls)
-        )
-        and not (isinstance(m, ToolMessage) and m.tool_call_id in answer_ids)
-    ]
+    kept: list[BaseMessage] = []
+    for m in new:
+        if isinstance(m, AIMessage) and any(tc["id"] in answer_ids for tc in m.tool_calls):
+            stripped = _without_answer_call(m, answer_ids)
+            if stripped is not None:
+                kept.append(stripped)
+        elif not (isinstance(m, ToolMessage) and m.tool_call_id in answer_ids):
+            kept.append(m)
     if (
         structured
         and not answer_ids
@@ -333,14 +376,20 @@ def build_graph(
             return verify_answer(
                 draft,
                 question=_text(question) if question is not None else "",
-                handles=collect_handles(messages, service.store),
+                handles=collect_handles(_turn(messages), service.store),
                 memory=service.memory,
                 cutoff=ctx.cutoff,
                 store=service.store,
             )
 
         verification = await asyncio.to_thread(check)
-        if verification.label == "not_verified" and not state.get("retries"):
+        # A decline or acknowledgement (no claims, no numbers) is final: a
+        # "cite handles" retry would only push the model to invent numbers.
+        if (
+            verification.label == "not_verified"
+            and verification.reason != NO_CLAIMS
+            and not state.get("retries")
+        ):
             problems = "; ".join(verification.problems or [verification.reason])
             feedback = HumanMessage(
                 RETRY_TEXT.format(problems=problems),
@@ -361,15 +410,10 @@ def build_graph(
         verification = state.get("verification")
         if draft is None:
             # The latest prose reply of this turn, never an earlier turn's answer.
-            messages = state["messages"]
-            question = _question(messages)
-            start = 0
-            if question is not None:
-                start = next(i for i, m in enumerate(messages) if m is question) + 1
             last_ai = next(
                 (
                     m
-                    for m in reversed(messages[start:])
+                    for m in reversed(_turn(state["messages"]))
                     if isinstance(m, AIMessage) and not m.tool_calls
                 ),
                 None,

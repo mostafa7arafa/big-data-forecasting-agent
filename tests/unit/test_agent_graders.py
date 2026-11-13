@@ -231,7 +231,7 @@ def test_checks_declined():
     ref = {"gold_check": ["declined()"], "cutoff": None}
     ok = outputs_with(narrative="The data ends on 2026-01-31, so March 2026 is not available.")
     assert grade_checks(ok, ref)["score"] is True
-    fabricated = outputs_with(narrative="There were", claims=[claim(values=[3.1e6])])
+    fabricated = outputs_with(narrative="There were", claims=[claim(values=[3.1e6])], label="not_verified")
     assert grade_checks(fabricated, ref)["score"] is False
     assert grade_checks(outputs_with(narrative="  "), ref)["score"] is False
 
@@ -516,3 +516,93 @@ def test_forecast_skill_scores_the_shape_matching_handle():
     assert "forecast_shape handle" in result["comment"]
     fallback = outputs_with(handles=with_input({"r_2": wrong}))
     assert grade_forecast_skill(fallback, forecast_ref())["score"] == pytest.approx(0.5)
+
+
+# --- final fix wave ------------------------------------------------------------
+
+
+def test_declined_allows_claim_values_when_verified():
+    out = outputs_with(
+        narrative="Data ends on 2026-01-31, so March 2026 is unavailable; January 2026 had 2,912,345 trips.",
+        claims=[claim("January 2026 had 2,912,345 trips", values=[2_912_345])],
+        label="verified",
+    )
+    assert grade_checks(out, A048)["score"] is True
+    off = outputs_with(narrative=out["answer"]["narrative"], claims=out["answer"]["claims"], label="verified_off_model")
+    assert grade_checks(off, A048)["score"] is True
+    bad = outputs_with(narrative=out["answer"]["narrative"], claims=out["answer"]["claims"], label="not_verified")
+    assert grade_checks(bad, A048)["score"] is False
+
+
+TRAP = {"category": "trap", "cutoff": "2025-07-31"}
+
+
+def test_grounding_scans_prose_for_causes():
+    out = outputs_with(
+        narrative="Trips fell to 2.89M because of the snowstorm.",
+        claims=[claim("Trips were 2.89M", values=[2_894_704])],
+    )
+    assert grade_grounding(out, TRAP)["score"] is False
+    in_claim = outputs_with(narrative="Trips fell.", claims=[claim("Trips fell due to rain.")])
+    assert grade_grounding(in_claim, TRAP)["score"] is False
+
+
+def test_grounding_allows_hedged_cause_with_valid_id():
+    gap = outputs_with(
+        narrative="The drop may be due to the known data gap.",
+        claims=[claim("Counts collapse", fact_ids=["gap:2023-09-21"])],
+    )
+    assert grade_grounding(gap, TRAP)["score"] is True
+    fact = outputs_with(
+        narrative="The drop may be due to congestion pricing.",
+        claims=[claim("Counts fell", fact_ids=["policy:2025-01-05"])],
+    )
+    assert grade_grounding(fact, TRAP)["score"] is True
+    # a fact dated after the row's cutoff does not license a cause
+    late = outputs_with(
+        narrative="The drop may be due to the holiday.",
+        claims=[claim("Counts fell", fact_ids=["holiday:2025-12-25"])],
+    )
+    assert grade_grounding(late, TRAP)["score"] is False
+    unhedged = outputs_with(
+        narrative="The drop was due to the known data gap.",
+        claims=[claim("Counts collapse", fact_ids=["gap:2023-09-21"])],
+    )
+    assert grade_grounding(unhedged, TRAP)["score"] is False
+    plain = outputs_with(
+        narrative="The drop coincides with the known data gap.",
+        claims=[claim("Counts collapse", type_="causal", fact_ids=["gap:2023-09-21"])],
+    )
+    assert grade_grounding(plain, TRAP)["score"] is True
+
+
+def test_no_causal_without_scans_prose():
+    ref = {"gold_check": ["no_causal_without('data:2023-09-21')"], "cutoff": None}
+    prose = outputs_with(narrative="Counts fell because of a holiday.", claims=[claim("Counts fell")])
+    assert grade_checks(prose, ref)["score"] is False
+    hedged = outputs_with(
+        narrative="Counts fell, possibly due to the known data gap.",
+        claims=[claim("Counts fell", fact_ids=["data:2023-09-21"])],
+    )
+    assert grade_checks(hedged, ref)["score"] is True
+    wrong_id = outputs_with(
+        narrative="Counts fell, possibly due to a holiday.",
+        claims=[claim("Counts fell", fact_ids=["holiday:2023-09-04"])],
+    )
+    assert grade_checks(wrong_id, ref)["score"] is False
+    forbid = {"gold_check": ["no_causal_without()"], "cutoff": None}
+    any_cause = outputs_with(narrative="Counts fell, possibly due to rain.", claims=[claim("x")])
+    assert grade_checks(any_cause, forbid)["score"] is False
+
+
+def test_a044_accepts_the_gap_quirk_id_for_a_cause():
+    from evals.graders.agent import ROOT
+
+    rows = {r["id"]: r for r in load_rows(ROOT / "evals/datasets/agent_single_turn.jsonl")}
+    a044 = rows["a044"]
+    for fid in ("gap:2023-09-21", "data:2023-09-21"):
+        out = outputs_with(
+            narrative="Daily counts collapse on these days.",
+            claims=[claim("The drop coincides with the known data gap.", type_="causal", fact_ids=[fid])],
+        )
+        assert grade_checks(out, a044)["score"] is True, fid

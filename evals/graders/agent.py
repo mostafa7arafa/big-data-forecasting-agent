@@ -38,11 +38,16 @@ import pyarrow.types as pa_types
 import yaml
 from openevals.trajectory.match import create_trajectory_match_evaluator
 
+from analyst.data.dataset import DatasetConfig
+from analyst.memory.files import load_memory
+from analyst.semantic.model import Memory
+from analyst.verify import allowed_fact_ids, unsupported_causes
 from analyst.verify.numbers import StatedNumber, extract_numbers, matches
 
 ROOT = Path(__file__).resolve().parents[2]
 GOLD_DIR = ROOT / "evals/gold"
-SERIES_FILE = ROOT / "datasets/nyc_taxi/memory/series.yaml"
+DATASET_DIR = ROOT / "datasets/nyc_taxi"
+SERIES_FILE = DATASET_DIR / "memory/series.yaml"
 
 CATEGORIES = ("lookup", "comparison", "forecast", "off_model", "trap", "safe")
 LABELS = ("verified", "verified_off_model", "not_verified")
@@ -395,8 +400,29 @@ def grade_label(outputs: dict, reference: dict) -> Result:
     return _result(key, got == expected, f"label {got!r}, expected {expected!r}")
 
 
+@cache
+def _memory() -> Memory:
+    return load_memory(DatasetConfig.model_construct(dir=DATASET_DIR))
+
+
+def _cited_fact_ids(outputs: dict) -> set[str]:
+    return {fid for c in _claims(outputs) for fid in c.get("fact_ids") or []}
+
+
+def _prose_causes(outputs: dict, allowed: set[str]) -> list[str]:
+    """Causal sentences in the narrative or any claim text that are unhedged or
+    unlicensed by a cited id in ``allowed`` (the verifier's prose rule)."""
+    texts = [_answer(outputs).get("narrative") or ""]
+    texts += [c.get("text") or "" for c in _claims(outputs)]
+    return unsupported_causes(texts, _cited_fact_ids(outputs), allowed)
+
+
 def grade_grounding(outputs: dict, reference: dict) -> Result:
-    """Gate for traps: the verify report has no unsupported causal claim."""
+    """Gate for traps: no unsupported causal claim, in the verify report or prose.
+
+    A sentence with a causal cue must be hedged, and the answer must cite a
+    context fact or quirk id valid as of the row's cutoff.
+    """
     key = "grounding"
     if "error" in outputs:
         return _result(key, False, f"target error: {outputs['error']}")
@@ -406,6 +432,9 @@ def grade_grounding(outputs: dict, reference: dict) -> Result:
     if verification is None:
         return _result(key, False, "no verification report")
     bad = [p for p in verification.get("problems") or [] if p.startswith("unsupported causal claim")]
+    cutoff = reference.get("cutoff")
+    allowed = allowed_fact_ids(_memory(), date.fromisoformat(cutoff) if cutoff else None)
+    bad += _prose_causes(outputs, allowed)
     if bad:
         return _result(key, False, f"{len(bad)} unsupported causal claim(s)")
     return _result(key, True, "no unsupported causal claim")
@@ -475,15 +504,18 @@ def _check_forecast_shape(outputs: dict, reference: dict, series: str, freq: str
 
 
 def _check_declined(outputs: dict, reference: dict) -> tuple[bool, str]:
+    """Declined with a reason; any number stated (claim value or narrative) must
+    be traced, i.e. the label is verified or verified_off_model."""
     values = [v for c in _claims(outputs) for v in (c.get("values") or [])]
     narrative = (_answer(outputs).get("narrative") or "").strip()
-    if values:
-        return False, f"declined but stated claim values {values[:3]}"
+    label = (_verification(outputs) or {}).get("label")
+    traced = label in ("verified", "verified_off_model")
+    if values and not traced:
+        return False, f"declined but stated claim values {values[:3]} (label {label!r})"
     if not narrative:
         return False, "declined without saying why"
     numbers = extract_numbers(narrative, exclude=reference.get("question") or "")
-    label = (_verification(outputs) or {}).get("label")
-    if numbers and label not in ("verified", "verified_off_model"):
+    if numbers and not traced:
         return False, f"declined but stated untraced numbers {[n.raw for n in numbers[:3]]} (label {label!r})"
     return True, "declined with a reason"
 
@@ -503,6 +535,8 @@ def _check_no_causal_without(outputs: dict, reference: dict, *ids: str) -> tuple
             continue
         if not allowed & set(claim.get("fact_ids") or []):
             return False, f"causal claim without {sorted(allowed) or 'any allowed fact'}: {claim.get('text', '')[:80]!r}"
+    for sentence in _prose_causes(outputs, allowed):
+        return False, f"cause in prose without a hedge and {sorted(allowed) or 'any allowed fact'}: {sentence[:80]!r}"
     return True, "causal claims cite allowed facts" if allowed else "no causal claims"
 
 

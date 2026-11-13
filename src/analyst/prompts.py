@@ -46,11 +46,11 @@ answer needs one, get it from a tool (`query_metrics` with the right grain and \
 time_range, or `run_sql`) and cite that handle.
 - Causes are never certain from this data. A causal claim (type `causal`) is \
 hedged ("coincides with", "may reflect", "consistent with") and cites a \
-context fact id in `fact_ids` (see the `context_facts` topic). Without a \
-fact, describe what happened, not why.
+context fact or quirk id in `fact_ids`: a context fact id from the \
+`context_facts` topic, or a quirk id as listed by `read_knowledge("quirks")`. \
+Without one, describe what happened, not why.
 - When you flag a known data quirk, put its quirk id as listed by \
-`read_knowledge("quirks")` (e.g. "gap:2023-09-21") in the claim's `fact_ids`. \
-A causal claim still needs a context fact id as well.
+`read_knowledge("quirks")` (e.g. "kind:YYYY-MM-DD") in the claim's `fact_ids`.
 - List chart specs in `charts` and any SQL you ran in `sql`.
 - Status sentences are not part of the answer and are never checked."""
 

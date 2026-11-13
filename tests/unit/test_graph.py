@@ -13,6 +13,7 @@ from datetime import date
 from pathlib import Path
 from typing import Any
 
+import pyarrow as pa
 import pytest
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
@@ -391,7 +392,8 @@ def test_background_note_numbers_are_not_exempt(key):
     assert out["plan"] == []
     verification = out["answer"].verification
     assert verification.label == "not_verified"
-    assert "4242" in verification.reason
+    assert verification.reason == "no evidence cited"
+    assert any("4242" in p for p in verification.problems)
 
 
 def test_no_blocking_calls_on_event_loop(monkeypatch):
@@ -502,8 +504,11 @@ def test_prompt_quirk_ids_in_fact_ids():
     memory = registry.get_service("events", None).memory
     p = build_system_prompt(memory, dataset="ds", cutoff=None, background=False)
     assert 'read_knowledge("quirks")' in p
-    assert "gap:2023-09-21" in p and "fact_ids" in p
-    assert "context fact id" in p  # causal claims still need a context fact
+    assert "kind:YYYY-MM-DD" in p and "fact_ids" in p
+    assert "gap:2023-09-21" not in p
+    assert "context fact id" in p
+    assert "still needs a context fact id" not in p
+    assert "context fact or quirk id" in p
 
 
 # --- fix round 2 -----------------------------------------------------------
@@ -834,3 +839,158 @@ def test_start_async_task_through_the_graph(monkeypatch):
         "dataset": "events",
         "cutoff": "2024-01-31",
     }
+
+
+# --- final fix wave ------------------------------------------------------------
+
+
+def _paired(messages: list[BaseMessage]) -> None:
+    """Every tool call has its ToolMessage and every ToolMessage its call."""
+    calls = {tc["id"] for m in messages if isinstance(m, AIMessage) for tc in m.tool_calls}
+    results = {m.tool_call_id for m in messages if isinstance(m, ToolMessage)}
+    assert calls == results, (calls, results)
+
+
+def test_answer_beside_data_call_keeps_the_data_call():
+    both = AIMessage(
+        "Pulling the totals.",
+        tool_calls=[
+            call("query_metrics", COUNT, "c1"),
+            # a number with no claim fails verify, so the retry runs
+            call("Answer", {"narrative": "There were 5 events.", "claims": []}, "a1"),
+        ],
+    )
+    model = ScriptedModel(script=[no_plan(), both, cite_total])
+    out = run(model, [HumanMessage("how many events?")])
+    messages = out["messages"]
+    _paired(messages)
+    ai = [m for m in messages if isinstance(m, AIMessage)]
+    assert not any(tc["name"] == "Answer" for m in ai for tc in m.tool_calls)
+    assert any([tc["id"] for tc in m.tool_calls] == ["c1"] for m in ai)
+    assert not any(isinstance(m, ToolMessage) and m.tool_call_id == "a1" for m in messages)
+    assert out["answer"].verification.label == "verified"
+
+
+def test_drop_structured_response_strips_only_the_answer_call():
+    from analyst.graph import _drop_structured_response
+
+    both = AIMessage(
+        "status",
+        tool_calls=[
+            call("query_metrics", COUNT, "c1"),
+            call("Answer", {"narrative": "x", "claims": []}, "a1"),
+        ],
+    )
+    answer_only = AIMessage("", tool_calls=[call("Answer", {"narrative": "y", "claims": []}, "a2")])
+    new = [
+        both,
+        ToolMessage("Returning structured response", tool_call_id="a1"),
+        ToolMessage("card", tool_call_id="c1"),
+        answer_only,
+        ToolMessage("Returning structured response", tool_call_id="a2"),
+    ]
+    kept = _drop_structured_response(new, structured=True)
+    assert len(kept) == 2
+    assert [tc["id"] for tc in kept[0].tool_calls] == ["c1"]
+    assert kept[0].content == "status"
+    assert kept[1].tool_call_id == "c1"
+    assert both.tool_calls[1]["id"] == "a1"  # the input message is not mutated
+    _paired(kept)
+
+
+def test_narrative_does_not_trace_to_an_earlier_turn():
+    store = registry.get_service("events", None).store
+    old = store.save(
+        pa.table({"v": pa.array([123_456.0])}),
+        produced_by="query_metrics",
+        source="earlier turn",
+        governed=True,
+        elapsed_s=0.0,
+    ).handle_id
+    history = [
+        HumanMessage("how many events last time?"),
+        AIMessage("", tool_calls=[call("query_metrics", COUNT, "c0")]),
+        ToolMessage(
+            "card",
+            tool_call_id="c0",
+            artifact={"handle_id": old, "produced_by": "query_metrics", "governed": True},
+        ),
+        AIMessage("There were 123,456 events.\n\nVerified"),
+        HumanMessage("how many events now?"),
+    ]
+
+    def stale(messages: list[BaseMessage]) -> AIMessage:
+        hid = handles_in(messages)[-1]
+        n = int(total(hid))
+        text = f"There were {n:,} events, against 123,456 before."
+        claim = {"text": f"{n:,} events", "type": "descriptive", "values": [n], "handles": [hid]}
+        return answer_turn(text, [claim])
+
+    model = ScriptedModel(
+        script=[no_plan(), tool_turn(call("query_metrics", COUNT, "c1")), stale, stale]
+    )
+    out = run(model, history)
+    verification = out["answer"].verification
+    assert verification.label == "not_verified"
+    assert "untraced number 123,456" in verification.problems
+
+
+def test_narrative_traces_to_this_turns_worker_handles():
+    from langchain_core.messages.notification import add_notification_metadata  # noqa: F401
+
+    store = registry.get_service("events", None).store
+    h = store.save(
+        pa.table({"v": pa.array([4242.0])}),
+        produced_by="run_sql",
+        source="worker",
+        governed=False,
+        elapsed_s=0.0,
+    ).handle_id
+    note = HumanMessage(
+        f"Task t1 finished.\nhandles: {h}", additional_kwargs={"source": "async_subagent"}
+    )
+    claim = {"text": "4242 events", "type": "descriptive", "values": [4242], "handles": [h]}
+    model = ScriptedModel(script=[answer_turn("The worker found 4242 events.", [claim])])
+    out = run(model, [HumanMessage("how many events?"), note])
+    assert out["answer"].verification.label == "verified_off_model"
+
+
+def test_drop_structured_response_strips_provider_copies_of_the_answer_call():
+    from analyst.graph import _drop_structured_response
+
+    both = AIMessage(
+        [
+            {"type": "text", "text": "status"},
+            {"type": "tool_use", "id": "c1", "name": "query_metrics", "input": {}},
+            {"type": "tool_use", "id": "a1", "name": "Answer", "input": {}},
+            {"type": "function_call", "call_id": "a1", "name": "Answer", "arguments": "{}"},
+        ],
+        tool_calls=[call("query_metrics", COUNT, "c1"), call("Answer", {}, "a1")],
+        additional_kwargs={
+            "tool_calls": [
+                {"id": "c1", "type": "function", "function": {"name": "query_metrics"}},
+                {"id": "a1", "type": "function", "function": {"name": "Answer"}},
+            ]
+        },
+    )
+    (kept, result) = _drop_structured_response(
+        [both, ToolMessage("card", tool_call_id="c1"), ToolMessage("done", tool_call_id="a1")],
+        structured=True,
+    )
+    assert [b.get("id") or b.get("call_id") for b in kept.content] == [None, "c1"]
+    assert [tc["id"] for tc in kept.additional_kwargs["tool_calls"]] == ["c1"]
+    assert result.tool_call_id == "c1"
+
+
+def test_zero_claim_answer_is_not_retried():
+    ack = answer_turn("I started a background task; I'll report back when it finishes.", [])
+    model = ScriptedModel(script=[no_plan(), ack])
+    out = run(model, [HumanMessage("forecast daily events")])
+    assert out["retries"] == 0
+    verification = out["answer"].verification
+    assert verification.label == "not_verified"
+    assert verification.reason == "no claims (decline or acknowledgement)"
+    assert not any(
+        isinstance(m, HumanMessage) and str(m.content).startswith("Verification failed")
+        for m in out["messages"]
+    )

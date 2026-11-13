@@ -39,8 +39,22 @@ def git_sha() -> str:
         return "nogit"
 
 
-def slug(model: str | None) -> str:
-    return re.sub(r"[^a-z0-9]+", "-", (model or "default").lower()).strip("-")
+def slug(model: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", model.lower()).strip("-")
+
+
+def resolved_model(model: str | None) -> str:
+    """The model a run uses: ``--model``, else the configured ``Settings.model``."""
+    if model:
+        return model
+    from analyst.config import get_settings
+
+    return get_settings().model
+
+
+def experiment_prefix(model: str | None, sha: str) -> str:
+    """``<model slug>-<git sha>``, naming the resolved model, never "default"."""
+    return f"{slug(resolved_model(model))}-{sha}"
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -77,7 +91,7 @@ async def run_experiment(rows: list[dict], args: argparse.Namespace) -> None:
     client = Client()
     all_rows = load_rows(DATASET_FILE)
     tag = sync_dataset(client, all_rows)
-    prefix = f"{slug(args.model)}-{git_sha()}"
+    prefix = experiment_prefix(args.model, git_sha())
     if len(rows) == len(all_rows):
         data = DATASET_NAME
     else:
@@ -93,7 +107,7 @@ async def run_experiment(rows: list[dict], args: argparse.Namespace) -> None:
         experiment_prefix=prefix,
         num_repetitions=args.reps,
         max_concurrency=3,
-        metadata={"dataset_tag": tag, "model": args.model, "git_sha": git_sha()},
+        metadata={"dataset_tag": tag, "model": resolved_model(args.model), "git_sha": git_sha()},
         client=client,
     )
     results = []

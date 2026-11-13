@@ -12,7 +12,7 @@ import math
 import re
 import statistics
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Callable
 from datetime import date, datetime
 from typing import Any
@@ -23,7 +23,7 @@ from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from analyst.context import AnalystContext
 from analyst.data import registry
 from analyst.verify.trace import collect_handles
-from evals.graders.agent import GATES, GRADERS, passed
+from evals.graders.agent import GATES, GRADERS, LABELS, passed
 
 DATASET_NAME = "analyst-single-turn"
 _TAG = re.compile(r"v(\d+)-([0-9a-f]{8})")
@@ -270,6 +270,8 @@ def summarize(results: list[dict]) -> dict:
     cost: list[float] = []
     tokens: list[float] = []
     tool_bytes: list[float] = []
+    labels: Counter[str] = Counter({label: 0 for label in LABELS})
+    reasons: Counter[str] = Counter()
     for r in results:
         by_cat[r["category"]].append(r["passed"])
         for res in r["results"]:
@@ -283,6 +285,12 @@ def summarize(results: list[dict]) -> dict:
                 for level, value in _COVERAGE.findall(res.get("comment") or ""):
                     cover[level].append(float(value))
         out = r.get("outputs") or {}
+        verification = out.get("verification") or (out.get("answer") or {}).get("verification") or {}
+        label = verification.get("label")
+        # A row without a label (target error, no verification) counts as no_label.
+        labels[label if label in LABELS else "no_label"] += 1
+        if label == "not_verified":
+            reasons[str(verification.get("reason") or "?")] += 1
         if "latency_s" in out:
             latency.append(float(out["latency_s"]))
         usage = out.get("usage") or {}
@@ -306,6 +314,8 @@ def summarize(results: list[dict]) -> dict:
         "mean_cost_usd": _mean(cost),
         "mean_tokens": _mean(tokens),
         "peak_tool_bytes": max(tool_bytes) if tool_bytes else None,
+        "label_distribution": {k: v for k, v in labels.items() if k in LABELS or v},
+        "not_verified_reasons": reasons.most_common(5),
     }
 
 
@@ -334,4 +344,10 @@ def format_summary(summary: dict, *, experiment: str | None = None, url: str | N
         f"Cost per question: {'n/a' if summary['mean_cost_usd'] is None else '$' + format(summary['mean_cost_usd'], '.4f')}; "
         f"mean tokens {num(summary['mean_tokens'], '.0f')}; peak tool bytes {num(summary['peak_tool_bytes'], '.0f')}"
     )
+    labels = summary.get("label_distribution") or {}
+    line = "Labels: " + ", ".join(f"{k} {v}" for k, v in labels.items())
+    reasons = summary.get("not_verified_reasons") or []
+    if reasons:
+        line += "; not_verified reasons: " + ", ".join(f"{r} ({n})" for r, n in reasons)
+    lines.append(line)
     return "\n".join(lines)

@@ -20,8 +20,33 @@ _MONTH = (
     r"|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)"
 )
 
+# A day of the month after a month name: 1-31, and not the start of a larger
+# number ("March 3,412,005", "March 3.2M", "May 5k", "June 12%").
+_DAY = (
+    r"(?:3[01]|[12]\d|0?[1-9])(?!\d)(?:st|nd|rd|th)?"
+    r"(?![.,]\d)(?!\s?(?:%|(?i:percent|million|billion|mn|bn|k|m|b)\b))"
+)
+
+_NUMBER_WORDS = {
+    word: str(i)
+    for i, word in enumerate(
+        [
+            "one", "two", "three", "four", "five", "six", "seven", "eight",
+            "nine", "ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen",
+            "sixteen", "seventeen", "eighteen", "nineteen", "twenty",
+        ],
+        start=1,
+    )
+}
+_NUMBER_WORD = re.compile(r"\b(?:" + "|".join(_NUMBER_WORDS) + r")\b", re.IGNORECASE)
+
 # Calendar-ish tokens that are never claims; blanked out before extraction.
 _MASKS = [
+    # Interval levels ("80% interval", "95% prediction interval") name the band.
+    re.compile(
+        r"\b\d{2}%\s+(?:prediction\s+)?(?:interval|band|PI|confidence)\b",
+        re.IGNORECASE,
+    ),
     re.compile(r"\b\d{4}-\d{2}-\d{2}\b"),
     re.compile(r"\b\d{1,2}/\d{1,2}/\d{2,4}\b"),
     re.compile(r"\b\d{4}-\d{1,2}\b"),
@@ -29,10 +54,9 @@ _MASKS = [
     re.compile(r"\b\d{1,2}:\d{2}(?::\d{2})?(?:\s?[ap]m\b)?", re.IGNORECASE),
     re.compile(r"\b\d{1,2}\s?[ap]m\b", re.IGNORECASE),
     re.compile(
-        rf"\b{_MONTH}\.? \d{{1,2}}(?!\d)(?:st|nd|rd|th)?(?:\s?[-\u2013]\s?\d{{1,2}}(?!\d))?"
-        r"(?:,? \d{4})?"
+        rf"\b{_MONTH}\.? {_DAY}(?:\s?[-\u2013]\s?{_DAY})?(?:,? \d{{4}}(?!\d))?"
     ),
-    re.compile(rf"\b\d{{1,2}}(?:st|nd|rd|th)?(?: of)? {_MONTH}\b"),
+    re.compile(rf"(?<![\d.,])\b\d{{1,2}}(?:st|nd|rd|th)?(?: of)? {_MONTH}\b"),
     re.compile(r"\b\d+(?:st|nd|rd|th)\b"),
     # Integer window phrases only ("12 months", "4-day gap"); decimals such as
     # "14.2 minutes" are metric values and stay.
@@ -101,6 +125,8 @@ def extract_numbers(text: str, *, exclude: str = "") -> list[StatedNumber]:
     numbers = _extract(text)
     if not exclude:
         return numbers
+    # "top five zones" in the question exempts "top 5" in the answer.
+    exclude = _NUMBER_WORD.sub(lambda m: _NUMBER_WORDS[m.group(0).lower()], exclude)
     skip = {_key(n) for n in _extract(exclude)}
     return [n for n in numbers if _key(n) not in skip]
 

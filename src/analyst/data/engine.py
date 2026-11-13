@@ -188,6 +188,12 @@ class Engine:
         return self._coverage
 
     def columns(self) -> list[tuple[str, str]]:
-        # This engine-generated query only needs relation metadata, not Arrow data.
-        relation = self._con.sql(f"SELECT * FROM {self._table} LIMIT 0")
-        return list(zip(relation.columns, map(str, relation.types), strict=True))
+        # This engine-generated query only needs relation metadata, not Arrow
+        # data. Like execute: inside the gate, on its own cursor.
+        with get_gate().slot():
+            cursor = self._con.cursor()
+            try:
+                relation = cursor.sql(f"SELECT * FROM {self._table} LIMIT 0")
+                return list(zip(relation.columns, map(str, relation.types), strict=True))
+            finally:
+                cursor.close()
