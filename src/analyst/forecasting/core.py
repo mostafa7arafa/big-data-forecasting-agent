@@ -18,6 +18,7 @@ from statsforecast.models import MSTL, SeasonalNaive
 from utilsforecast.evaluation import evaluate
 from utilsforecast.losses import coverage, mae, mase, scaled_crps
 
+from analyst.errors import InvalidRequestError
 from analyst.semantic.model import Quirk
 
 from .models import DEFAULTS, candidate_models
@@ -53,7 +54,7 @@ class ForecastRun:
 
 def _check_freq(freq):
     if freq not in DEFAULTS:
-        raise ValueError(f"unsupported frequency: {freq!r}")
+        raise InvalidRequestError(f"unsupported frequency: {freq!r}")
 
 
 def _record(adjustments, message):
@@ -130,7 +131,7 @@ def prepare_series(
     _check_freq(freq)
     data_end = pd.Timestamp(data_end)
     if data_end.tzinfo is not None:
-        raise ValueError("data_end must be timezone-naive")
+        raise InvalidRequestError("data_end must be timezone-naive")
     quirks = [q for q in quirks if q.status == "approved" and q.treatment == "impute"]
     columns = [time_col, value_col] + ([id_col] if id_col else [])
     frame = df[columns].rename(columns={time_col: "ds", value_col: "y"}).copy()
@@ -141,11 +142,13 @@ def prepare_series(
     frame["ds"] = pd.to_datetime(frame["ds"])
     frame["y"] = pd.to_numeric(frame["y"]).astype(float)
     if frame.empty or frame[["unique_id", "ds"]].isna().any().any():
-        raise ValueError("series must have non-null ids and dates and at least one row")
+        raise InvalidRequestError(
+            "series must have non-null ids and dates and at least one row"
+        )
     if frame.duplicated(["unique_id", "ds"]).any():
-        raise ValueError("duplicate dates within a series")
+        raise InvalidRequestError("duplicate dates within a series")
     if np.isinf(frame.y).any():
-        raise ValueError("series values must be finite")
+        raise InvalidRequestError("series values must be finite")
     all_adjustments, frames = [], []
     imputed_points = 0
     multiple_ids = frame.unique_id.nunique() > 1
@@ -161,10 +164,10 @@ def prepare_series(
             group = group.iloc[:-1]
             adjustments.append(f"dropped partial period {last.date()}")
         if group.empty:
-            raise ValueError("series too short after dropping partial period")
+            raise InvalidRequestError("series too short after dropping partial period")
         full_index = pd.date_range(group.index.min(), group.index.max(), freq=freq)
         if not group.index.isin(full_index).all():
-            raise ValueError(f"dates must be aligned to {freq}")
+            raise InvalidRequestError(f"dates must be aligned to {freq}")
         missing = full_index.difference(group.index)
         group = group.reindex(full_index)
         unit = "days" if freq == "D" else "months"
@@ -201,7 +204,7 @@ def prepare_series(
         imputed_points += int(group.y.isna().sum())
         group["y"] = group.y.interpolate(method="time", limit_direction="both")
         if group.y.isna().any():
-            raise ValueError(f"cannot impute series {uid!r}: no observed values")
+            raise InvalidRequestError(f"cannot impute series {uid!r}: no observed values")
         group["unique_id"] = uid
         group.index.name = "ds"
         frames.append(group.reset_index()[["unique_id", "ds", "y"]])
@@ -237,7 +240,7 @@ def _supported_models(series, models, horizon, n_windows):
             )
             supported.append(model)
     if not supported:
-        raise ValueError("series too short for any candidate model")
+        raise InvalidRequestError("series too short for any candidate model")
     return supported
 
 
@@ -286,7 +289,7 @@ def backtest(
     step = defaults["step"] if step is None else step
     requested = defaults["n_windows"] if n_windows is None else n_windows
     if horizon < 1 or step < 1 or requested < 3:
-        raise ValueError(
+        raise InvalidRequestError(
             "horizon and step must be positive; n_windows must be at least 3"
         )
     history = series.df.groupby("unique_id").size().min()
@@ -300,7 +303,7 @@ def backtest(
     ):
         windows -= 1
     if windows < 3 or pd.isna(history):
-        raise ValueError("series too short for at least 3 backtest windows")
+        raise InvalidRequestError("series too short for at least 3 backtest windows")
     if windows != requested:
         _series_record(
             series,
@@ -354,7 +357,7 @@ def backtest(
             )
             scores.loc[mask, name] = 0.0
         if scores[names].isna().any().any():
-            raise ValueError("undefined backtest scores")
+            raise InvalidRequestError("undefined backtest scores")
         evaluated.append(scores)
     long = pd.concat(evaluated).melt(
         id_vars=["unique_id", "metric"],
@@ -419,7 +422,7 @@ def fit_predict(
     """Fit the supplied models on all observations without running a backtest."""
     _check_freq(freq)
     if horizon < 1:
-        raise ValueError("horizon must be positive")
+        raise InvalidRequestError("horizon must be positive")
     return StatsForecast(
         models=deepcopy(list(models)), freq=freq, n_jobs=n_jobs
     ).forecast(df=series.df, h=horizon, level=list(levels))

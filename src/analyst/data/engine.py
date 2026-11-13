@@ -10,9 +10,12 @@ import duckdb
 import pyarrow as pa
 
 from analyst.data.dataset import DatasetConfig
+from analyst.errors import AnalystError
+
+VIEWS_HINT = "use only the dataset views listed by describe('schema')"
 
 
-class QueryError(Exception):
+class QueryError(AnalystError):
     """A rejected, failed, or resource-limited query."""
 
 
@@ -103,7 +106,7 @@ class Engine:
                     for entry in node.get("cte_map", {}).get("map", []):
                         name = entry["key"]
                         if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
-                            raise QueryError(message)
+                            raise QueryError(message, hint=VIEWS_HINT)
                         cte_names.append(name.casefold())
                     visible_tables = visible_tables.union(cte_names)
 
@@ -117,19 +120,19 @@ class Engine:
                                 for key in ("schema_name", "catalog_name")
                             )
                         ):
-                            raise QueryError(message)
+                            raise QueryError(message, hint=VIEWS_HINT)
                     elif (
                         node.get("type") == "TABLE_FUNCTION"
                         and node["function"]["function_name"].casefold()
                         not in {"range", "generate_series", "unnest"}
                     ):
-                        raise QueryError(message)
+                        raise QueryError(message, hint=VIEWS_HINT)
                     pending.extend((child, visible_tables) for child in node.values())
                 elif isinstance(node, list):
                     pending.extend((child, visible_tables) for child in node)
         except (KeyError, TypeError, AttributeError, IndexError, ValueError) as exc:
             # Fail closed if the serializer's AST shape is unexpected.
-            raise QueryError(message) from exc
+            raise QueryError(message, hint=VIEWS_HINT) from exc
 
     def execute(self, sql: str) -> pa.Table:
         timer = Timer(self._timeout_s, self._con.interrupt)
@@ -138,7 +141,10 @@ class Engine:
         try:
             statements = self._con.extract_statements(sql)
             if len(statements) != 1 or statements[0].type != duckdb.StatementType.SELECT:
-                raise QueryError("expected exactly one SELECT statement")
+                raise QueryError(
+                    "expected exactly one SELECT statement",
+                    hint="send exactly one SELECT statement",
+                )
             self._validate_sql(sql)
             result = self._con.sql(sql).limit(self._max_rows + 1).to_arrow_table()
             if result.num_rows > self._max_rows:

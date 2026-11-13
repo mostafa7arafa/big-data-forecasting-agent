@@ -15,6 +15,7 @@ from analyst.config import get_settings
 from analyst.data.dataset import DatasetConfig
 from analyst.data.engine import Coverage, Engine
 from analyst.data.results import ResultStore, SummaryCard, is_result_handle_id
+from analyst.errors import InvalidRequestError
 from analyst.forecasting.core import forecast as run_forecast
 from analyst.forecasting.core import prepare_series
 from analyst.forecasting.models import DEFAULTS
@@ -132,15 +133,19 @@ class DataService:
                 )
             except KeyError as exc:
                 available = ", ".join(d.name for d in self.memory.semantic.dimensions)
-                raise ValueError(
-                    f"unknown dimension {name!r}; valid dimensions: {available}"
+                raise InvalidRequestError(
+                    f"unknown dimension {name!r}; valid dimensions: {available}",
+                    hint="call describe('dimensions')",
                 ) from exc
         if target == "schema":
             return _describe_schema(self.engine)
         if target == "coverage":
             return _describe_coverage(self.engine)
         choices = ", ".join(_DESCRIBE_TARGETS)
-        raise ValueError(f"unknown describe target {target!r}; valid: {choices}")
+        raise InvalidRequestError(
+            f"unknown describe target {target!r}; valid: {choices}",
+            hint=f"call describe('metrics') with one of: {choices}",
+        )
 
     def forecast(
         self,
@@ -159,7 +164,10 @@ class DataService:
         input_card = self.store.card(handle_id)
         query_meta = input_card.meta.get("query")
         if query_meta is not None and {"day": "D", "month": "MS"}.get(query_meta.get("grain")) != freq:
-            raise ValueError("forecast supports query grain/frequency pairs day→D and month→MS only")
+            raise InvalidRequestError(
+                "forecast supports query grain/frequency pairs day→D and month→MS only",
+                hint="query at day grain for freq D, month grain for freq MS",
+            )
         _require_columns(
             table.column_names,
             [time_col, value_col, *([id_col] if id_col else [])],
@@ -167,7 +175,10 @@ class DataService:
         if id_col is None:
             periods = table.column(time_col).to_pylist()
             if len(periods) != len(set(periods)):
-                raise ValueError("handle has multiple rows per period; pass id_col")
+                raise InvalidRequestError(
+                    "handle has multiple rows per period; pass id_col",
+                    hint="pass id_col so each id is forecast as its own series",
+                )
         t0 = time.perf_counter()
         additive = query_meta is not None and _metric_additive(self.memory, value_col)
         prepared = prepare_series(
@@ -181,7 +192,10 @@ class DataService:
             additive=additive,
         )
         if query_meta is None and prepared.imputed_points > 0.2 * len(prepared.df):
-            raise ValueError("more than 20% of series points were imputed; aggregate to the right grain first")
+            raise InvalidRequestError(
+                "more than 20% of series points were imputed; aggregate to the right grain first",
+                hint="aggregate to the right grain first, or query a wider time range",
+            )
         data_end = pd.Timestamp(self.engine.coverage().end)
         complete_end = data_end.to_period("D" if freq == "D" else "M").start_time
         boundary = (
@@ -191,7 +205,7 @@ class DataService:
             complete_end -= pd.tseries.frequencies.to_offset(freq)
         series_end = prepared.df.ds.max()
         if series_end < complete_end:
-            raise ValueError(
+            raise InvalidRequestError(
                 f"handle ends {series_end.date()} but data runs to {complete_end.date()}; "
                 "re-query without an earlier end (forecast origin must be the end of data)"
             )
@@ -272,7 +286,10 @@ def _require_columns(columns: list[str], required: list[str]) -> None:
     if missing:
         available = ", ".join(columns)
         unknown = ", ".join(missing)
-        raise ValueError(f"unknown column(s): {unknown}; columns: {available}")
+        raise InvalidRequestError(
+            f"unknown column(s): {unknown}; columns: {available}",
+            hint="use the output column names of the handle",
+        )
 
 
 def _kept_scores(scores, best_model: str):
@@ -436,7 +453,7 @@ def _period_threshold(period: date | datetime, grain: str) -> datetime:
     elif grain == "day":
         next_start = period + timedelta(days=1)
     else:
-        raise ValueError(f"unsupported grain {grain!r}")
+        raise InvalidRequestError(f"unsupported grain {grain!r}")
     return datetime.combine(next_start, datetime.min.time()) - timedelta(hours=1)
 
 

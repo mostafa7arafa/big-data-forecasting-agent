@@ -5,6 +5,8 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
+from analyst.errors import UnknownNameError
+
 
 class MemoryItem(BaseModel):
     source: Literal["profile", "llm", "owner", "feedback"] = "owner"
@@ -114,4 +116,7 @@ def _match[T: Dimension | Metric](items: list[T], name: str, kind: str) -> T:
         if any(label.casefold() == needle for label in labels):
             return item
     available = ", ".join(item.name for item in items)
-    raise KeyError(f"unknown {kind} {name!r}; available: {available}")
+    raise UnknownNameError(
+        f"unknown {kind} {name!r}; available: {available}",
+        hint=f"call describe('{kind}s')",
+    )

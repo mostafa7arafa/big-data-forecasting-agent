@@ -3,6 +3,7 @@
 from difflib import get_close_matches
 
 from analyst.data.engine import Engine
+from analyst.errors import InvalidRequestError
 from analyst.semantic.compiler import _approved, from_sql
 from analyst.semantic.model import SemanticModel
 
@@ -35,7 +36,9 @@ def resolve_values(
             needle = _normalize(str(value))
             suggestions = get_close_matches(needle, list(labels), n=5, cutoff=0)
             choices = ", ".join(str(labels[label]) for label in suggestions)
-            raise ValueError(
-                f"unknown value {value!r} for {dim.name}; did you mean: {choices or '(none)'}"
+            raise InvalidRequestError(
+                f"unknown value {value!r} for {dim.name}; "
+                f"did you mean: {choices or '(none)'}",
+                hint=f"call describe('dimension:{dim.name}')",
             )
     return resolved
