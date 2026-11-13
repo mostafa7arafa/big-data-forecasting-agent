@@ -39,7 +39,7 @@ _FORECASTING_GUIDANCE = """\
 the full range and let the engine set the origin (respecting the cutoff).
 - Every forecast is backtested against SeasonalNaive; report whether the chosen \
 model beat that baseline instead of hiding it (`beats_baseline` in the card \
-meta, and the baseline rows in the backtest handle).
+meta, and the SeasonalNaive rows of the `backtest_handle`).
 - Intervals are always 80% and 95%, as the columns `lo_80`, `hi_80`, `lo_95` \
 and `hi_95`.
 - Grain must match the frequency: day grain with freq "D", month grain with \
@@ -120,7 +120,8 @@ def _quirks_topic(memory: Memory, cutoff: date | None) -> str:
     if not quirks:
         lines.append("no known quirks are recorded")
     for quirk in quirks:
-        lines.append(f"- {_span(quirk.start, quirk.end)} {_quirk_tail(quirk)}")
+        span = _span(quirk.start, quirk.end, cutoff)
+        lines.append(f"- {quirk.id} {span} {_quirk_tail(quirk)}".rstrip())
     return "\n".join(lines)
 
 
@@ -131,7 +132,7 @@ def _context_facts_topic(memory: Memory, cutoff: date | None) -> str:
     if not facts:
         lines.append("no context facts are recorded")
     for fact in facts:
-        lines.append(f"- {_fact_line(fact)}")
+        lines.append(f"- {_fact_line(fact, cutoff)}")
     return "\n".join(lines)
 
 
@@ -168,22 +169,25 @@ def _section(title: str, body: str) -> str:
     return f"## {title}\n{body}"
 
 
-def _span(start: date, end: date | None) -> str:
+def _span(start: date, end: date | None, cutoff: date | None) -> str:
+    """A date, or a span; under a cutoff an end past it reads ``..ongoing``."""
     if end is None or end == start:
         return start.isoformat()
+    if cutoff is not None and end > cutoff:
+        return f"{start.isoformat()}..ongoing"
     return f"{start.isoformat()}..{end.isoformat()}"
 
 
 def _quirk_tail(quirk: Quirk) -> str:
-    parts = [quirk.kind]
-    if quirk.treatment:
-        parts.append(f"({quirk.treatment})")
-    head = " ".join(parts)
-    return f"{head}: {quirk.description}" if quirk.description else head
+    """Treatment and description; the kind already leads the line as its id."""
+    head = f"({quirk.treatment})" if quirk.treatment else ""
+    if not quirk.description:
+        return head
+    return f"{head}: {quirk.description}" if head else quirk.description
 
 
-def _fact_line(fact: ContextFact) -> str:
-    return f"{fact.id} {_span(fact.date, fact.end)} {fact.kind}: {fact.label}"
+def _fact_line(fact: ContextFact, cutoff: date | None) -> str:
+    return f"{fact.id} {_span(fact.date, fact.end, cutoff)}: {fact.label}"
 
 
 def _series_line(spec: SeriesSpec) -> str:

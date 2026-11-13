@@ -83,6 +83,11 @@ class Quirk(MemoryItem):
     description: str = ""
     treatment: Literal["impute", "flag", "exclude"] | None = None
 
+    @property
+    def id(self) -> str:
+        """Stable id, e.g. ``gap:2023-09-21``: kind plus start date."""
+        return f"{self.kind}:{self.start.isoformat()}"
+
 
 class SeriesSpec(MemoryItem):
     name: str
@@ -102,12 +107,11 @@ class ContextFact(MemoryItem):
 
     @property
     def id(self) -> str:
-        """Stable citation id, e.g. ``cf_2024-01-02_holiday``.
+        """Stable citation id, e.g. ``policy:2025-01-05``: kind plus date.
 
-        Curated memory keeps one fact per (date, kind); claims cite this id
-        instead of the prose label.
+        Claims cite this id (``fact_ids``) instead of the prose label.
         """
-        return f"cf_{self.date.isoformat()}_{self.kind}"
+        return f"{self.kind}:{self.date.isoformat()}"
 
 
 class Memory(BaseModel):

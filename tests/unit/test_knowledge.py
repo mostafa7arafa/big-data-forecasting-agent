@@ -90,13 +90,20 @@ def test_recap_without_cutoff_is_the_memory_recap(memory):
     assert read_topic(memory, "recap", cutoff=None) == "Synthetic hourly events."
 
 
+def test_memory_item_ids_are_kind_prefixed_dates(memory):
+    quirk = next(q for q in memory.quirks if q.start == date(2024, 1, 20))
+    assert quirk.id == "gap:2024-01-20"
+    policy = next(f for f in memory.context_facts if f.kind == "policy")
+    assert policy.id == "policy:2024-04-01"
+
+
 def test_context_facts_topic_lists_ids_and_dates(memory):
     text = read_topic(memory, "context_facts", cutoff=None)
     for fact in memory.context_facts:
         assert fact.id in text
         assert fact.date.isoformat() in text
     assert len(text) <= 4096
-    assert "- cf_" in text
+    assert "- holiday:2024-01-01" in text
 
 
 def test_context_facts_topic_hides_future_facts(memory):
@@ -105,10 +112,23 @@ def test_context_facts_topic_hides_future_facts(memory):
     assert "New Year Day" in text and "fare policy change" in text
 
 
-def test_quirks_topic_lists_dates_and_treatments(memory):
+def test_quirks_topic_lists_ids_dates_and_treatments(memory):
     text = read_topic(memory, "quirks", cutoff=None)
-    assert "2024-01-20..2024-01-21" in text and "impute" in text
+    assert "- gap:2024-01-20 2024-01-20..2024-01-21 (impute)" in text
+    for quirk in memory.quirks:
+        assert quirk.id in text
     assert "2024-09-01" in text
+
+
+def test_open_ended_span_stops_at_the_cutoff(memory):
+    cutoff = date(2024, 4, 15)
+    facts = read_topic(memory, "context_facts", cutoff=cutoff)
+    quirks = read_topic(memory, "quirks", cutoff=cutoff)
+    for text in (facts, quirks):
+        assert "2024-05-01" not in text and "2024-12-31" not in text
+        assert "..ongoing" in text
+    assert "policy:2024-04-01 2024-04-01..ongoing" in facts
+    assert "anomaly:2024-03-01 2024-03-01..ongoing" in quirks
 
 
 def test_quirks_topic_hides_future_quirks(memory):
@@ -143,8 +163,16 @@ def test_forecasting_topic_is_generic_plus_series(memory):
     lowered = text.lower()
     assert "origin" in lowered and "80%" in text and "95%" in text
     assert "MS" in text and "summing daily intervals" in lowered
-    # Dataset-agnostic: no schema names from the dataset leak into the prose.
-    assert "event_count" in text
+    # The series section renders the fixture's spec, metric included.
+    assert "metric=event_count" in text
+
+
+def test_forecasting_topic_names_real_output_columns(memory):
+    from analyst.data.service import _FORECAST_COLUMNS
+
+    text = read_topic(memory, "forecasting", cutoff=None)
+    for column in ("lo_80", "hi_80", "lo_95", "hi_95"):
+        assert column in text and column in _FORECAST_COLUMNS
 
 
 def test_unknown_topic_hint(memory):
