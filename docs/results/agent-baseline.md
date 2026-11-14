@@ -87,6 +87,7 @@ The same harness and graders, re-run after Plan B2 added the Docker CodeAct sand
 
 **Other measures:**
 - Forecast skill is unchanged: WAPE 0.083, coverage 0.69 at 80% and 0.87 at 95%.
+  These numbers are optimistic: the forecaster's `recommended_models` were chosen by the Plan A replay on the same cutoffs this eval scores, so they are not an independent out-of-sample test (see the B1 follow-ups).
 - Latency: median 21.2 s, p95 67.8 s.
 - Mean trajectory score: 0.89.
 
