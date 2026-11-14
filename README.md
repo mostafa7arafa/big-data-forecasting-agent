@@ -213,7 +213,7 @@ docs/              spec, plans, research, results
 
 - [x] **Plan A: data and forecasting core.** Engine, semantic layer, forecasting, cutoff replay, profiler, gold set ([PR #1](https://github.com/mostafa7arafa/big-data-forecasting-agent/pull/1))
 - [x] **Plan B1: the agent in LangGraph Studio.** The analyst graph, tools, verification labels, background worker and a 50-question eval run as a LangSmith experiment
-- [x] **Plan B2: sandbox and compaction.** `run_python` in a locked-down Docker sandbox (no network, no capabilities, read-only root, only the run's own cutoff-bounded results mounted), an AST guard, a 20-case escape suite, and digest compaction of long chats. Eval: 78% on 55 questions, 5/5 Python questions Verified · off-model ([baseline](docs/results/agent-baseline.md))
+- [x] **Plan B2: sandbox and compaction.** `run_python` in a locked-down Docker sandbox (no network, no capabilities, read-only root, only the run's own cutoff-bounded results mounted), an AST guard, a 20-case escape suite, and digest compaction of long chats. Eval: 73% on 55 questions (B1: 70% on 50), 5/5 Python questions Verified · off-model ([baseline](docs/results/agent-baseline.md))
 - [ ] **Plan C: calibration and memory.** The agent drafts a new dataset's semantic layer from the profile, you approve it, and it remembers per user across sessions
 - [ ] **Plan D: evals at scale.** About 70 gold questions, agent-level cutoff replay, grounding checks, model comparisons, a second non-taxi dataset
 - [ ] **Web: Leptos/Rust dashboard.** Built to render millions of chart points without lag
