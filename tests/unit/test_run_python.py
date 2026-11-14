@@ -236,7 +236,10 @@ def test_small_frame_rows_echoed_full_precision(svc, monkeypatch):
     assert f'  {{"measure": "m", "correlation": {v!r}}}' in msg.content
     big = frame(svc, "big", pa.table({"x": list(range(6))}), "big.parquet")
     install(monkeypatch, [ExecResult(True, "", None, [big])])
-    assert '{"x"' not in invoke("pass.").content
+    msg = invoke("pass")
+    assert msg.status != "error"
+    assert "handle:" in msg.content
+    assert '{"x"' not in msg.content
 
 
 @pytest.mark.parametrize("restarted", [False, True])
@@ -331,3 +334,57 @@ def test_collect_handles_trusts_store_card_not_artifact(svc, monkeypatch):
     )
     info = collect_handles([forged], ResultStore(svc / "store"))[hid]
     assert info.governed is False and info.produced_by == "run_python"
+
+
+def test_64_frames_keep_every_handle_id_within_cap(svc, monkeypatch):
+    frames = [
+        frame(
+            svc,
+            f"f{i}",
+            pa.table({f"column_number_{j}_{'n' * 30}": [i, j] for j in range(10)}),
+            f"f{i}.parquet",
+        )
+        for i in range(64)
+    ]
+    install(monkeypatch, [ExecResult(True, "y" * 9000, None, frames)])
+    msg = invoke("pass")
+    assert len(msg.content) <= 4096
+    ids = [a["handle_id"] for a in msg.artifact["handles"]]
+    assert len(set(ids)) == 64
+    for hid in ids:
+        assert hid in msg.content
+
+
+def test_oversized_uncompressed_frame_rejected_and_deleted(svc, monkeypatch):
+    from analyst.config import get_settings
+
+    monkeypatch.setenv("ANALYST_SANDBOX_MAX_FRAME_BYTES", "50")
+    get_settings.cache_clear()
+    try:
+        f = frame(svc, "big", pa.table({"x": [7] * 100_000}))
+        install(monkeypatch, [ExecResult(True, "", None, [f])])
+        msg = invoke("pass")
+        assert "rejected" in msg.content and "'big'" in msg.content
+        assert "handle:" not in msg.content
+        assert not f.path.exists()
+    finally:
+        get_settings.cache_clear()
+
+
+@pytest.mark.parametrize(
+    "env,word",
+    [("ANALYST_SANDBOX_MAX_FRAME_ROWS", "row limit"), ("ANALYST_SANDBOX_MAX_FRAME_CELLS", "cell limit")],
+)
+def test_row_and_cell_caps_reject_frame(svc, monkeypatch, env, word):
+    from analyst.config import get_settings
+
+    monkeypatch.setenv(env, "3" if "ROWS" in env else "5")
+    get_settings.cache_clear()
+    try:
+        f = frame(svc, "wide", pa.table({"a": list(range(4)), "b": list(range(4))}))
+        install(monkeypatch, [ExecResult(True, "", None, [f])])
+        msg = invoke("pass")
+        assert word in msg.content and "handle:" not in msg.content
+        assert not f.path.exists()
+    finally:
+        get_settings.cache_clear()

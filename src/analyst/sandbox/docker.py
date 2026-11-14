@@ -184,11 +184,14 @@ class DockerSandbox:
         staging_dir: Path | None = None, max_stage_bytes: int = MAX_STAGE_BYTES,
     ) -> None:
         self.in_dir = Path(in_dir)
-        self.out_dir = Path(out_dir)
+        base_dir = Path(out_dir)
+        # A unique scratch dir per instance: a replacement sandbox for the same
+        # key (after LRU eviction) must not share files with a still-running one.
+        self.out_dir = base_dir / uuid.uuid4().hex
         # Host-only (never mounted): saved files are copied here after validation.
         self.staging_dir = (
             Path(staging_dir) if staging_dir is not None
-            else self.out_dir.with_name(self.out_dir.name + ".staged")
+            else base_dir.with_name(base_dir.name + ".staged")
         )
         self.image = image
         self.timeout_s = timeout_s
@@ -400,6 +403,7 @@ class DockerSandbox:
     def close(self) -> None:
         with self._lock:
             self._kill()
+            shutil.rmtree(self.out_dir, ignore_errors=True)
 
 
 # -- orphan reaping ----------------------------------------------------------------

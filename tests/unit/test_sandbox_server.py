@@ -132,3 +132,33 @@ def test_save_count_is_capped_per_cell(server):
     assert len(r["saved"]) == 64
     r = server.run("save(pd.DataFrame({'a': [1]}), 'y')")
     assert r["ok"] and len(r["saved"]) == 1
+
+
+def _server_module():
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("sandbox_server_mod", SERVER)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_bounded_writer_never_holds_more_than_limit():
+    mod = _server_module()
+    w = mod.BoundedWriter(limit=100)
+    for _ in range(200_000):
+        w.write("line of output\n")
+    assert w.size == 100 and len(w.getvalue()) == 100 and w.truncated
+
+
+def test_bounded_writer_small_output_not_truncated():
+    mod = _server_module()
+    w = mod.BoundedWriter(limit=100)
+    w.write("hi")
+    assert w.getvalue() == "hi" and not w.truncated
+
+
+def test_repeated_prints_are_capped(server):
+    r = server.run("for _ in range(200000):\n    print('spam line')")
+    assert r["ok"] and r["truncated"] and len(r["stdout"]) <= 4096
+    assert r["stdout"].endswith("… (truncated)")

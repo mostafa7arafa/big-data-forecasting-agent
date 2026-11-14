@@ -22,6 +22,9 @@ _Plan B2 (Docker CodeAct sandbox and compaction) was built on branch `feat/plan-
 - Ruling R16: final-review minors 2 (chip names forecast not run_python), 5 (container runs as host uid), 6 (image not hash/digest pinned), 7 (compaction.py lives in middleware/), 8 (no cutoff python eval row) → followups doc, not fix wave — low.
 - Ruling R17: final re-review minors parked to followups (no second fix wave): evicted-while-held sandbox starts untracked container until process exit (fix: closed flag, refuse run); replacement after LRU eviction lacks the variables-lost note; shared out_dir race in that case; evals/target.py reads inputs['id'] before try; in-call disk fill through bind mount (needs quota'd volume or bytes-over-protocol) — narrow, reaped at exit — low.
 
+- Ruling R18: CodeRabbit "row echo returns raw rows" rejected — the ≤5-row echo is the model's own computed result saved via save(), capped and budgeted, not source records; it is what lets claims verify exactly (R12) — cost if wrong: a model could save() ≤5 raw source rows and see them (it already can print them in stdout).
+- Ruling R19: CodeRabbit "regenerate uv.lock" rejected — uv.lock was updated in 81b55b5 and `uv lock --check` passes. "Dockerfile from lockfile" deferred (already in followups, R16).
+
 ## Security model: what the guard and the container each stop
 
 The AST guard is a usability layer. It rejects disallowed imports, dunder access, `eval`/`exec`/`compile`, `open()` outside `/artifacts` and similar, with a hint the model can act on. **The container is the boundary.**
@@ -79,3 +82,6 @@ Residual risks:
 - (Final re-review) A sandbox evicted from the LRU cap while a caller still holds it starts an untracked container on its next `run()`, which lives until process exit or the next reap. Fix: a closed flag, and refuse to run.
 - (Final re-review) After an LRU eviction, the thread's next sandbox lacks the "variables were lost" note.
 - (Final re-review) `evals/target.py` reads `inputs['id']` before its `try`.
+- (CodeRabbit re-review) Per-instance scratch directories are removed only by `close()`. After a hard crash they persist, because `reap()` cleans containers, not directories.
+- (CodeRabbit re-review) `pq.ParquetFile` in the footer checks is not closed explicitly.
+- (CodeRabbit) The parquet footer caps (uncompressed bytes 512 MB, 5M rows, 20M cells) bound decoding, but not every pathological encoding.

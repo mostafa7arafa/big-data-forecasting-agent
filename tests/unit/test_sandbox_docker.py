@@ -177,16 +177,19 @@ def test_save_returns_host_path(tmp_dirs):
 def test_timeout_restarts_and_reports_state_loss(tmp_path):
     _need_image()
     sb = DockerSandbox(in_dir=tmp_path / "i", out_dir=tmp_path / "o", image=IMAGE, timeout_s=2)
+    name = ""
     try:
         assert sb.run("x = 5").ok
+        name = sb._name
         r = sb.run("while True: pass")
         assert not r.ok and r.restarted
         assert r.error == "timeout after 2 s; sandbox restarted, variables were lost"
         assert sb.run("print(1)").ok
         assert not sb.run("x").ok
+        name = sb._name
     finally:
         sb.close()
-    ps = subprocess.run(["docker", "ps", "-q", "--filter", "name=analyst-sbx-"],
+    ps = subprocess.run(["docker", "ps", "-q", "--filter", f"name={name}"],
                         check=False, capture_output=True, text=True).stdout
     assert ps.strip() == ""
 
@@ -519,3 +522,16 @@ def test_deeply_nested_response_restarts(tmp_path, monkeypatch):
     monkeypatch.setattr(sb, "_start", fake_start)
     res = sb.run("pass")
     assert not res.ok and res.restarted
+
+
+def test_instances_for_same_key_get_distinct_scratch_dirs_and_close_removes_own(tmp_path):
+    a = DockerSandbox(in_dir=tmp_path / "i", out_dir=tmp_path / "o", image="x", timeout_s=1)
+    b = DockerSandbox(in_dir=tmp_path / "i", out_dir=tmp_path / "o", image="x", timeout_s=1)
+    assert a.out_dir != b.out_dir
+    assert a.out_dir.parent == b.out_dir.parent == tmp_path / "o"
+    a.out_dir.mkdir(parents=True)
+    b.out_dir.mkdir(parents=True)
+    (b.out_dir / "keep.parquet").write_bytes(b"x")
+    a.close()
+    assert not a.out_dir.exists()
+    assert (b.out_dir / "keep.parquet").exists()

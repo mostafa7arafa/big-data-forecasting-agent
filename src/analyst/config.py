@@ -31,6 +31,9 @@ class Settings(BaseSettings):
     sandbox_image: str = "analyst-sandbox:1"
     sandbox_timeout_s: float = 30.0
     sandbox_max_live: int = Field(default=8, gt=0)
+    sandbox_max_frame_bytes: int = Field(default=512 * 1024 * 1024, gt=0)
+    sandbox_max_frame_rows: int = Field(default=5_000_000, gt=0)
+    sandbox_max_frame_cells: int = Field(default=20_000_000, gt=0)
 
     # Provider keys keep their ecosystem-standard names, so the LangChain,
     # LangSmith and OpenAI SDKs read the same environment this does.

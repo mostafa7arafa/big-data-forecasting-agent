@@ -15,7 +15,6 @@ Standard library + pandas only at import time.
 
 import ast
 import contextlib
-import io
 import json
 import os
 import re
@@ -47,6 +46,32 @@ def _cap(text: str) -> tuple[str, bool]:
 def _slug(name: str) -> str:
     s = re.sub(r"[^a-z0-9_-]+", "-", str(name).lower()).strip("-")[:40].strip("-")
     return s or "result"
+
+
+class BoundedWriter:
+    """Text sink keeping at most ``limit`` chars; later writes are discarded."""
+
+    def __init__(self, limit: int = CAP + 64) -> None:
+        self.limit = limit
+        self.size = 0
+        self.truncated = False
+        self._parts: list[str] = []
+
+    def write(self, text: str) -> int:
+        n = len(text)
+        room = self.limit - self.size
+        if room > 0:
+            self._parts.append(text[:room])
+            self.size += min(n, room)
+        if n > room:
+            self.truncated = True
+        return n
+
+    def flush(self) -> None:
+        pass
+
+    def getvalue(self) -> str:
+        return "".join(self._parts)
 
 
 class Session:
@@ -101,7 +126,7 @@ class Session:
 
     def handle(self, req: dict) -> dict:
         self.saved = []
-        buf = io.StringIO()
+        buf = BoundedWriter()
         error = None
         try:
             with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
@@ -110,6 +135,7 @@ class Session:
             tb = exc.__traceback__
             error = "".join(traceback.format_exception(type(exc), exc, tb.tb_next if tb else None))
         stdout, t1 = _cap(buf.getvalue())
+        t1 = t1 or buf.truncated
         err, t2 = _cap(error) if error else (None, False)
         return {
             "id": req.get("id"),

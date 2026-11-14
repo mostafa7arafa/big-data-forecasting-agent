@@ -2,11 +2,13 @@
 
 import hashlib
 import json
+import re
 import time
 
 import pyarrow.parquet as pq
 from langchain.tools import ToolRuntime
 
+from analyst.config import get_settings
 from analyst.context import AnalystContext
 from analyst.errors import AnalystError, InvalidRequestError
 from analyst.sandbox import ExecResult, SavedFrame, get_sandbox
@@ -93,6 +95,26 @@ def _content_sha(path) -> str:
     return digest.hexdigest()[:16]
 
 
+def _budget_lines(lines: list[str]) -> list[str]:
+    """Handle/note lines within the content budget; every handle id survives."""
+    limit = MAX_CONTENT_CHARS - 400  # headroom for stdout notes
+    if sum(len(x) + 1 for x in lines) <= limit:
+        return lines
+    short = [re.sub(r"\s+columns: .*$", "", x) for x in lines]
+    if sum(len(x) + 1 for x in short) <= limit:
+        return short
+    out: list[str] = []
+    used = 0
+    for i, line in enumerate(short):
+        if used + len(line) + 1 > limit - 40:
+            ids = [m for x in short[i:] for m in re.findall(r"r_[0-9a-f]{10}", x)]
+            out.append(f"(+{len(short) - i} lines omitted; handles: {' '.join(ids)})")
+            break
+        out.append(line)
+        used += len(line) + 1
+    return out
+
+
 def _ingest(
     runtime: ToolRuntime[AnalystContext],
     code: str,
@@ -100,12 +122,29 @@ def _ingest(
     elapsed_s: float,
 ) -> tuple[list[str], list[dict], list[tuple[str, list[str]]]]:
     store = service_for(runtime).store
+    cfg = get_settings()
+    cap_bytes, cap_rows, cap_cells = (
+        cfg.sandbox_max_frame_bytes, cfg.sandbox_max_frame_rows, cfg.sandbox_max_frame_cells
+    )
     lines: list[str] = []
     artifacts: list[dict] = []
     echoes: list[tuple[str, list[str]]] = []
     for frame in frames:
         try:
             try:
+                meta = pq.ParquetFile(frame.path).metadata
+                size = sum(meta.row_group(i).total_byte_size for i in range(meta.num_row_groups))
+                cells = meta.num_rows * meta.num_columns
+                reason = None
+                if size > cap_bytes:
+                    reason = f"{size} bytes uncompressed exceeds the {cap_bytes} byte limit"
+                elif meta.num_rows > cap_rows:
+                    reason = f"{meta.num_rows} rows exceeds the {cap_rows} row limit"
+                elif cells > cap_cells:
+                    reason = f"{cells} cells exceeds the {cap_cells} cell limit"
+                if reason:
+                    lines.append(f"note: saved frame {frame.name!r} rejected: {reason}")
+                    continue
                 table = pq.read_table(frame.path)
                 # Content-addressed: the same cell over different kernel state
                 # (new thread, restart) must never overwrite an earlier handle.
@@ -185,7 +224,7 @@ def _run(code: str, runtime: ToolRuntime[AnalystContext]) -> Result:
     if res.truncated:
         parts.append("(stdout truncated)")
     # Cards must survive the cap: bound stdout so the handle lines always fit.
-    card_text = "\n".join(lines)
+    card_text = "\n".join(_budget_lines(lines))
     room = MAX_CONTENT_CHARS - len(card_text) - 2
     echo = _echo_lines(echoes, max(0, room - len(_OMITTED) - 1))
     if echo:
