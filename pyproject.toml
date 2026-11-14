@@ -20,6 +20,7 @@ dependencies = [
     "pyarrow>=26.0.1",
     "pydantic>=2.14.3",
     "pydantic-settings>=2.16.2",
+    "python-dotenv>=1.2.4",
     "pyyaml>=6.0.3",
     "statsforecast>=2.0.1",
     "utilsforecast>=0.2.17",
