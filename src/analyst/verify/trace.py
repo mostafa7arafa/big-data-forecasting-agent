@@ -118,7 +118,8 @@ def _text(message: object) -> str:
 def collect_handles(messages, store: ResultStore) -> dict[str, HandleInfo]:
     """Handles produced by tools in ``messages``, plus those reported by workers.
 
-    A handle missing from ``store`` is unknown and left out.
+    A handle missing from ``store`` is unknown and left out. ``produced_by``
+    and ``governed`` always come from the stored card, never the message.
     """
     found: dict[str, HandleInfo] = {}
     for message in messages:
@@ -136,16 +137,11 @@ def collect_handles(messages, store: ResultStore) -> dict[str, HandleInfo]:
         if entries:
             for entry in entries:
                 hid = entry["handle_id"]
+                # The store card is authoritative for produced_by/governed:
+                # a message artifact can be stale or forged.
                 loaded = load_handle_info(store, hid)
                 if loaded is not None:
-                    found[hid] = HandleInfo(
-                        hid,
-                        str(entry.get("produced_by", "")),
-                        bool(entry.get("governed", False)),
-                        loaded.values,
-                        loaded.columns,
-                        loaded.levels,
-                    )
+                    found[hid] = loaded
             continue
         if is_background_notification(message):
             for line in _HANDLES_LINE.findall(_text(message)):

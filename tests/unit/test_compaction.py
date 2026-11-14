@@ -178,3 +178,15 @@ def test_nothing_droppable_but_summaries_makes_no_model_call():
     chat.calls.clear()
     assert _run(chat, msgs, keep=1, protect=1) is None
     assert chat.calls == []
+
+
+def test_digest_values_render_at_full_precision():
+    from analyst.middleware.compaction import Digest, render_digest
+
+    v = 0.08283779943279351
+    text = render_digest(
+        Digest(goal="g", findings=[Finding(text="corr", values=[v, 123456.0], handles=[])]),
+        [],
+    )
+    assert f"values: {v!r}, 123456.0" in text
+    assert "0.0828378" not in text.replace(repr(v), "")

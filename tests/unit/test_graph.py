@@ -999,12 +999,12 @@ def test_zero_claim_answer_is_not_retried():
 # --- compaction at the graph level ------------------------------------------
 
 
-def _saved(store, value: float) -> str:
+def _saved(store, value: float, produced_by: str = "query_metrics", governed: bool = True) -> str:
     return store.save(
         pa.table({"v": pa.array([value])}),
-        produced_by="query_metrics",
+        produced_by=produced_by,
         source="seeded",
-        governed=True,
+        governed=governed,
         elapsed_s=0.0,
     ).handle_id
 
@@ -1013,21 +1013,27 @@ def _digest_turn(goal: str) -> AIMessage:
     return AIMessage("", tool_calls=[call("Digest", {"goal": goal}, "d0")])
 
 
-def test_compaction_graph_keeps_turn_handles_and_prior_handle(monkeypatch):
+@pytest.mark.parametrize(
+    ("produced_by", "governed", "label"),
+    [("query_metrics", True, "verified"), ("run_python", False, "verified_off_model")],
+)
+def test_compaction_graph_keeps_turn_handles_and_prior_handle(
+    monkeypatch, produced_by, governed, label
+):
     from analyst.middleware.compaction import is_compaction_summary
 
     monkeypatch.setenv("ANALYST_COMPACTION_TRIGGER_TOKENS", "1500")
     monkeypatch.setenv("ANALYST_COMPACTION_KEEP_MESSAGES", "1")
     get_settings.cache_clear()
     store = registry.get_service("events", None).store
-    handle_a = _saved(store, 123_456.0)
+    handle_a = _saved(store, 123_456.0, produced_by, governed)
     history = [
         HumanMessage("how many events last time?"),
-        AIMessage("", tool_calls=[call("query_metrics", COUNT, "c0")]),
+        AIMessage("", tool_calls=[call(produced_by, COUNT, "c0")]),
         ToolMessage(
             "card " + "x" * 8000,
             tool_call_id="c0",
-            artifact={"handle_id": handle_a, "produced_by": "query_metrics", "governed": True},
+            artifact={"handle_id": handle_a, "produced_by": produced_by, "governed": governed},
         ),
         AIMessage("There were 123,456 events.\n\nVerified"),
         HumanMessage("how many events now?"),
@@ -1056,9 +1062,7 @@ def test_compaction_graph_keeps_turn_handles_and_prior_handle(monkeypatch):
     assert is_compaction_summary(messages[0])
     assert handle_a in messages[0].content
     assert messages[1].content == "how many events now?"
-    assert out["answer"].verification.label in ("verified", "verified_off_model"), (
-        out["answer"].verification
-    )
+    assert out["answer"].verification.label == label, out["answer"].verification
 
     # second turn: the thread is already small, so no new digest is made
     model2 = ScriptedModel(
@@ -1072,7 +1076,7 @@ def test_compaction_graph_keeps_turn_handles_and_prior_handle(monkeypatch):
         for call_seen in model2.seen
         for m in call_seen
     )
-    assert out2["answer"].verification.label in ("verified", "verified_off_model")
+    assert out2["answer"].verification.label == "verified"
 
 
 def test_question_skips_compaction_summary():

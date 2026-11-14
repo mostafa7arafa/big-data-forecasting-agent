@@ -139,7 +139,8 @@ def render_digest(digest: Digest, handles: list[str]) -> str:
         for f in digest.findings:
             extra = []
             if f.values:
-                extra.append("values: " + ", ".join(f"{v:g}" for v in f.values))
+                # repr: full precision, so a value cited from the digest still traces
+                extra.append("values: " + ", ".join(repr(v) for v in f.values))
             if f.handles:
                 extra.append("handles: " + ", ".join(f.handles))
             suffix = f" ({'; '.join(extra)})" if extra else ""

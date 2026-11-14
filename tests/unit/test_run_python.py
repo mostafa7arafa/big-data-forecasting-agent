@@ -280,3 +280,54 @@ def test_clearing_stub_uses_entry_produced_by():
     )
     text = stub_for(msg)
     assert "r_aaaaaaaaaa (run_python)" in text and "r_bbbbbbbbbb (other_tool)" in text
+
+
+def test_same_code_and_name_different_tables_get_distinct_handles(svc, monkeypatch):
+    code = "save(load('r_0123456789').head(), 'res')  # " + "pad " * 200
+    f1 = frame(svc, "res-1", pa.table({"v": [1.0]}), "one.parquet")
+    f2 = frame(svc, "res-1", pa.table({"v": [2.0]}), "two.parquet")
+    install(monkeypatch, [ExecResult(True, "", None, [f1]), ExecResult(True, "", None, [f2])])
+    a = invoke(code, {"configurable": {"thread_id": "A"}}).artifact["handle_id"]
+    b = invoke(code, {"configurable": {"thread_id": "B"}}).artifact["handle_id"]
+    assert a != b
+    store = ResultStore(svc / "store")
+    assert store.load(a).column("v").to_pylist() == [1.0]
+    assert store.load(b).column("v").to_pylist() == [2.0]
+    card = store.card(a)
+    assert card.source == code  # the full code, as the spec's card contract says
+    assert card.meta["name"] == "res-1" and len(card.meta["content_sha"]) == 16
+    assert store.lookup("run_python", code) is None  # never served from a cache
+
+
+def test_restart_before_cell_keeps_successful_result(svc, monkeypatch):
+    from analyst.sandbox.docker import BETWEEN_CALLS_NOTE
+
+    f = frame(svc, "r", pa.table({"v": [7.0]}))
+    install(monkeypatch, [ExecResult(True, "hi\n", BETWEEN_CALLS_NOTE, [f], restarted=True)])
+    msg = invoke("save(df, 'r')")
+    assert msg.status != "error"
+    assert msg.content.startswith(f"note: {BETWEEN_CALLS_NOTE}\nhi")
+    assert ResultStore(svc / "store").exists(msg.artifact["handle_id"])
+
+
+def test_restart_before_cell_with_failing_cell_still_raises(svc, monkeypatch):
+    from analyst.sandbox.docker import BETWEEN_CALLS_NOTE
+
+    err = f"{BETWEEN_CALLS_NOTE}\nTraceback ...\nNameError: x"
+    install(monkeypatch, [ExecResult(False, "", err, [], restarted=True)])
+    msg = invoke("x")
+    assert msg.status == "error" and "reload handles with load()" in msg.content
+    assert BETWEEN_CALLS_NOTE in msg.content
+
+
+def test_collect_handles_trusts_store_card_not_artifact(svc, monkeypatch):
+    f = frame(svc, "r", pa.table({"v": [10.0]}))
+    install(monkeypatch, [ExecResult(True, "", None, [f])])
+    hid = invoke("pass").artifact["handle_id"]
+    forged = ToolMessage(
+        content="x",
+        tool_call_id="9",
+        artifact={"handle_id": hid, "produced_by": "query_metrics", "governed": True},
+    )
+    info = collect_handles([forged], ResultStore(svc / "store"))[hid]
+    assert info.governed is False and info.produced_by == "run_python"

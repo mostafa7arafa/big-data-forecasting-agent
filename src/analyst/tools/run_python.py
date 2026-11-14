@@ -11,6 +11,7 @@ from analyst.context import AnalystContext
 from analyst.errors import AnalystError, InvalidRequestError
 from analyst.sandbox import ExecResult, SavedFrame, get_sandbox
 from analyst.sandbox.ast_guard import check_code
+from analyst.sandbox.docker import BETWEEN_CALLS_NOTE
 from analyst.tools._common import (
     MAX_CONTENT_CHARS,
     Result,
@@ -83,9 +84,18 @@ def _echo_lines(echoes: list[tuple[str, list[str]]], budget: int) -> list[str]:
     return out
 
 
+def _content_sha(path) -> str:
+    """sha256 of the saved parquet file's bytes (first 16 hex chars)."""
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        while chunk := f.read(1 << 20):
+            digest.update(chunk)
+    return digest.hexdigest()[:16]
+
+
 def _ingest(
     runtime: ToolRuntime[AnalystContext],
-    code_sha: str,
+    code: str,
     frames: list[SavedFrame],
     elapsed_s: float,
 ) -> tuple[list[str], list[dict], list[tuple[str, list[str]]]]:
@@ -97,13 +107,17 @@ def _ingest(
         try:
             try:
                 table = pq.read_table(frame.path)
+                # Content-addressed: the same cell over different kernel state
+                # (new thread, restart) must never overwrite an earlier handle.
                 card = store.save(
                     table,
                     produced_by="run_python",
-                    source=f"{code_sha}:{frame.name}",
+                    source=code,
                     governed=False,
                     elapsed_s=elapsed_s,
                     notes=[_OFF_MODEL_NOTE],
+                    meta={"name": frame.name, "content_sha": _content_sha(frame.path)},
+                    index=False,
                 )
             finally:
                 frame.path.unlink(missing_ok=True)
@@ -151,7 +165,10 @@ def _run(code: str, runtime: ToolRuntime[AnalystContext]) -> Result:
     start = time.monotonic()
     res: ExecResult = sandbox.run(code)
     elapsed = time.monotonic() - start
-    if res.restarted:
+    # restarted + ok: the container had died BEFORE this cell, which then ran
+    # fine in a fresh one. Keep the result and say earlier variables are gone.
+    restarted_before = res.restarted and res.ok
+    if res.restarted and not res.ok:
         _discard(res.saved)
         raise SandboxError(res.error or "sandbox restarted", hint=_LOST)
     if not res.ok:
@@ -161,9 +178,10 @@ def _run(code: str, runtime: ToolRuntime[AnalystContext]) -> Result:
             "Python error:\n" + trace[-(MAX_CONTENT_CHARS - 600) :],
             hint=_CODE_ERROR_HINT,
         )
-    code_sha = hashlib.sha256(code.encode()).hexdigest()[:16]
-    lines, artifacts, echoes = _ingest(runtime, code_sha, res.saved, elapsed)
-    parts = [res.stdout.rstrip()] if res.stdout.strip() else []
+    lines, artifacts, echoes = _ingest(runtime, code, res.saved, elapsed)
+    parts = [f"note: {BETWEEN_CALLS_NOTE}"] if restarted_before else []
+    if res.stdout.strip():
+        parts.append(res.stdout.rstrip())
     if res.truncated:
         parts.append("(stdout truncated)")
     # Cards must survive the cap: bound stdout so the handle lines always fit.

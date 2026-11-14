@@ -26,6 +26,7 @@ import numpy as np
 import pandas as pd
 
 CAP = 4096
+MAX_SAVES = 64  # per cell: keeps one response line far below the host's line limit
 MARK = "… (truncated)"
 ID_RE = re.compile(r"^r_[0-9a-f]{10}$")
 
@@ -68,6 +69,8 @@ class Session:
     def save(self, df: pd.DataFrame, name: str) -> str:
         if not isinstance(df, pd.DataFrame):
             raise TypeError("save() expects a pandas DataFrame")
+        if len(self.saved) >= MAX_SAVES:
+            raise ValueError(f"at most {MAX_SAVES} save() calls per cell")
         out = os.path.realpath(_dirs()[1])
         slug = _slug(name)
         while True:
@@ -135,6 +138,11 @@ def main() -> None:
                     "saved": [], "truncated": False}
         proto.write(json.dumps(resp) + "\n")
         proto.flush()
+    # stdin closed: the host is gone. Exit now, even if user code left
+    # non-daemon threads running (they would keep the container alive).
+    with contextlib.suppress(Exception):
+        proto.flush()
+    os._exit(0)
 
 
 if __name__ == "__main__":

@@ -116,3 +116,19 @@ def test_malformed_request_gets_one_error_line(server):
     resp = json.loads(server.p.stdout.readline())
     assert resp["ok"] is False and "bad request" in resp["error"]
     assert server.run("print(1)")["ok"]
+
+
+def test_stdin_eof_exits_despite_non_daemon_thread(tmp_path):
+    s = Proc(tmp_path)
+    r = s.run("import threading, time\nthreading.Thread(target=time.sleep, args=(600,)).start()")
+    assert r["ok"], r["error"]
+    s.p.stdin.close()
+    assert s.p.wait(timeout=10) == 0
+
+
+def test_save_count_is_capped_per_cell(server):
+    r = server.run("df = pd.DataFrame({'a': [1]})\nfor i in range(65):\n    save(df, 'x')")
+    assert not r["ok"] and "at most 64 save() calls per cell" in r["error"]
+    assert len(r["saved"]) == 64
+    r = server.run("save(pd.DataFrame({'a': [1]}), 'y')")
+    assert r["ok"] and len(r["saved"]) == 1

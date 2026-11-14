@@ -3,7 +3,13 @@
 Every case runs its attack with the AST guard bypassed (``DockerSandbox.run``
 directly) and asserts the container contains it. Unless the guard legitimately
 allows the code (ruling R4: huge stdout, infinite loop, memory bomb, load()
-traversal), the case also asserts the guard rejects it at the tool level.
+traversal, sparse files, output floods), the case also asserts the guard
+rejects it at the tool level.
+
+"Contains" is not always "fails": ctypes, subprocess, importlib, eval/exec and
+the ``__subclasses__`` walk are guard-blocked; with the guard bypassed the
+container runs them, unprivileged (uid != 0, no capabilities, no network, no
+secrets in the environment), and the cases assert exactly that.
 Probes print secret env var NAMES only, never values.
 """
 
@@ -360,3 +366,103 @@ def test_write_inside_scratch_still_works(sb):
     check_code(code)
     r = _run(sb, code + "\nopen('/tmp/ok.txt', 'w').write('y')")
     assert r.ok, r.error
+
+
+# --- host-side resource bounds and lifecycle (final review I2, I3) -------------------
+def _box(tmp_path, **kw) -> DockerSandbox:
+    _need_image()
+    return DockerSandbox(in_dir=tmp_path / "in", out_dir=tmp_path / "out", image=IMAGE,
+                         timeout_s=kw.pop("timeout_s", 30), **kw)
+
+
+_SPARSE = """
+    save(pd.DataFrame({'a': [1]}), 'sparse')
+    f = open('/artifacts/out/sparse-1.parquet', 'r+b')
+    f.seek({offset})
+    f.write(b'1')
+    f.close()
+"""
+
+
+# 21 (guard allows: R4) sparse file past RLIMIT_FSIZE
+def test_sparse_file_past_fsize_blocked_in_container(tmp_path):
+    code = textwrap.dedent(_SPARSE).replace("{offset}", str(300 * 1024 * 1024))
+    check_code(code)
+    box = _box(tmp_path)
+    try:
+        r = box.run(code)
+        assert not r.ok and ("File too large" in r.error or "Errno 27" in r.error), r.error
+        for f in r.saved:
+            f.path.unlink(missing_ok=True)
+        _alive(box)
+    finally:
+        box.close()
+
+
+# 22 (guard allows: R4) sparse file under fsize but over the host staging limit
+def test_sparse_file_over_staging_limit_rejected_on_host(tmp_path):
+    code = textwrap.dedent(_SPARSE).replace("{offset}", str(100 * 1024 * 1024))
+    check_code(code)
+    box = _box(tmp_path, max_stage_bytes=50 * 1024 * 1024)
+    try:
+        r = box.run(code)
+        assert not r.ok and not r.saved and "staging limit" in r.error, r.error
+        assert not box.staging_dir.exists() or not any(box.staging_dir.iterdir())
+        assert list(box.out_dir.iterdir()) == []  # scratch wiped after the call
+    finally:
+        box.close()
+
+
+# 23 stderr flood without newline: host keeps only a bounded tail
+def test_stderr_flood_is_bounded(sb):
+    code = "import os\nchunk = b'e' * (1 << 20)\nfor _ in range(300):\n    os.write(2, chunk)\nprint('done')"
+    _guard_rejects(code, "import of 'os'")
+    r = sb.run(code)
+    assert r.ok and r.stdout.strip() == "done", r.error
+    assert len(sb._stderr) <= 8 * 1024
+    _alive(sb)
+
+
+# 24 protocol-fd flood without newline: protocol error, restart, recovery
+def test_protocol_fd_flood_restarts(tmp_path):
+    code = textwrap.dedent("""
+        import os, stat
+        skip = {os.fstat(0).st_ino, os.fstat(2).st_ino}
+        chunk = b'p' * (1 << 20)
+        for fd in range(3, 64):
+            try:
+                st = os.fstat(fd)
+            except OSError:
+                continue
+            if stat.S_ISFIFO(st.st_mode) and st.st_ino not in skip:
+                for _ in range(300):
+                    os.write(fd, chunk)
+    """)
+    _guard_rejects(code, "import of 'os'")
+    box = _box(tmp_path)
+    try:
+        t0 = time.monotonic()
+        r = box.run(code)
+        assert time.monotonic() - t0 < 30
+        assert not r.ok and r.restarted and "protocol error" in r.error, r.error
+        _alive(box)
+    finally:
+        box.close()
+
+
+# 25 orphan on exit: a non-daemon thread must not keep the container alive
+def test_stdin_eof_exits_container_despite_non_daemon_thread(tmp_path):
+    box = _box(tmp_path)
+    try:
+        r = box.run("import threading, time\nthreading.Thread(target=time.sleep, args=(600,)).start()")
+        assert r.ok, r.error
+        name = box._name
+        labelled = subprocess.run(
+            ["docker", "ps", "-q", "--filter", "label=analyst.sandbox=1", "--filter", f"name={name}"],
+            check=False, capture_output=True, text=True).stdout
+        assert labelled.strip(), "sandbox container is not labelled"
+        box._proc.stdin.close()  # what the host's death looks like to the container
+        box._proc.wait(timeout=20)
+        assert _containers(name) == "", "container outlived its host connection"
+    finally:
+        box.close()
