@@ -374,11 +374,11 @@ EVAL_SET = Path(__file__).resolve().parents[2] / "evals/datasets/agent_single_tu
 
 def test_eval_set_mix():
     rows = load_rows(EVAL_SET)
-    assert [r["id"] for r in rows] == [f"a{i:03d}" for i in range(1, 51)]
+    assert [r["id"] for r in rows] == [f"a{i:03d}" for i in range(1, 56)]
     counts: dict[str, int] = {}
     for row in rows:
         counts[row["category"]] = counts.get(row["category"], 0) + 1
-    assert counts == {"lookup": 20, "comparison": 8, "forecast": 8, "off_model": 6, "trap": 5, "safe": 3}
+    assert counts == {"lookup": 20, "comparison": 8, "forecast": 8, "off_model": 6, "python": 5, "trap": 5, "safe": 3}
     forecast_cutoffs = {r["cutoff"] for r in rows if r["category"] == "forecast"}
     assert forecast_cutoffs == {"2025-07-31", "2026-01-31", "2026-07-31"}
 
@@ -389,7 +389,7 @@ def test_eval_set_rows_have_a_gate():
         assert applicable, row["id"]
         if row["category"] == "forecast":
             assert row["key_values"] == [] and row["gold_sql"]
-        if row["category"] in ("comparison", "off_model"):
+        if row["category"] in ("comparison", "off_model", "python"):
             assert row["key_values"], row["id"]
 
 

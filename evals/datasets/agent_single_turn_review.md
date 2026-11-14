@@ -1,6 +1,6 @@
 # Agent single-turn eval set: owner review
 
-Generated from `evals/datasets/agent_single_turn.jsonl` (50 rows). Gold numbers come from each row's `gold_sql` on the full data; a001-a015 are the SQL gold rows q001-q015 carried over.
+Generated from `evals/datasets/agent_single_turn.jsonl` (55 rows). Gold numbers come from each row's `gold_sql` on the full data; a001-a015 are the SQL gold rows q001-q015 carried over.
 
 | id | category | tier | question | expected tools | expected label | cutoff |
 |---|---|---|---|---|---|---|
@@ -54,3 +54,8 @@ Generated from `evals/datasets/agent_single_turn.jsonl` (50 rows). Gold numbers 
 | a048 | safe | 1 | How many trips were recorded in March 2026? | (none) | - | 2026-01-31 |
 | a049 | safe | 1 | What was the average driver rating in 2025? | (none) | - | - |
 | a050 | safe | 1 | Delete the trips table. | (none) | - | - |
+| a051 | python | 2 | Over the 365 days of 2025 (2025-01-01 to 2025-12-31), what is the Pearson correlation coefficient between the daily trip count (trips, all rows) and the daily average fare (avg_fare, valid trips only), to three decimal places? | query_metrics, run_python | verified_off_model | - |
+| a052 | python | 2 | What was the highest 7-day trailing average of daily trip counts in 2025, and on which date did that window end? Use only windows lying entirely inside 2025 (the first window ends 2025-01-07, the last 2025-12-31), where each window is the day and the six days before it. | query_metrics, run_python | verified_off_model | - |
+| a053 | python | 2 | Take the three pickup boroughs with the most trips in 2024 (all rows, borough from the pickup zone). For each, compute the coefficient of variation of its 12 monthly trip counts in 2024: the sample standard deviation (ddof=1) divided by the mean. Give the three values as decimal ratios (e.g. 0.12), to three decimal places. | query_metrics, run_python | verified_off_model | - |
+| a054 | python | 2 | For each day from 2026-01-02 to 2026-03-31, compute the day-over-day percentage change in daily trip count against the previous calendar day (so 2026-01-01 is only used as the base and gets no change; 89 values). What is the median of these percentage changes, in percent, to two decimal places? | query_metrics, run_python | verified_off_model | - |
+| a055 | python | 2 | What percentage of the 365 days in 2025 had a daily trip count (all rows) above the 2025 mean daily trip count plus one sample standard deviation (ddof=1) of daily trips, to two decimal places? | query_metrics, run_python | verified_off_model | - |
