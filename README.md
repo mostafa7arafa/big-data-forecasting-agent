@@ -213,14 +213,14 @@ docs/              spec, plans, research, results
 
 - [x] **Plan A: data and forecasting core.** Engine, semantic layer, forecasting, cutoff replay, profiler, gold set ([PR #1](https://github.com/mostafa7arafa/big-data-forecasting-agent/pull/1))
 - [x] **Plan B1: the agent in LangGraph Studio.** The analyst graph, tools, verification labels, background worker and a 50-question eval run as a LangSmith experiment
-- [ ] **Plan B2: sandbox and compaction.** A guarded CodeAct sandbox and context compaction
+- [x] **Plan B2: sandbox and compaction.** `run_python` in a locked-down Docker sandbox (no network, no capabilities, read-only root, only the run's own cutoff-bounded results mounted), an AST guard, a 20-case escape suite, and digest compaction of long chats. Eval: 78% on 55 questions, 5/5 Python questions Verified · off-model ([baseline](docs/results/agent-baseline.md))
 - [ ] **Plan C: calibration and memory.** The agent drafts a new dataset's semantic layer from the profile, you approve it, and it remembers per user across sessions
 - [ ] **Plan D: evals at scale.** About 70 gold questions, agent-level cutoff replay, grounding checks, model comparisons, a second non-taxi dataset
 - [ ] **Web: Leptos/Rust dashboard.** Built to render millions of chart points without lag
 
 ## How it's built
 
-Spec first, then a plan, then implementation by agents with independent review. Each task was built by a delegated coding agent (Cursor, or Pi running a Codex model). A separate model reviewed each task for spec compliance and code quality, and an opus-level review and CodeRabbit covered the whole branch before merge. Every judgment call is recorded with its cost if wrong in [`docs/superpowers/plans/2026-11-08-plan-a-followups.md`](docs/superpowers/plans/2026-11-08-plan-a-followups.md).
+Spec first, then a plan, then implementation by agents with independent review. Each task was built by a delegated coding agent (Cursor, or Pi running a Codex model). A separate model reviewed each task for spec compliance and code quality, and an opus-level review and CodeRabbit covered the whole branch before merge. The CodeAct sandbox is a security boundary of its own: the container never sees raw data, only result files the cutoff-enforcing engine already produced, so a forecast replay can't leak the future through Python. Every judgment call is recorded with its cost if wrong in [`docs/superpowers/plans/2026-11-08-plan-a-followups.md`](docs/superpowers/plans/2026-11-08-plan-a-followups.md).
 
 <div align="center">
 <sub>Data: <a href="https://www.nyc.gov/site/tlc/about/tlc-trip-record-data.page">NYC TLC Trip Record Data</a> · built by <a href="https://github.com/mostafa7arafa">Mostafa Arafa</a> · <a href="LICENSE">MIT License</a></sub>
