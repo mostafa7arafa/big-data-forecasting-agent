@@ -19,6 +19,14 @@ DEFAULT_STUB = "[cleared] tool output"
 def stub_for(message: ToolMessage) -> str:
     """Build the replacement text for one cleared tool message."""
     artifact = message.artifact if isinstance(message.artifact, dict) else {}
+    many = artifact.get("handles")
+    if not artifact.get("handle_id") and isinstance(many, list):
+        entries = [a for a in many if isinstance(a, dict) and a.get("handle_id")]
+        if entries:
+            labels = ", ".join(
+                f"{a['handle_id']} ({a.get('produced_by') or 'unknown'})" for a in entries
+            )
+            return f"[cleared] {labels}; call describe('<handle>') to see it again"
     handle_id = artifact.get("handle_id")
     if not handle_id:
         return DEFAULT_STUB

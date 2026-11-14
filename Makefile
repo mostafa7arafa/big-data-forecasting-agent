@@ -1,7 +1,13 @@
-.PHONY: test test-taxi lint replay dev eval-agent
+.PHONY: test test-docker sandbox-image test-taxi lint replay dev eval-agent
 
 test:
-	uv run pytest -m "not taxi and not live"
+	uv run pytest -m "not taxi and not live and not docker"
+
+test-docker:
+	uv run pytest -m docker
+
+sandbox-image:
+	docker build -t analyst-sandbox:1 docker/sandbox
 
 test-taxi:
 	uv run pytest -m taxi
