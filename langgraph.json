@@ -1,1 +1,19 @@
-{"dependencies": ["."], "graphs": {"analyst": "./src/analyst/graph.py:graph", "worker": "./src/analyst/worker.py:graph"}, "env": ".env"}
+{
+  "dependencies": ["."],
+  "graphs": {
+    "analyst": "./src/analyst/graph.py:graph",
+    "worker": "./src/analyst/worker.py:graph"
+  },
+  "env": ".env",
+  "http": {
+    "app": "./src/analyst/http/app.py:app",
+    "cors": {
+      "allow_origins": ["http://localhost:3000", "https://smith.langchain.com"],
+      "allow_methods": ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+      "allow_headers": ["*"],
+      "allow_credentials": false,
+      "expose_headers": ["x-pagination-total", "x-pagination-next", "content-location", "location"],
+      "max_age": 600
+    }
+  }
+}

@@ -7,6 +7,7 @@ An AI data analyst over ~162M NYC taxi trips (DuckDB over Parquet) that answers 
 - Plan A (data and forecasting core, done): `docs/superpowers/plans/2026-11-07-plan-a-data-and-forecasting-core.md`
 - Plan A rulings: `docs/superpowers/plans/2026-11-08-plan-a-followups.md`; Plan B spec (B1 and B2 done): `docs/superpowers/specs/2026-11-12-plan-b-agent-harness-design.md`; B1 rulings and deferred items: `docs/superpowers/plans/2026-11-14-plan-b1-followups.md`
 - While a plan runs, its progress ledger (gitignored, the recovery map) lives at `.superpowers/sdd/<plan-name>/progress.md` — tasks with `Task N: complete` are DONE; every `Ruling:` line is a decision to report to the owner
+- Dashboard: spec `docs/superpowers/specs/2026-11-15-dashboard-design.md`; Plan W1 (backend, done) followups and the W2 handoff: `docs/superpowers/plans/2026-11-15-plan-w1-followups.md`
 - Research: `docs/research/01-04`; web dashboard brief (separate later session): `docs/superpowers/briefs/web-dashboard-brief.md`
 
 ## How we work
@@ -16,7 +17,7 @@ An AI data analyst over ~162M NYC taxi trips (DuckDB over Parquet) that answers 
 - One implementer at a time. Briefs, dispatches, reports, reviews live in the ledger directory.
 
 ## Commands
-- `make test` (unit, synthetic data) · `make test-taxi` (integration, needs `data/raw`) · `make lint` · `make replay` (model cutoff replay → `docs/results/`) · `make dev` (LangGraph Studio on the `analyst` graph via `langgraph dev`; needs `.env` keys) · `make eval-agent` (55-question agent eval as a LangSmith experiment; `--dry-run` runs locally; needs `.env` keys and the sandbox image) · `make sandbox-image` (builds `analyst-sandbox:1` for `run_python`) · `make test-docker` (sandbox and escape-suite tests, need Docker and the image)
+- `./dev.sh` (starts the agent server, plus the Nuxt dashboard once `web/` exists, and opens the browser; Ctrl+C stops all; logs in `.dev/`) · `make test` (unit, synthetic data) · `make test-taxi` (integration, needs `data/raw`) · `make lint` · `make replay` (model cutoff replay → `docs/results/`) · `make dev` (LangGraph Studio on the `analyst` graph via `langgraph dev`; also serves `/meta`, `/charts`, `/geo`, `/feedback`; needs `.env` keys) · `make eval-agent` (55-question agent eval as a LangSmith experiment; `--dry-run` runs locally; needs `.env` keys and the sandbox image) · `make sandbox-image` (builds `analyst-sandbox:1` for `run_python`) · `make test-docker` (sandbox and escape-suite tests, need Docker and the image)
 - Data: `scripts/download_data.sh` (45 monthly files 2023-01..2026-09 into `data/raw/`, resumable)
 
 ## Rules that bite
@@ -24,4 +25,5 @@ An AI data analyst over ~162M NYC taxi trips (DuckDB over Parquet) that answers 
 - The engine is a security boundary: single SELECT, AST-validated to reference only dataset views/CTEs with plain identifiers; cutoff enforced in the engine. Don't weaken it.
 - Tools return summary cards (≤ 4,096 chars) and handles, never raw rows.
 - Forecasts always carry a SeasonalNaive comparison; origin = end of data (respecting cutoff), never today.
+- Model prices and context windows live in `config/models.yaml` (the trace cost comes from it); never invent a number there, leave it null.
 - Python 3.12 via `uv`; `duckdb==2.0.0` pinned; everything locked in `uv.lock`.

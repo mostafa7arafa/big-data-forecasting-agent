@@ -1,0 +1,36 @@
+{
+  "chart_id": "c_0123456789",
+  "cutoff": "2026-06-30",
+  "data": {
+    "color": [
+      "u",
+      "v",
+      "u"
+    ],
+    "mode": "points",
+    "x": [
+      1.0,
+      2.0,
+      3.0
+    ],
+    "y": [
+      2.0,
+      1.0,
+      3.0
+    ]
+  },
+  "dataset": "demo",
+  "downsampled": null,
+  "kind": "scatter",
+  "notes": [],
+  "spec": {
+    "color": "k",
+    "handle": "r_618b9ff6e1",
+    "kind": "scatter",
+    "title": "Scatter",
+    "x": "x",
+    "y": "y"
+  },
+  "title": "Scatter",
+  "version": 1
+}

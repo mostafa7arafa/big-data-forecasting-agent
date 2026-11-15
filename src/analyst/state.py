@@ -1,9 +1,12 @@
 """Answer schema and graph state shared by the agent, verifier and UI."""
 
+import operator
 from typing import Annotated, Any, Literal, NotRequired, TypedDict
 
 from langgraph.graph.message import add_messages
 from pydantic import BaseModel, Field, field_validator
+
+from analyst.charts.store import CHART_ID_RE
 
 
 def _none_to_list(value: object) -> object:
@@ -29,20 +32,6 @@ class Claim(BaseModel):
     _lists = _null_lists("values", "handles", "fact_ids")
 
 
-class ChartSpec(BaseModel):
-    kind: Literal["line", "bar"]
-    title: str
-    handle: str
-    x: str
-    y: str
-    series: str | None = None
-    forecast_handle: str | None = None
-    bands: list[int] = Field(default_factory=list)
-    last_year_handle: str | None = None
-
-    _lists = _null_lists("bands")
-
-
 class Verification(BaseModel):
     label: Literal["verified", "verified_off_model", "not_verified"]
     reason: str
@@ -53,12 +42,23 @@ class Verification(BaseModel):
 class Answer(BaseModel):
     narrative: str
     claims: list[Claim]
-    charts: list[ChartSpec] = Field(default_factory=list)
+    #: chart ids returned by ``make_chart``.
+    charts: list[str] = Field(default_factory=list)
     sql: list[str] = Field(default_factory=list)
     verification: Verification | None = None
     background_tasks: list[str] = Field(default_factory=list)
 
-    _lists = _null_lists("claims", "charts", "sql", "background_tasks")
+    _lists = _null_lists("claims", "sql", "background_tasks")
+
+    @field_validator("charts", mode="before")
+    @classmethod
+    def _chart_ids_only(cls, value: object) -> object:
+        """Keep chart ids only; old checkpoints carry ChartSpec dicts here."""
+        if value is None:
+            return []
+        if not isinstance(value, list):
+            return value
+        return [v for v in value if isinstance(v, str) and CHART_ID_RE.fullmatch(v)]
 
 
 class Plan(BaseModel):
@@ -86,3 +86,10 @@ class AnalystState(TypedDict):
     background_contexts: NotRequired[Annotated[dict[str, Any], _merge_tasks]]
     #: this turn's woken task context (a run started by a notification), or None.
     wake_context: NotRequired[dict[str, Any] | None]
+    #: one RunTrace dict per answered run (analyst.trace), appended by ``answer``.
+    trace: NotRequired[Annotated[list[dict], operator.add]]
+    #: this turn's AI messages the thread drops (the raw structured answer),
+    #: kept only so the run trace counts their tokens; reset by ``plan``.
+    trace_hidden: NotRequired[list]
+    #: whether this run's ``compact`` node compacted the thread.
+    compacted: NotRequired[bool]

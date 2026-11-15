@@ -1,0 +1,41 @@
+{
+  "chart_id": "c_0123456789",
+  "cutoff": "2026-06-30",
+  "data": {
+    "categories": [
+      "a",
+      "b",
+      "c",
+      "other"
+    ],
+    "other": true,
+    "series": [
+      {
+        "name": "v",
+        "values": [
+          4.0,
+          3.0,
+          2.0,
+          1.0
+        ]
+      }
+    ]
+  },
+  "dataset": "demo",
+  "downsampled": null,
+  "kind": "bar",
+  "notes": [],
+  "spec": {
+    "category": "c",
+    "handle": "r_57eba58237",
+    "kind": "bar",
+    "mode": "grouped",
+    "orientation": "vertical",
+    "series": null,
+    "title": "Bar",
+    "top_n": 3,
+    "value": "v"
+  },
+  "title": "Bar",
+  "version": 1
+}

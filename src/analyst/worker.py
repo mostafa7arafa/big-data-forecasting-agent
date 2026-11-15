@@ -88,7 +88,11 @@ def build_worker(
         model=model if model is not None else _default_model(),
         tools=DATA_TOOLS,
         system_prompt=WORKER_PROMPT,
-        middleware=[worker_context or WorkerContext(), *analyst_middleware(settings)],
+        middleware=[
+            worker_context or WorkerContext(),
+            # records each run's trace in the worker's own final state
+            *analyst_middleware(settings, record_trace=True),
+        ],
         context_schema=AnalystContext,
         name="worker",
     )

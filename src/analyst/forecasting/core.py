@@ -45,10 +45,19 @@ class BacktestReport:
     horizon: int
     adjustments: list[str] = field(default_factory=list)
     windows_used: int | None = None
+    # Merged cross-validation frame (all surviving models); kept so the best
+    # model's most recent window can be re-derived after a refit fallback.
+    cv: pd.DataFrame | None = field(default=None, repr=False)
+    last_fold: pd.DataFrame | None = None
+    last_fold_cutoff: pd.Timestamp | None = None
 
     def __post_init__(self):
         if self.windows_used is None:
             self.windows_used = self.windows
+        if self.last_fold is None and self.cv is not None:
+            self.last_fold = _last_fold(self.cv, self.best_model)
+            if self.last_fold is not None:
+                self.last_fold_cutoff = pd.Timestamp(self.cv["cutoff"].max())
 
 
 @dataclass
@@ -58,6 +67,22 @@ class ForecastRun:
     origin: datetime
     backtest: BacktestReport
     adjustments: list[str]
+    season_length: int | None = None
+
+
+def _last_fold(cv: pd.DataFrame, model: str) -> pd.DataFrame | None:
+    """The model's predictions on each series' most recent backtest window."""
+    if cv is None or cv.empty or model not in cv.columns:
+        return None
+    latest = cv.groupby("unique_id")["cutoff"].transform("max")
+    fold = cv.loc[cv["cutoff"] == latest]
+    renames = {model: "yhat", "y": "actual"}
+    for level in (80, 95):
+        for side in ("lo", "hi"):
+            renames[f"{model}-{side}-{level}"] = f"{side}_{level}"
+    fold = fold.rename(columns=renames)
+    columns = ["unique_id", "ds", "yhat", "lo_80", "hi_80", "lo_95", "hi_95", "actual"]
+    return fold.loc[:, columns].reset_index(drop=True)
 
 
 def _check_freq(freq):
@@ -486,7 +511,7 @@ def backtest(
     ]
     scores = scores[columns]
     scores.columns.name = None
-    return _report(scores, windows, horizon, series.adjustments, windows_used)
+    return _report(scores, windows, horizon, series.adjustments, windows_used, cv)
 
 
 def _fit_failure(series, model, error):
@@ -494,7 +519,7 @@ def _fit_failure(series, model, error):
     _series_record(series, f"{model} skipped (fit failed: {first_line})")
 
 
-def _report(scores, windows, horizon, adjustments, windows_used=None):
+def _report(scores, windows, horizon, adjustments, windows_used=None, cv=None):
     means = scores.groupby("model")[["relative_mae", "mase"]].mean()
     contenders = means.loc[(means.index != "SeasonalNaive") & (means.relative_mae < 1)]
     best = (
@@ -503,7 +528,7 @@ def _report(scores, windows, horizon, adjustments, windows_used=None):
     )
     beats = best != "SeasonalNaive"
     return BacktestReport(
-        scores, best, beats, windows, horizon, list(adjustments), windows_used
+        scores, best, beats, windows, horizon, list(adjustments), windows_used, cv
     )
 
 
@@ -576,7 +601,11 @@ def forecast(
                 horizon,
                 working.adjustments,
                 report.windows_used,
+                report.cv,
             )
+    season = next(
+        int(m.season_length) for m in candidates if str(m) == "SeasonalNaive"
+    )
     adjustments = list(series.adjustments)
     for message in working.adjustments:
         _record(adjustments, message)
@@ -587,11 +616,30 @@ def forecast(
         for side in ("lo", "hi"):
             names[f"{report.best_model}-{side}-{level}"] = f"{side}_{level}"
     predictions = predictions.rename(columns=names)
-    columns = ["unique_id", "ds", "yhat", "lo_80", "hi_80", "lo_95", "hi_95"]
+    if report.best_model == "SeasonalNaive":
+        predictions["baseline"] = predictions["yhat"]
+    else:
+        naive = fit_predict(
+            series,
+            freq=freq,
+            horizon=horizon,
+            models=[SeasonalNaive(season_length=season)],
+            levels=[80, 95],
+            n_jobs=n_jobs,
+        )[["unique_id", "ds", "SeasonalNaive"]].rename(
+            columns={"SeasonalNaive": "baseline"}
+        )
+        predictions = predictions.merge(
+            naive, on=["unique_id", "ds"], how="left", validate="one_to_one"
+        )
+    columns = [
+        "unique_id", "ds", "yhat", "lo_80", "hi_80", "lo_95", "hi_95", "baseline"
+    ]
     return ForecastRun(
         predictions[columns],
         report.best_model,
         pd.Timestamp(series.df.ds.max()).to_pydatetime(),
         report,
         adjustments,
+        season,
     )

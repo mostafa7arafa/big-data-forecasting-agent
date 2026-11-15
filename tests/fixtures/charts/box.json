@@ -1,0 +1,39 @@
+{
+  "chart_id": "c_0123456789",
+  "cutoff": "2026-06-30",
+  "data": {
+    "groups": [
+      {
+        "max": 5.0,
+        "median": 3.0,
+        "min": 1.0,
+        "n": 5,
+        "name": "a",
+        "q1": 2.0,
+        "q3": 4.0
+      },
+      {
+        "max": 10.0,
+        "median": 6.0,
+        "min": 2.0,
+        "n": 5,
+        "name": "b",
+        "q1": 4.0,
+        "q3": 8.0
+      }
+    ]
+  },
+  "dataset": "demo",
+  "downsampled": null,
+  "kind": "box",
+  "notes": [],
+  "spec": {
+    "group": "g",
+    "handle": "r_3e0d7bedf9",
+    "kind": "box",
+    "title": "Box",
+    "value": "v"
+  },
+  "title": "Box",
+  "version": 1
+}

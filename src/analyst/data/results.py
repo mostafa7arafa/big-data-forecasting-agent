@@ -15,7 +15,7 @@ import pyarrow.compute as pc
 import pyarrow.parquet as pq
 from pydantic import BaseModel, Field, field_validator
 
-from analyst.errors import UnknownNameError
+from analyst.errors import InvalidRequestError, UnknownNameError
 
 _RENDER_BUDGET = 4096
 _PREVIEW_ROWS = 10
@@ -160,6 +160,12 @@ class ResultStore:
     ) -> SummaryCard:
         """Persist a result; ``index=False`` keeps it out of lookup() (no caching)."""
         meta = meta or {}
+        intervals = [f.name for f in table.schema if _has_interval(f.type)]
+        if intervals:  # Parquet cannot store intervals (DuckDB INTERVAL)
+            raise InvalidRequestError(
+                f"column {intervals[0]!r} is an interval, which results cannot store",
+                hint=INTERVAL_HINT,
+            )
         handle_id = _make_handle(source, produced_by, meta)
         card = _build_card(
             handle_id,
@@ -305,15 +311,56 @@ def _is_orderable_type(dtype: pa.DataType) -> bool:
         return True
     if pa.types.is_binary(dtype) or pa.types.is_large_binary(dtype):
         return True
-    return pa.types.is_temporal(dtype)
-
-
-def _is_numeric_type_str(type_str: str) -> bool:
-    lowered = type_str.lower()
-    return any(
-        token in lowered
-        for token in ("int", "float", "double", "decimal", "numeric")
+    # min/max have no kernel for intervals (DuckDB INTERVAL) or durations.
+    return pa.types.is_temporal(dtype) and not (
+        pa.types.is_interval(dtype) or pa.types.is_duration(dtype)
     )
+
+
+# Column type families, matched on whole Arrow (``str(pa.DataType)``) or DuckDB
+# type names; never substrings ("int" is in INTERVAL, "time" in TIME).
+_NUMERIC_TYPE = re.compile(
+    r"u?int(8|16|32|64)|halffloat|float|double"
+    r"|decimal(32|64|128|256)?\(\s*\d+\s*,\s*\d+\s*\)"
+    r"|u?(tinyint|smallint|integer|bigint|hugeint)|int[1248]?|float[48]|real"
+    r"|(decimal|numeric)(\(\s*\d+\s*(,\s*\d+\s*)?\))?"
+)
+_TEMPORAL_TYPE = re.compile(
+    r"date(32|64)\[\w+\]|timestamp\[\w+(,\s*tz=[^\]]+)?\]"
+    r"|date|datetime|timestamp(_s|_ms|_ns)?|timestamp with time zone|timestamptz"
+)
+_INTERVAL_TYPE = re.compile(r"(month_day_nano|day_time|month)_interval|duration\[\w+\]|interval")
+
+
+INTERVAL_HINT = "convert the duration to seconds (e.g. epoch(...)) before charting"
+
+
+def _has_interval(dtype: pa.DataType) -> bool:
+    if pa.types.is_interval(dtype):
+        return True
+    return any(_has_interval(dtype.field(i).type) for i in range(dtype.num_fields))
+
+
+def _type_key(type_str: str) -> str:
+    return " ".join(type_str.strip().lower().split())
+
+
+def is_numeric_type_str(type_str: str) -> bool:
+    """Integer, float and decimal families (not intervals, lists or dictionaries)."""
+    return _NUMERIC_TYPE.fullmatch(_type_key(type_str)) is not None
+
+
+_is_numeric_type_str = is_numeric_type_str
+
+
+def is_temporal_type_str(type_str: str) -> bool:
+    """Date and timestamp (with or without a zone); a clock TIME is not a time axis."""
+    return _TEMPORAL_TYPE.fullmatch(_type_key(type_str)) is not None
+
+
+def is_interval_type_str(type_str: str) -> bool:
+    """A duration (Arrow interval/duration, DuckDB INTERVAL)."""
+    return _INTERVAL_TYPE.fullmatch(_type_key(type_str)) is not None
 
 
 def _column_stats(table: pa.Table, name: str) -> ColumnStats:

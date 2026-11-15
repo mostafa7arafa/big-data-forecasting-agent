@@ -1,0 +1,28 @@
+{
+  "chart_id": "c_0123456789",
+  "cutoff": "2026-06-30",
+  "data": {
+    "change_pct": 20.0,
+    "comparison": 100.0,
+    "label": "Trips",
+    "trend": null,
+    "value": 120.0
+  },
+  "dataset": "demo",
+  "downsampled": null,
+  "kind": "kpi",
+  "notes": [],
+  "spec": {
+    "comparison": "c",
+    "handle": "r_b0c450be18",
+    "kind": "kpi",
+    "label": "Trips",
+    "title": "Kpi",
+    "trend_handle": null,
+    "trend_x": null,
+    "trend_y": null,
+    "value": "v"
+  },
+  "title": "Kpi",
+  "version": 1
+}

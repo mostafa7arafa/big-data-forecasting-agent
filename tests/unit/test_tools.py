@@ -172,22 +172,49 @@ def test_forecast_emits_progress_events(monkeypatch):
     assert any(e["message"] == "fitting" for e in events)
 
 
-def test_make_chart_validates_handles():
-    args = {
+def _line(handle, **kw):
+    return {
         "kind": "line",
         "title": "T",
-        "handle": "r_0000000000",
+        "handle": handle,
         "x": "period",
         "y": "total_amount",
+        **kw,
     }
-    assert invoke(make_chart, args).status == "error"
+
+
+def test_make_chart_stores_and_returns_id():
     handle = _handle()
-    msg = invoke(make_chart, {**args, "handle": handle})
-    assert msg.status == "success"
-    assert msg.artifact["chart"]["handle"] == handle
-    assert "\n" not in msg.content
-    bad = invoke(make_chart, {**args, "handle": handle, "y": "nope"})
+    msg = invoke(make_chart, {"spec": _line(handle)})
+    assert msg.status == "success", msg.content
+    chart_id = msg.artifact["chart_id"]
+    assert msg.content.startswith(f"chart {chart_id} queued: line 'T'")
+    assert msg.artifact["kind"] == "line"
+    assert msg.artifact["handles"] == [handle]
+    service = registry.get_service("events", None)
+    assert service.charts.get(chart_id).spec.handle == handle
+    again = invoke(make_chart, {"spec": _line(handle)})
+    assert again.artifact["chart_id"] == chart_id
+
+
+def test_make_chart_rejects_bad_column_as_tool_error():
+    handle = _handle()
+    bad = invoke(make_chart, {"spec": _line(handle, y="nope")})
     assert bad.status == "error"
+    assert "nope" in bad.content and "HINT" in bad.content
+    unknown = invoke(make_chart, {"spec": _line("r_0000000000")})
+    assert unknown.status == "error"
+
+
+def test_make_chart_schema_is_openai_valid():
+    from langchain_core.utils.function_calling import convert_to_openai_tool
+
+    schema = convert_to_openai_tool(make_chart)
+    spec = schema["function"]["parameters"]["properties"]["spec"]
+    branches = spec.get("oneOf") or spec.get("anyOf")
+    assert len(branches) == 11
+    for node in _array_nodes(schema):
+        assert "items" in node and "prefixItems" not in node, node
 
 
 def test_read_knowledge_respects_cutoff():
@@ -216,6 +243,23 @@ def test_context_from_settings(monkeypatch):
 def test_answer_schema_defaults():
     a = Answer(narrative="n", claims=[Claim(text="t", type="descriptive")])
     assert a.verification is None and a.charts == [] and a.claims[0].values == []
+
+
+def test_answer_drops_legacy_chart_specs_from_old_checkpoints():
+    """Old checkpoints stored ``Answer.charts`` as ChartSpec dicts: keep only ids."""
+    legacy = {
+        "narrative": "n",
+        "claims": [],
+        "charts": [
+            {"kind": "line", "title": "T", "handle": "h_0123456789", "x": "ds", "y": "v"},
+            "c_0123456789",
+            "not-a-chart-id",
+            "c_0123456789abc",
+            42,
+        ],
+    }
+    assert Answer.model_validate(legacy).charts == ["c_0123456789"]
+    assert Answer.model_validate({**legacy, "charts": None}).charts == []
 
 
 def _array_nodes(node):
@@ -253,19 +297,6 @@ def test_query_metrics_time_range_wrong_length_is_rejected():
 
 def test_tool_content_capped_with_artifact_kept():
     handle = _handle()
-    title = "T" * 5000
-    args = {
-        "kind": "line",
-        "title": title,
-        "handle": handle,
-        "x": "period",
-        "y": "total_amount",
-    }
-    msg = invoke(make_chart, args)
-    assert msg.status == "success"
-    assert len(msg.content) <= 4096
-    assert msg.content.endswith("… (truncated)")
-    assert msg.artifact["chart"]["title"] == title
-    bad = invoke(make_chart, {**args, "y": "y" * 5000})
+    bad = invoke(make_chart, {"spec": _line(handle, y="y" * 5000)})
     assert bad.status == "error"
     assert len(bad.content) <= 4096 and bad.content.endswith("… (truncated)")

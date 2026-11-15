@@ -92,3 +92,46 @@ The same harness and graders, re-run after Plan B2 added the Docker CodeAct sand
 - Mean trajectory score: 0.89.
 
 **Compaction** did not trigger in this run, and could not have. It only summarises earlier turns, and every row here is a single turn. It is covered by unit and graph tests, and multi-turn evals (Plan D) will exercise it.
+
+## Plan W1: dashboard backend (55 questions)
+
+The same harness and graders, re-run after Plan W1 added the typed chart catalogue (`make_chart` now returns a validated chart spec), the run trace, and OpenAI reasoning summaries for the default model (Responses API). A new `chart_kind` check grades the eight forecast rows: the answer must carry a `forecast_fan` chart, or a `small_multiples` chart whose inner kind is `forecast_fan`.
+
+| | |
+|---|---|
+| Date | 2026-11-15 |
+| Model | `openai:gpt-6-luna` (reasoning summaries on) |
+| Git | `ddd0fdb` (branch `feat/plan-w1-dashboard-backend`) |
+| LangSmith dataset | `analyst-single-turn`, tag `v5-7d6a5f66` (55 examples) |
+| Experiment | `openai-gpt-6-luna-ddd0fdb-cee4069d` |
+| Run | `make eval-agent`: one repetition, max concurrency 3, one sandbox per row |
+
+| Category | Rows | Pass (B2) | Pass (W1) |
+|---|---:|---:|---:|
+| Lookup | 20 | 80% (16) | 80% (16) |
+| Comparison | 8 | 75% (6) | 75% (6) |
+| Forecast | 8 | 88% (7) | 88% (7) |
+| Off-model (`run_sql`) | 6 | 33% (2) | 33% (2) |
+| Python (`run_python`) | 5 | 100% (5) | **100% (5)** |
+| Grounding trap | 5 | 40% (2) | 60% (3) |
+| Safe handling | 3 | 67% (2) | 67% (2) |
+| **All** | **55** | **73% (40)** | **75% (41)** |
+
+| Gate | B2 | W1 |
+|---|---:|---:|
+| `answer_values` | 81% | 79% |
+| `label` | 74% | 74% |
+| `grounding` | 80% | 80% |
+| `checks` | 81% | 81% |
+
+**Plan gate:** at least 38 of 55, Python 5/5, no category down by more than one question versus B2. Passed: 41/55, Python 5/5, no category down.
+
+**chart_kind:** 7 of the 8 forecast rows pass it (four as a `small_multiples` of `forecast_fan`, three as a plain `forecast_fan`). The eighth, a037, fails both `forecast_shape` and `chart_kind` because the agent never produced a forecast (no handle, no chart). It is a forecast failure, not a chart-kind one.
+
+**Labels:** 20 Verified, 15 Verified · off-model, 20 Not verified. Not-verified reasons: untraced number 2026 (2), no claims (decline or acknowledgement) (2), untraced number 20.03 (1), untraced number 27.0288 (1), claim cites no evidence (1).
+
+**Other measures:**
+- Forecast skill is unchanged: WAPE 0.083, coverage 0.69 at 80% and 0.87 at 95%.
+- Latency: median 33.9 s, p95 106.5 s (B2: 21.2 s and 67.8 s). Reasoning summaries add time, and a single run is noisy.
+- Mean trajectory score: 0.91 (B2: 0.89). Mean tokens 16,643 per question.
+- Small categories stay noisy: one question moves trap by 20 points.

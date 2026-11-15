@@ -8,6 +8,12 @@ from contextlib import contextmanager
 
 from analyst.config import get_settings
 
+_POLL_S = 0.05
+
+
+class SlotCancelled(Exception):
+    """The wait for a query slot was cancelled before a slot came free."""
+
 
 class QueryGate:
     def __init__(self, max_concurrent: int) -> None:
@@ -34,8 +40,12 @@ class QueryGate:
             self._peak = self._in_use
 
     @contextmanager
-    def slot(self) -> Iterator[None]:
-        with self._semaphore:
+    def slot(self, cancelled: threading.Event | None = None) -> Iterator[None]:
+        """Hold one query slot; waiting ends early with SlotCancelled once ``cancelled`` is set."""
+        while not self._semaphore.acquire(timeout=_POLL_S):
+            if cancelled is not None and cancelled.is_set():
+                raise SlotCancelled
+        try:
             with self._lock:
                 self._in_use += 1
                 self._peak = max(self._peak, self._in_use)
@@ -44,6 +54,8 @@ class QueryGate:
             finally:
                 with self._lock:
                     self._in_use -= 1
+        finally:
+            self._semaphore.release()
 
 
 _gate: QueryGate | None = None

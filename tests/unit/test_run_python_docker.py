@@ -92,3 +92,31 @@ def test_end_to_end_load_compute_save(env):
     assert art["produced_by"] == "run_python" and art["governed"] is False
     table = store.load(art["handle_id"])
     assert "roll" in table.column_names and table.num_rows == 10
+
+
+def test_cancel_kills_running_cell_and_close_is_prompt(env):
+    import threading
+    import time
+
+    from analyst import cancel
+    from analyst.sandbox import close_sandbox
+
+    assert _call("print('warm')", thread="docker-c").status != "error"
+    out: dict = {}
+
+    def slow():
+        out["msg"] = _call("x = 0\nwhile True:\n    x += 1\nprint('late')", thread="docker-c")
+
+    worker = threading.Thread(target=slow)
+    start = time.monotonic()
+    worker.start()
+    deadline = time.monotonic() + 30
+    while not cancel._callbacks.get("docker-c") and time.monotonic() < deadline:
+        time.sleep(0.05)
+    time.sleep(0.5)  # the cell is running
+    assert cancel.cancel_thread("docker-c") == 1  # the sandbox abort
+    close_sandbox("docker-c")
+    worker.join(timeout=30)
+    assert not worker.is_alive()
+    assert time.monotonic() - start < 20  # well before the 30 s sandbox timeout
+    assert out["msg"].status == "error" and "timeout" not in out["msg"].content

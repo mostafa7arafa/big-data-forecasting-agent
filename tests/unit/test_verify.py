@@ -927,3 +927,58 @@ def test_calendar_preposition_beats_count_noun(text, raws):  # follow-up item 18
 )
 def test_year_unless_quantity_cue_and_count_noun(text, raws):
     assert [n.raw for n in extract_numbers(text)] == raws, text
+
+
+def test_verify_flags_unknown_chart_id(tmp_path):
+    from analyst.charts import ChartStore
+
+    store = ResultStore(tmp_path)
+    h = save(store, [2_894_704.0])
+    answer = Answer(
+        narrative="ok",
+        claims=[Claim(text="c", type="descriptive", handles=[h], values=[2_894_704.0])],
+        charts=["c_0000000000"],
+    )
+    v = verify_answer(
+        answer,
+        question="",
+        handles={},
+        memory=make_memory(),
+        cutoff=None,
+        store=store,
+        charts=ChartStore(tmp_path),
+    )
+    assert "unknown chart c_0000000000" in v.problems
+    assert v.label == "not_verified"
+
+
+def test_verify_resolves_chart_handles(tmp_path):
+    from analyst.charts import ChartStore
+    from analyst.charts.spec import KpiChart
+
+    store = ResultStore(tmp_path)
+    h = save(store, [2_894_704.0])
+    charts = ChartStore(tmp_path)
+    stored = charts.save(
+        KpiChart.model_validate(
+            {"kind": "kpi", "title": "T", "handle": h, "value": "v", "label": "L"}
+        ),
+        dataset="d",
+        cutoff=None,
+    )
+    answer = Answer(
+        narrative="ok",
+        claims=[Claim(text="c", type="descriptive", handles=[h], values=[2_894_704.0])],
+        charts=[stored.chart_id],
+    )
+    v = verify_answer(
+        answer,
+        question="",
+        handles={},
+        memory=make_memory(),
+        cutoff=None,
+        store=store,
+        charts=charts,
+    )
+    assert not any("chart" in p for p in v.problems), v.problems
+    assert v.label == "verified"

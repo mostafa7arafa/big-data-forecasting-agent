@@ -12,6 +12,7 @@ from typing import Literal
 import pandas as pd
 import pyarrow as pa
 
+from analyst.charts.store import ChartStore
 from analyst.config import get_settings
 from analyst.data.dataset import DatasetConfig
 from analyst.data.engine import Coverage, Engine
@@ -41,6 +42,17 @@ _FORECAST_COLUMNS = (
     "hi_80",
     "lo_95",
     "hi_95",
+    "baseline",
+)
+_FOLD_COLUMNS = (
+    "unique_id",
+    "ds",
+    "yhat",
+    "lo_80",
+    "hi_80",
+    "lo_95",
+    "hi_95",
+    "actual",
 )
 _SCORE_FIELDS = (
     "mae",
@@ -94,8 +106,10 @@ class DataService:
     ) -> None:
         if store_root is None:
             store_root = segment_root(dataset.name, cutoff)
+        self.dataset = dataset
         self.engine = Engine(dataset, cutoff=cutoff)
         self.store = ResultStore(store_root)
+        self.charts = ChartStore(store_root)
         self.memory: Memory = load_memory(dataset)
 
     def query_metrics(self, q: MetricQuery) -> SummaryCard:
@@ -196,6 +210,8 @@ class DataService:
                 "levels": sorted(levels),
                 "candidates": names,
                 "candidates_source": candidates_source,
+                # v2: forecasts now store the baseline column and fold handle.
+                "schema": "v2",
             },
             separators=(",", ":"),
             sort_keys=True,
@@ -431,7 +447,33 @@ class DataService:
             },
             index=complete,
         )
+        fold_handle = None
+        last_fold = run.backtest.last_fold
+        if last_fold is not None and len(last_fold):
+            fold_card = self.store.save(
+                pa.Table.from_pandas(
+                    last_fold.loc[:, list(_FOLD_COLUMNS)], preserve_index=False
+                ),
+                produced_by="backtest_fold",
+                source=source + ":fold",
+                governed=input_card.governed,
+                elapsed_s=elapsed_s,
+                # Model and evaluated windows are part of the identity: a partial
+                # run can share its newest cutoff with a later complete run.
+                meta={
+                    "cutoff": pd.Timestamp(run.backtest.last_fold_cutoff).isoformat(),
+                    "model": run.model,
+                    "windows_used": int(run.backtest.windows_used),
+                },
+                index=False,
+            )
+            fold_handle = fold_card.handle_id
         meta = {
+            "time_col": time_col,
+            "value_col": value_col,
+            "id_col": id_col,
+            "season_length": run.season_length,
+            "fold_handle": fold_handle,
             "model": run.model,
             "origin": run.origin.isoformat(),
             "horizon": horizon,

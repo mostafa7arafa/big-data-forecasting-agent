@@ -137,6 +137,7 @@ def test_forecast_from_query_handle(daily_by_area):
         "levels": [80, 95],
         "candidates": forecast_card.meta["candidates"],
         "candidates_source": "default",
+        "schema": "v2",
     }
     assert forecast_card.source == json.dumps(
         expected_source, separators=(",", ":"), sort_keys=True
@@ -155,6 +156,7 @@ def test_forecast_from_query_handle(daily_by_area):
         "hi_80",
         "lo_95",
         "hi_95",
+        "baseline",
     ]
     assert set(table.column("unique_id").to_pylist()) == {"North", "South"}
     again = svc.forecast(
@@ -253,6 +255,7 @@ def _fake_run(ids, *, beats_baseline, adjustments, mae=1.23456789):
                 "hi_80": 11.0,
                 "lo_95": 8.0,
                 "hi_95": 12.0,
+                "baseline": 10.0,
             }
         )
     return ForecastRun(
@@ -431,3 +434,82 @@ def test_forecast_bad_column(synthetic_dataset, tmp_path):
     message = str(exc.value)
     for name in ("period", "area", "total_amount"):
         assert name in message
+
+
+def test_forecast_has_baseline_column(daily_by_area):
+    svc, _, card = daily_by_area
+    table = svc.store.load(card.handle_id)
+    assert "baseline" in table.column_names
+    assert all(v is not None for v in table.column("baseline").to_pylist())
+
+
+def test_forecast_meta_names_columns_and_fold_handle(daily_by_area):
+    svc, input_card, card = daily_by_area
+    meta = card.meta
+    assert (meta["time_col"], meta["value_col"], meta["id_col"]) == (
+        "period", "total_amount", "area",
+    )
+    assert meta["season_length"] == DEFAULTS["D"]["season"]
+    fold = svc.store.card(meta["fold_handle"])
+    assert fold.produced_by == "backtest_fold"
+    assert fold.governed == input_card.governed
+    assert fold.source == card.source + ":fold"
+    assert svc.store.lookup("backtest_fold", fold.source) is None
+    assert fold.meta["cutoff"]
+    table = svc.store.load(fold.handle_id)
+    assert table.column_names == [
+        "unique_id", "ds", "yhat", "lo_80", "hi_80", "lo_95", "hi_95", "actual",
+    ]
+    assert set(table.column("unique_id").to_pylist()) == {"North", "South"}
+
+
+def test_old_cached_forecast_not_served(daily_by_area):
+    svc, input_card, card = daily_by_area
+    old_source = json.loads(card.source)
+    del old_source["schema"]
+    old_source = json.dumps(old_source, separators=(",", ":"), sort_keys=True)
+    stale = svc.store.save(
+        pa.table({"unique_id": ["North"], "ds": [datetime(2024, 1, 1)], "yhat": [1.0]}),
+        produced_by="forecast",
+        source=old_source,
+        governed=True,
+        elapsed_s=0.0,
+    )
+    assert svc.store.lookup("forecast", old_source).handle_id == stale.handle_id
+    fresh = svc.forecast(
+        input_card.handle_id, id_col="area", value_col="total_amount", freq="D"
+    )
+    assert fresh.handle_id == card.handle_id != stale.handle_id
+
+
+def test_fold_handle_differs_by_model_and_windows(synthetic_dataset, tmp_path, monkeypatch):
+    """A partial and a complete run sharing the newest fold cutoff keep separate folds."""
+    svc = DataService(synthetic_dataset, store_root=tmp_path)
+    card = _one_series_handle(svc)
+    fold = pd.DataFrame(
+        {
+            "unique_id": ["series"], "ds": [datetime(2024, 1, 1)], "yhat": [1.0],
+            "lo_80": [0.5], "hi_80": [1.5], "lo_95": [0.2], "hi_95": [1.8], "actual": [1.1],
+        }
+    )
+
+    def make(model, windows_used):
+        def fake(series, **kwargs):
+            run = _fake_run(["series"], beats_baseline=True, adjustments=[])
+            run.model = model
+            run.backtest.windows = 8
+            run.backtest.windows_used = windows_used
+            run.backtest.last_fold = fold.assign(yhat=float(windows_used))
+            run.backtest.last_fold_cutoff = pd.Timestamp("2023-12-31")
+            return run
+        return fake
+
+    handles = []
+    for model, used in (("AutoETS", 4), ("AutoTheta", 8)):
+        monkeypatch.setattr("analyst.data.service.run_forecast", make(model, used))
+        result = svc.forecast(card.handle_id, value_col="total_amount", freq="D", horizon=1)
+        handles.append(result.meta["fold_handle"])
+        fold_card = svc.store.card(result.meta["fold_handle"])
+        assert (fold_card.meta["model"], fold_card.meta["windows_used"]) == (model, used)
+    assert len(set(handles)) == 2
+    assert svc.store.load(handles[0]).column("yhat").to_pylist() == [4.0]

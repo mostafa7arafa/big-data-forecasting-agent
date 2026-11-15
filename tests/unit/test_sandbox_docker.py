@@ -195,6 +195,35 @@ def test_timeout_restarts_and_reports_state_loss(tmp_path):
 
 
 @pytest.mark.docker
+def test_abort_during_cold_start_returns_promptly(tmp_path):
+    """Stop while ``docker run`` is still creating the container: no 30 s hang."""
+    import time
+
+    _need_image()
+    sb = DockerSandbox(in_dir=tmp_path / "i", out_dir=tmp_path / "o", image=IMAGE, timeout_s=30)
+    out: dict = {}
+    worker = threading.Thread(target=lambda: out.setdefault("r", sb.run("import time\ntime.sleep(60)")))
+    try:
+        start = time.monotonic()
+        worker.start()
+        while sb._proc is None and time.monotonic() - start < 10:
+            time.sleep(0.001)
+        name = sb._name
+        assert name and sb._proc is not None
+        sb.abort()  # the container is still being created
+        worker.join(timeout=25)
+        assert not worker.is_alive()
+        assert time.monotonic() - start < 15  # well under the 30 s cell timeout
+        assert not out["r"].ok and out["r"].restarted
+    finally:
+        sb.close()
+    time.sleep(1)  # a create the daemon finishes late must not be left running
+    ps = subprocess.run(["docker", "ps", "-q", "--filter", f"name=^{name}$"],
+                        check=False, capture_output=True, text=True).stdout
+    assert ps.strip() == ""
+
+
+@pytest.mark.docker
 def test_container_exit_restarts(tmp_dirs):
     r = tmp_dirs.run("import os\nos._exit(1)")
     assert not r.ok and r.restarted and "variables were lost" in r.error
@@ -535,3 +564,69 @@ def test_instances_for_same_key_get_distinct_scratch_dirs_and_close_removes_own(
     a.close()
     assert not a.out_dir.exists()
     assert (b.out_dir / "keep.parquet").exists()
+
+
+def test_close_during_cold_start_kills_the_new_process(tmp_path, monkeypatch):
+    """A close that lands before _start publishes _proc is not lost."""
+    sb = _box(tmp_path)
+    killed: list[int] = []
+    monkeypatch.setattr(sb, "_kill", lambda: (killed.append(1), setattr(sb, "_proc", None)))
+    starting, release = threading.Event(), threading.Event()
+    started = Live()
+
+    def slow_start():
+        starting.set()
+        assert release.wait(5)
+        sb._proc = started  # published only after the close already looked for it
+
+    monkeypatch.setattr(sb, "_start", slow_start)
+    out: dict = {}
+    worker = threading.Thread(target=lambda: out.setdefault("r", sb.run("print(1)")))
+    worker.start()
+    assert starting.wait(5)
+    assert sb._proc is None
+    sb.request_close()  # abort finds no process yet
+    release.set()
+    worker.join(5)
+    assert not worker.is_alive()
+    assert not out["r"].ok and out["r"].error == sbx._CLOSED_ERROR
+    assert started.stdin.getvalue() == b""  # the cell was never sent
+    assert sb._proc is None and len(killed) == 2  # pre-start reset, then the late kill
+
+
+def test_queued_run_after_close_starts_nothing(tmp_path, monkeypatch):
+    sb = _box(tmp_path)
+    starts: list[int] = []
+    monkeypatch.setattr(sb, "_start", lambda: starts.append(1))
+    sb._lock.acquire()  # a run is in flight
+    out: dict = {}
+    worker = threading.Thread(target=lambda: out.setdefault("r", sb.run("print(1)")), daemon=True)
+    worker.start()
+    try:
+        sb.request_close()
+    finally:
+        sb._lock.release()
+    worker.join(5)
+    sb.close()
+    assert out["r"].error == sbx._CLOSED_ERROR and starts == []
+    assert sb.run("print(2)").error == sbx._CLOSED_ERROR and starts == []
+
+
+def test_abort_alone_does_not_close(tmp_path, monkeypatch):
+    """Steering cancels a cell with abort(); the sandbox stays usable."""
+    sb = _box(tmp_path)
+    monkeypatch.setattr(sb, "_kill", lambda: setattr(sb, "_proc", None))
+
+    def fake_start():
+        sb._proc = Live()
+        sb._lines.put(b'{"id": "1", "ok": true, "stdout": "1\\n", "error": null, "saved": [], "truncated": false}\n')
+
+    monkeypatch.setattr(sb, "_start", fake_start)
+    sb.abort()
+    assert sb.run("print(1)").ok
+
+
+def test_get_sandbox_after_close_is_fresh(fake_registry):
+    a = get_sandbox("t", "ds", None)
+    sbx.close_sandbox("t")
+    assert get_sandbox("t", "ds", None) is not a

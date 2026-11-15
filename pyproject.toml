@@ -10,6 +10,7 @@ requires-python = ">=3.12"
 dependencies = [
     "deepagents==0.7.37",
     "duckdb==2.0.0",
+    "fastapi>=0.163,<0.164",
     "langchain>=1.5,<1.6",
     "langchain-openai>=1.7.4,<1.8",
     "langchain-openrouter==0.2.9",
@@ -23,6 +24,7 @@ dependencies = [
     "python-dotenv>=1.2.4",
     "pyyaml>=6.0.3",
     "statsforecast>=2.0.1",
+    "tsdownsample==0.1.5.1",
     "utilsforecast>=0.2.17",
 ]
 
@@ -33,6 +35,8 @@ build-backend = "uv_build"
 [dependency-groups]
 dev = [
     "langgraph-cli[inmem]>=0.4.43,<0.5",
+    "pyproj==3.8.0",
+    "pyshp==3.1.8",
     "pytest>=9.2.0",
     "ruff>=0.9.0",
 ]

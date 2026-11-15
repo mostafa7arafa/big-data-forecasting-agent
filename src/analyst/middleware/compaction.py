@@ -48,6 +48,7 @@ __all__ = [
     "Finding",
     "compact_messages",
     "is_compaction_summary",
+    "unpack_raw",
 ]
 
 logger = logging.getLogger(__name__)
@@ -82,6 +83,24 @@ class Digest(BaseModel):
     live_handles: list[str] = Field(default_factory=list)
     open_questions: list[str] = Field(default_factory=list)
     preferences: list[str] = Field(default_factory=list)
+
+
+def unpack_raw(result: Any, raw_out: list[AIMessage] | None) -> Any:
+    """The parsed value of an ``include_raw=True`` structured call.
+
+    The raw AI message goes to ``raw_out``; a parsing error re-raises after
+    that, so the caller's failure path still runs. A result that is not the
+    ``{"raw", "parsed"}`` shape (a model ignoring ``include_raw``) is returned
+    as it is.
+    """
+    if not (isinstance(result, Mapping) and "raw" in result and "parsed" in result):
+        return result
+    if raw_out is not None and isinstance(result["raw"], AIMessage):
+        raw_out.append(result["raw"])
+    error = result.get("parsing_error")
+    if result["parsed"] is None and error is not None:
+        raise error if isinstance(error, BaseException) else ValueError(str(error))
+    return result["parsed"]
 
 
 def is_compaction_summary(message: object) -> bool:
@@ -218,19 +237,25 @@ async def compact_messages(
     trigger_tokens: int,
     keep_messages: int,
     protect_from: int,
+    raw_out: list[AIMessage] | None = None,
 ) -> dict | None:
     """A state update replacing old messages with the digest, or None.
 
     None when below the trigger, when nothing can be dropped, or when the
     digest fails (logged); the run then continues with the messages unchanged.
     The update is ``RemoveMessage(REMOVE_ALL)``, the summary, the tail.
+    ``raw_out``, when given, receives the digest call's raw AI message (its
+    token usage, for the run trace), even when the digest then fails to parse.
     """
     cut = plan_cut(messages, trigger_tokens, keep_messages, protect_from)
     if cut <= 0:
         return None
     old, tail = messages[:cut], messages[cut:]
     try:
-        result = await chat.with_structured_output(Digest).ainvoke(_prompt(old))
+        result = await chat.with_structured_output(Digest, include_raw=True).ainvoke(
+            _prompt(old)
+        )
+        result = unpack_raw(result, raw_out)
         digest = result if isinstance(result, Digest) else Digest.model_validate(result)
     except Exception:
         logger.warning("compaction failed; continuing uncompacted", exc_info=True)

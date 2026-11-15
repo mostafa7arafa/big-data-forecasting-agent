@@ -1,0 +1,35 @@
+{
+  "chart_id": "c_0123456789",
+  "cutoff": "2026-06-30",
+  "data": {
+    "geometry": "areas",
+    "key_property": "area",
+    "keys": [
+      "A",
+      "B",
+      "Z"
+    ],
+    "unmatched": [
+      "Z"
+    ],
+    "values": [
+      1.0,
+      2.0,
+      3.0
+    ]
+  },
+  "dataset": "demo",
+  "downsampled": null,
+  "kind": "map",
+  "notes": [],
+  "spec": {
+    "geometry": "areas",
+    "handle": "r_621fcbaa4c",
+    "key": "k",
+    "kind": "map",
+    "title": "Map",
+    "value": "v"
+  },
+  "title": "Map",
+  "version": 1
+}

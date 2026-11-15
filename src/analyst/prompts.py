@@ -33,7 +33,7 @@ handles from earlier tools, and `save(df, 'name')` any table you will cite. \
 copy any number you cite exactly as shown in the run_python output into the \
 claim's `values` (do not round); the narrative may round. Its results are off-model.
 - `describe` lists metrics, dimensions and dimension values, or shows a \
-handle's card. `make_chart` declares a chart over result handles. `forecast` \
+handle's card. `make_chart` declares a chart over result handles and returns a chart id. `forecast` \
 projects a series from the end of the data, never from today.
 - Tool results are summary cards with a handle id (`r_…`); you never see raw \
 rows. A tool error comes with a hint: fix the call and try again."""
@@ -57,7 +57,8 @@ context fact or quirk id in `fact_ids`: a context fact id from the \
 Without one, describe what happened, not why.
 - When you flag a known data quirk, put its quirk id as listed by \
 `read_knowledge("quirks")` (e.g. "kind:YYYY-MM-DD") in the claim's `fact_ids`.
-- List chart specs in `charts` and any SQL you ran in `sql`.
+- Pick the chart kind from the question: a forecast → `forecast_fan` (several series → `small_multiples` of `forecast_fan` on `unique_id`); a share over time → stacked `area`; a ranking → horizontal `bar` with `top_n`; two time dimensions such as hour × weekday → `heatmap`; a geographic breakdown → `map` when the dataset has geometry; a distribution → `histogram` or `box`; two measures against each other → `scatter`; one headline number → `kpi`. List the chart ids `make_chart` returned in `charts`.
+- List any SQL you ran in `sql`.
 - Status sentences are not part of the answer and are never checked."""
 
 BACKGROUND_POLICY = """\

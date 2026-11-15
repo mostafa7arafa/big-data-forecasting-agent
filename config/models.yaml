@@ -1,0 +1,24 @@
+# Model catalogue: label, context window, prices (USD per 1M tokens) and the
+# reasoning-summary opt-in per model spec ("<provider>:<model id>").
+#
+# Numbers are copied from the provider's own model/pricing page for the exact
+# model id, with the page and date recorded per entry; anything not stated
+# there is null (unknown), never estimated. A spec missing from this file is
+# still usable: its trace simply has no price-based cost or context window.
+
+# openai:gpt-6-luna
+#   context_window: https://developers.openai.com/api/docs/models/gpt-6-luna
+#     ("1,050,000 context window"), read 2026-11-15
+#   prices: https://developers.openai.com/api/docs/pricing, Standard tier,
+#     short context (<= 272K input tokens), read 2026-11-15. Long-context
+#     requests (> 272K input) are billed higher ($0.20 / $0.02 / $0.75), which
+#     this flat table does not model.
+#   reasoning_summary: true (owner ruling; Task 9's live eval is the gate).
+- spec: openai:gpt-6-luna
+  label: GPT-6 Luna
+  context_window: 1050000
+  prices:
+    input: 0.10
+    cached_input: 0.01
+    output: 0.50
+  reasoning_summary: true

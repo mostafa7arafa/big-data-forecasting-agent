@@ -106,7 +106,7 @@ def _fake_run(*, windows_used=3, windows=3):
     )
     frame = pd.DataFrame(
         [{"unique_id": "x", "ds": datetime(2024, 3, 1), "yhat": 1.0, "lo_80": 0.5,
-          "hi_80": 1.5, "lo_95": 0.2, "hi_95": 1.8}]
+          "hi_80": 1.5, "lo_95": 0.2, "hi_95": 1.8, "baseline": 0.9}]
     )
     report = BacktestReport(scores, "AutoETS", True, windows, 1, [], windows_used)
     return ForecastRun(frame, "AutoETS", datetime(2024, 2, 29), report, [])

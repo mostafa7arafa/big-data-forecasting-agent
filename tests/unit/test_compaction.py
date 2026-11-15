@@ -190,3 +190,33 @@ def test_digest_values_render_at_full_precision():
     )
     assert f"values: {v!r}, 123456.0" in text
     assert "0.0828378" not in text.replace(repr(v), "")
+
+
+def test_compact_messages_hands_back_raw_digest_message():
+    """With include_raw the digest call's AI message (its usage) reaches ``raw_out``."""
+
+    class RawChat(FakeChat):
+        parse_error: bool = False
+
+        def with_structured_output(self, schema, **kwargs):
+            assert kwargs.get("include_raw") is True
+            raw = AIMessage("", usage_metadata={"input_tokens": 9, "output_tokens": 1, "total_tokens": 10})
+            error = ValueError("bad digest") if self.parse_error else None
+            parsed = None if self.parse_error else self.digest
+            return RunnableLambda(lambda _: {"raw": raw, "parsed": parsed, "parsing_error": error})
+
+    msgs = _conversation()
+    for parse_error, compacted in ((False, True), (True, False)):
+        raw_out: list = []
+        out = asyncio.run(
+            compact_messages(
+                msgs,
+                RawChat(digest=_digest(), parse_error=parse_error),
+                trigger_tokens=100,
+                keep_messages=8,
+                protect_from=len(msgs),
+                raw_out=raw_out,
+            )
+        )
+        assert (out is not None) is compacted
+        assert [m.usage_metadata["input_tokens"] for m in raw_out] == [9]
