@@ -1,5 +1,6 @@
 """Answer schema and graph state shared by the agent, verifier and UI."""
 
+import operator
 from typing import Annotated, Any, Literal, NotRequired, TypedDict
 
 from langgraph.graph.message import add_messages
@@ -73,3 +74,10 @@ class AnalystState(TypedDict):
     background_contexts: NotRequired[Annotated[dict[str, Any], _merge_tasks]]
     #: this turn's woken task context (a run started by a notification), or None.
     wake_context: NotRequired[dict[str, Any] | None]
+    #: one RunTrace dict per answered run (analyst.trace), appended by ``answer``.
+    trace: NotRequired[Annotated[list[dict], operator.add]]
+    #: this turn's AI messages the thread drops (the raw structured answer),
+    #: kept only so the run trace counts their tokens; reset by ``plan``.
+    trace_hidden: NotRequired[list]
+    #: whether this run's ``compact`` node compacted the thread.
+    compacted: NotRequired[bool]

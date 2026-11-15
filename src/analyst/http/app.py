@@ -36,6 +36,7 @@ from analyst.data.registry import get_service
 from analyst.data.service import DataService, segment_root
 from analyst.errors import AnalystError, InvalidRequestError, UnknownNameError
 from analyst.feedback import Feedback, append_feedback
+from analyst.providers.catalog import load_catalog
 
 logger = logging.getLogger(__name__)
 
@@ -189,8 +190,17 @@ def _meta() -> dict:
                 ],
             }
         )
-    # The model catalogue arrives with Task 7.
-    return {"datasets": datasets, "models": [], "default_model": settings.model}
+    models = [
+        {
+            "spec": m.spec,
+            "label": m.label,
+            "context_window": m.context_window,
+            "has_prices": m.has_prices,
+            "reasoning_summary": m.reasoning_summary,
+        }
+        for m in load_catalog(settings)
+    ]
+    return {"datasets": datasets, "models": models, "default_model": settings.model}
 
 
 @app.get("/meta")

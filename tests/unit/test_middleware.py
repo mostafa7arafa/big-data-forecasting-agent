@@ -230,6 +230,7 @@ def test_middleware_order():
     settings = SimpleNamespace()
     names = [type(m).__name__ for m in analyst_middleware(settings)]
     assert names == [
+        "TraceMiddleware",
         "ClearOldToolResults",
         "ContextMeter",
         "OpenRouterCost",
@@ -238,7 +239,12 @@ def test_middleware_order():
     ]
 
 
-@pytest.mark.parametrize("index,limit", [(3, 40), (4, 25)])
+def test_middleware_records_trace_when_asked():
+    names = [type(m).__name__ for m in analyst_middleware(None, record_trace=True)]
+    assert names[0] == "RunTraceRecorder"
+
+
+@pytest.mark.parametrize("index,limit", [(4, 40), (5, 25)])
 def test_middleware_limits(index, limit):
     middleware = analyst_middleware(SimpleNamespace())[index]
     assert middleware.run_limit == limit

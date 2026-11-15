@@ -50,11 +50,19 @@ from analyst.config import get_settings
 from analyst.context import AnalystContext
 from analyst.data.registry import get_service
 from analyst.middleware import analyst_middleware
-from analyst.middleware.compaction import compact_messages, is_compaction_summary
+from analyst.middleware.compaction import (
+    compact_messages,
+    is_compaction_summary,
+    plan_cut,
+    unpack_raw,
+)
 from analyst.prompts import PLAN_PROMPT, build_system_prompt
 from analyst.providers import get_model
+from analyst.providers.catalog import model_info
 from analyst.state import AnalystState, Answer, Plan, Verification
 from analyst.tools import DATA_TOOLS
+from analyst.trace import build_trace, current_run_id
+from analyst.trace.middleware import atimed_model_call
 from analyst.verify import NO_CLAIMS, collect_handles, verify_answer
 
 logger = logging.getLogger(__name__)
@@ -247,6 +255,45 @@ def _context(runtime: Runtime[AnalystContext], wake: Any = None) -> AnalystConte
     return ctx if ctx.background == background else replace(ctx, background=background)
 
 
+def _raw_message(result: Any) -> AIMessage | None:
+    """The raw AI message of an ``include_raw=True`` structured call, if any."""
+    if isinstance(result, dict) and isinstance(result.get("raw"), AIMessage):
+        return result["raw"]
+    return None
+
+
+def _run_messages(state: AnalystState) -> list[BaseMessage]:
+    """This run's messages for the trace, plus the AI messages the thread dropped.
+
+    A run starts after the latest real question or background notification
+    (a woken run must not count the earlier run's steps again). A run that
+    compacted the thread starts from the compaction summary.
+    """
+    messages = list(state["messages"])
+    question = _question(messages)
+    start = 0
+    for i in range(len(messages) - 1, -1, -1):
+        m = messages[i]
+        if m is question or is_background_notification(m):
+            start = i + 1
+            break
+    run = messages[start:]
+    if state.get("compacted") and messages and is_compaction_summary(messages[0]):
+        run = [messages[0], *run]
+    return [*run, *(state.get("trace_hidden") or [])]
+
+
+def _trace_inputs(runtime: Runtime[AnalystContext], state: AnalystState) -> tuple[str, int]:
+    """Model spec and compaction trigger for the trace; warms the catalogue.
+
+    Blocking (settings, the catalogue file): call through ``asyncio.to_thread``.
+    """
+    settings = get_settings()
+    spec = _context(runtime, state.get("wake_context")).model or settings.model
+    model_info(spec, settings=settings)
+    return spec, settings.compaction_trigger_tokens
+
+
 def build_graph(
     *, model: BaseChatModel | None = None, extra_middleware: list | None = None
 ) -> CompiledStateGraph:
@@ -292,6 +339,8 @@ def build_graph(
             "verification": None,
             "retries": 0,
             "wake_context": None,
+            # ``compact`` ran first this turn and set it (its digest call).
+            "trace_hidden": list(state.get("trace_hidden") or []),
         }
         messages = state["messages"]
         if messages and is_background_notification(messages[-1]):
@@ -305,16 +354,26 @@ def build_graph(
             return reset
         ctx = await asyncio.to_thread(_context, runtime, None)
         chat = await asyncio.to_thread(resolve_model, ctx.model)
-        planner = chat.with_structured_output(Plan)
+        planner = chat.with_structured_output(Plan, include_raw=True)
+        raw: list[AIMessage] = []
         try:
-            result = await planner.ainvoke(
-                [SystemMessage(PLAN_PROMPT), HumanMessage(_text(question))]
+            # Traced as a model step: its tokens belong in the run's totals.
+            result, stamped = await atimed_model_call(
+                "plan",
+                lambda: planner.ainvoke(
+                    [SystemMessage(PLAN_PROMPT), HumanMessage(_text(question))]
+                ),
+                _raw_message,
             )
+            if stamped is not None:
+                raw.append(stamped)
+            result = unpack_raw(result, None)
             if isinstance(result, dict):
                 result = Plan.model_validate(result)
         except Exception:  # a planning failure must not fail the question
             logger.warning("plan node failed; continuing without a plan", exc_info=True)
-            return reset
+            return {**reset, "trace_hidden": [*reset["trace_hidden"], *raw]}
+        reset["trace_hidden"] = [*reset["trace_hidden"], *raw]
         if not isinstance(result, Plan) or not result.needs_plan or not result.steps:
             return reset
         runtime.stream_writer({"type": "plan", "steps": list(result.steps)})
@@ -327,23 +386,43 @@ def build_graph(
         # thread state, so the thread itself shrinks and later turns reuse it.
         messages = list(state["messages"])
         settings = await asyncio.to_thread(get_settings)
+        # Each turn starts its hidden trace messages here (compact runs first).
         if count_tokens_approximately(messages) <= settings.compaction_trigger_tokens:
-            return None
+            return {"compacted": False, "trace_hidden": []}
         question = _question(messages)
         protect = (
             next(i for i, m in enumerate(messages) if m is question)
             if question is not None
             else len(messages)
         )
+        cut = plan_cut(
+            messages,
+            settings.compaction_trigger_tokens,
+            settings.compaction_keep_messages,
+            protect,
+        )
+        if cut <= 0:  # nothing to drop: no digest call, no trace step
+            return {"compacted": False, "trace_hidden": []}
         ctx = await asyncio.to_thread(_context, runtime, None)
         chat = await asyncio.to_thread(resolve_model, ctx.model)
-        return await compact_messages(
-            messages,
-            chat,
-            trigger_tokens=settings.compaction_trigger_tokens,
-            keep_messages=settings.compaction_keep_messages,
-            protect_from=protect,
+        raw: list[AIMessage] = []
+        update, stamped = await atimed_model_call(
+            "compaction",
+            lambda: compact_messages(
+                messages,
+                chat,
+                trigger_tokens=settings.compaction_trigger_tokens,
+                keep_messages=settings.compaction_keep_messages,
+                protect_from=protect,
+                raw_out=raw,
+            ),
+            lambda _: raw[0] if raw else None,
         )
+        hidden = [stamped] if stamped is not None else []
+        # The run trace reports a compaction only for the run that did it.
+        if update is None:
+            return {"compacted": False, "trace_hidden": hidden}
+        return {**update, "compacted": True, "trace_hidden": hidden}
 
     async def analyst(state: AnalystState, runtime: Runtime[AnalystContext]) -> dict:
         ctx = await asyncio.to_thread(_context, runtime, state.get("wake_context"))
@@ -368,22 +447,32 @@ def build_graph(
         carried = {key: dict(state.get(key) or {}) for key in _CARRIED_KEYS}
         last: dict[str, Any] = {"messages": messages}
         try:
-            async for snapshot in agent.astream(
+            # Custom events (trace steps, tool progress) are re-emitted on the
+            # outer graph's stream; a nested astream keeps them to itself.
+            async for mode, chunk in agent.astream(
                 {"messages": messages, **carried},
                 context=ctx,
-                stream_mode="values",
+                stream_mode=["values", "custom"],
             ):
-                last = snapshot
+                if mode == "custom":
+                    runtime.stream_writer(chunk)
+                else:
+                    last = chunk
         except (StructuredOutputError, ValidationError, ValueError):
             logger.warning("analyst gave no valid structured answer", exc_info=True)
             last = {**last, "structured_response": None}
         draft = last.get("structured_response")
         if not isinstance(draft, Answer):
             draft = None
-        new = _drop_structured_response(
-            list(last["messages"][len(messages) :]), structured=draft is not None
-        )
+        produced = list(last["messages"][len(messages) :])
+        new = _drop_structured_response(produced, structured=draft is not None)
         update: dict[str, Any] = {"messages": new, "draft": draft}
+        # Model calls whose message the thread drops still cost tokens: keep
+        # them for the run trace (stripped copies keep their id and usage).
+        kept_ids = {m.id for m in new}
+        hidden = [m for m in produced if isinstance(m, AIMessage) and m.id not in kept_ids]
+        if hidden:
+            update["trace_hidden"] = [*(state.get("trace_hidden") or []), *hidden]
         for key, before in carried.items():
             if last.get(key) and last[key] != before:
                 update[key] = last[key]
@@ -434,7 +523,7 @@ def build_graph(
             )
         return Command(goto="answer", update={"verification": verification})
 
-    async def answer(state: AnalystState) -> dict:
+    async def answer(state: AnalystState, runtime: Runtime[AnalystContext]) -> dict:
         draft = state.get("draft")
         verification = state.get("verification")
         if draft is None:
@@ -460,7 +549,21 @@ def build_graph(
                 verification = Verification(label="not_verified", reason="not checked")
             final = draft.model_copy(update={"verification": verification})
         message = AIMessage(content=final.narrative + "\n\n" + label_chip(verification))
-        return {"answer": final, "verification": verification, "messages": [message]}
+        spec, trigger = await asyncio.to_thread(_trace_inputs, runtime, state)
+        trace = build_trace(
+            _run_messages(state),
+            model=spec,
+            run_id=current_run_id(),
+            verification=verification,
+            events=[],
+            compaction_trigger=trigger,
+        )
+        return {
+            "answer": final,
+            "verification": verification,
+            "messages": [message],
+            "trace": [trace.model_dump(mode="json")],
+        }
 
     builder = StateGraph(AnalystState, context_schema=AnalystContext)
     builder.add_node("compact", compact)

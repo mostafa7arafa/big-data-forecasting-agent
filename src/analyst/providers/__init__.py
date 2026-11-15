@@ -3,7 +3,9 @@
 A model spec is ``"<provider>:<model id>"`` with provider in ``openai``,
 ``openrouter`` or ``nanogpt``. The spec defaults to ``ANALYST_MODEL``; keys
 come from the environment through :class:`analyst.config.Settings`. Building a
-model never touches the network — only the first call does.
+model never touches the network — only the first call does. OpenAI models
+whose catalogue entry (``config/models.yaml``) sets ``reasoning_summary`` run
+on the Responses API with reasoning summaries on.
 """
 
 from langchain_core.language_models import BaseChatModel
@@ -12,6 +14,7 @@ from langchain_openrouter import ChatOpenRouter
 
 from analyst.config import Settings, get_settings
 from analyst.errors import InvalidRequestError
+from analyst.providers.catalog import model_info
 
 __all__ = ["PROVIDERS", "get_model"]
 
@@ -69,5 +72,14 @@ def get_model(
     if provider == "nanogpt":
         return ChatOpenAI(
             model=model_id, base_url=settings.nanogpt_base_url, api_key=api_key
+        )
+    info = model_info(f"{provider}:{model_id}", settings=settings)
+    if info is not None and info.reasoning_summary:
+        # Reasoning summaries are a Responses API feature: opt-in per catalogue entry.
+        return ChatOpenAI(
+            model=model_id,
+            api_key=api_key,
+            use_responses_api=True,
+            reasoning={"summary": "auto"},
         )
     return ChatOpenAI(model=model_id, api_key=api_key)
