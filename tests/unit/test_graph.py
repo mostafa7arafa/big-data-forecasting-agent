@@ -364,7 +364,24 @@ def test_langgraph_json_points_at_graph(monkeypatch, tmp_path):
             "worker": "./src/analyst/worker.py:graph",
         },
         "env": ".env",
+        "http": {
+            "app": "./src/analyst/http/app.py:app",
+            "cors": {
+                "allow_origins": ["http://localhost:3000", "https://smith.langchain.com"],
+                "allow_methods": ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+                "allow_headers": ["*"],
+                "allow_credentials": False,
+                "expose_headers": [
+                    "x-pagination-total",
+                    "x-pagination-next",
+                    "content-location",
+                    "location",
+                ],
+                "max_age": 600,
+            },
+        },
     }
+    assert (REPO / config["http"]["app"].partition(":")[0]).is_file()
     for var in ("ANALYST_DATASET", "OPENAI_API_KEY", "OPENROUTER_API_KEY"):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.chdir(tmp_path)  # no .env: the graphs import without keys

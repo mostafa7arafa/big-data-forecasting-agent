@@ -28,6 +28,15 @@ class GeometrySpec(BaseModel):
         return value
 
 
+def contained_geometry_path(dataset_dir: Path, spec: GeometrySpec) -> Path:
+    """The one containment check for geometry files (symlinks resolved)."""
+    base = dataset_dir.resolve()
+    path = (base / spec.file).resolve()
+    if not path.is_relative_to(base):
+        raise ValueError(f"geometry {spec.name!r} resolves outside the dataset folder")
+    return path
+
+
 class DatasetConfig(BaseModel):
     name: str
     description: str
@@ -48,11 +57,7 @@ class DatasetConfig(BaseModel):
         spec = self.geometry(name)
         if spec is None:
             raise KeyError(name)
-        base = self.dir.resolve()
-        path = (base / spec.file).resolve()
-        if not path.is_relative_to(base):
-            raise ValueError(f"geometry {name!r} resolves outside the dataset folder")
-        return path
+        return contained_geometry_path(self.dir, spec)
 
     @property
     def data_dirs(self) -> list[Path]:

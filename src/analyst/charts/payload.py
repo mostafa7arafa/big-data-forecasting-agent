@@ -28,7 +28,7 @@ from analyst.charts.spec import (
     SmallMultiplesChart,
 )
 from analyst.charts.store import StoredChart
-from analyst.data.dataset import GeometrySpec
+from analyst.data.dataset import GeometrySpec, contained_geometry_path
 from analyst.data.results import ResultStore
 from analyst.errors import InvalidRequestError
 
@@ -361,13 +361,21 @@ def _map_data(
             f"this dataset has no geometry named {spec.geometry!r}",
             hint="map charts need a geometry declared by the dataset; use a bar chart",
         )
-    base = geometry_dir.resolve()
-    path = (base / geo.file).resolve()
-    if not path.is_relative_to(base):
-        raise InvalidRequestError(f"geometry {geo.name!r} resolves outside the dataset folder")
+    try:
+        path = contained_geometry_path(geometry_dir, geo)
+    except ValueError as exc:
+        raise InvalidRequestError(str(exc)) from exc
+    try:
+        features = json.loads(path.read_text(encoding="utf-8")).get("features", [])
+    except (OSError, ValueError, AttributeError) as exc:
+        raise InvalidRequestError(
+            f"geometry {geo.name!r} is missing or not valid GeoJSON",
+            hint="map charts need a readable geometry file; use a bar chart",
+        ) from exc
     feature_keys = {
-        _geo_key(f.get("properties", {}).get(geo.key_property))
-        for f in json.loads(path.read_text(encoding="utf-8")).get("features", [])
+        _geo_key((f.get("properties") or {}).get(geo.key_property))
+        for f in features
+        if isinstance(f, dict)
     } - {None}
     keys = [_geo_key(k) for k in df[spec.key]]
     values = [_num(v) for v in df[spec.value]]
