@@ -308,12 +308,20 @@ def _is_orderable_type(dtype: pa.DataType) -> bool:
     return pa.types.is_temporal(dtype)
 
 
-def _is_numeric_type_str(type_str: str) -> bool:
+def is_numeric_type_str(type_str: str) -> bool:
     lowered = type_str.lower()
     return any(
         token in lowered
         for token in ("int", "float", "double", "decimal", "numeric")
     )
+
+
+_is_numeric_type_str = is_numeric_type_str
+
+
+def is_temporal_type_str(type_str: str) -> bool:
+    lowered = type_str.lower()
+    return any(token in lowered for token in ("date", "time", "timestamp"))
 
 
 def _column_stats(table: pa.Table, name: str) -> ColumnStats:
