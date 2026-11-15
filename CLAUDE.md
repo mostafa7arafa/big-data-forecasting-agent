@@ -17,7 +17,7 @@ An AI data analyst over ~162M NYC taxi trips (DuckDB over Parquet) that answers 
 - One implementer at a time. Briefs, dispatches, reports, reviews live in the ledger directory.
 
 ## Commands
-- `make test` (unit, synthetic data) · `make test-taxi` (integration, needs `data/raw`) · `make lint` · `make replay` (model cutoff replay → `docs/results/`) · `make dev` (LangGraph Studio on the `analyst` graph via `langgraph dev`; also serves `/meta`, `/charts`, `/geo`, `/feedback`; needs `.env` keys) · `make eval-agent` (55-question agent eval as a LangSmith experiment; `--dry-run` runs locally; needs `.env` keys and the sandbox image) · `make sandbox-image` (builds `analyst-sandbox:1` for `run_python`) · `make test-docker` (sandbox and escape-suite tests, need Docker and the image)
+- `./dev.sh` (starts the agent server, plus the Nuxt dashboard once `web/` exists, and opens the browser; Ctrl+C stops all; logs in `.dev/`) · `make test` (unit, synthetic data) · `make test-taxi` (integration, needs `data/raw`) · `make lint` · `make replay` (model cutoff replay → `docs/results/`) · `make dev` (LangGraph Studio on the `analyst` graph via `langgraph dev`; also serves `/meta`, `/charts`, `/geo`, `/feedback`; needs `.env` keys) · `make eval-agent` (55-question agent eval as a LangSmith experiment; `--dry-run` runs locally; needs `.env` keys and the sandbox image) · `make sandbox-image` (builds `analyst-sandbox:1` for `run_python`) · `make test-docker` (sandbox and escape-suite tests, need Docker and the image)
 - Data: `scripts/download_data.sh` (45 monthly files 2023-01..2026-09 into `data/raw/`, resumable)
 
 ## Rules that bite
