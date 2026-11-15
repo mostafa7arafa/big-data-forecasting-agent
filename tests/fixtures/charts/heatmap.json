@@ -1,0 +1,38 @@
+{
+  "chart_id": "c_0123456789",
+  "cutoff": "2026-06-30",
+  "data": {
+    "values": [
+      [
+        1.0,
+        2.0
+      ],
+      [
+        3.0,
+        4.0
+      ]
+    ],
+    "x": [
+      1,
+      2
+    ],
+    "y": [
+      "p",
+      "q"
+    ]
+  },
+  "dataset": "demo",
+  "downsampled": null,
+  "kind": "heatmap",
+  "notes": [],
+  "spec": {
+    "handle": "r_40f761e392",
+    "kind": "heatmap",
+    "title": "Heat",
+    "value": "v",
+    "x": "x",
+    "y": "y"
+  },
+  "title": "Heat",
+  "version": 1
+}

@@ -23,6 +23,7 @@ dependencies = [
     "python-dotenv>=1.2.4",
     "pyyaml>=6.0.3",
     "statsforecast>=2.0.1",
+    "tsdownsample==0.1.5.1",
     "utilsforecast>=0.2.17",
 ]
 
