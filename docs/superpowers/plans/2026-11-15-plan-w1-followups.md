@@ -16,6 +16,8 @@ _Plan W1 (dashboard backend: chart catalogue and service, map geometry, run trac
 - Ruling R10: an interrupted run's inner-agent steps never reach the thread (the analyst node commits only on return), so a saved, steered thread keeps the question plus an interrupted trace record. The partial output is visible in W2 only from the live stream. Making the inner loop checkpoint progressively is out of W1 scope. Cost if wrong: reloading a steered thread loses the partial steps (owner to be told; candidate follow-up).
 - Ruling R11: keep the widened interruption detection: any prior turn that ended without an answer gets `interrupted=True`, since a crash and a cancel look the same afterwards. Cost if wrong: an errored run is labelled "interrupted" rather than "failed" in the trace.
 
+- R12 (final fix wave): ResultStore rejects INTERVAL/duration columns with an `epoch(...)` hint instead of crashing with "internal error" (Parquet can't store intervals anyway) — cost if wrong: an agent query returning a raw interval gets a clear tool error and must convert to seconds.
+
 ## Durability check
 
 Task 8: a SIGINT restart of the dev server, then the thread and its trace were read back successfully. SIGKILL was not tested.
