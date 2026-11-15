@@ -86,7 +86,7 @@ The verifier treats every handle a chart references as cited (today `claims.py` 
 ### 4.4 Chart service
 
 - `make_chart` stores the spec and returns a chart id plus a short caption to the model.
-- `GET /charts/{chart_id}?width=<px>&from=&to=` (custom route) loads the referenced handles from the ResultStore segment of the chart's (dataset, cutoff), recorded in the spec, and returns a columnar payload: typed arrays for x/y as JSON or Arrow, at about one point per pixel column using M4 (keeps first, last, min and max, so spikes and gaps survive).
+- `GET /charts/{dataset}/{segment}/{chart_id}?width=<px>&from=&to=` (custom route) loads the referenced handles from the ResultStore segment of the chart's (dataset, cutoff), recorded in the spec, and returns a columnar payload: typed arrays for x/y as JSON or Arrow, at about one point per pixel column using M4 (keeps first, last, min and max, so spikes and gaps survive).
 - Zoom and pan re-request the visible range at full detail where it fits (level of detail).
 - `tsdownsample` (Rust core) for M4/LTTB [call]; the builder may use DuckDB's equivalent if simpler.
 - Payload schema is versioned and tested with fixtures shared by the backend tests and the web tests.
@@ -125,7 +125,7 @@ A middleware on the analyst agent and the worker (model-call and tool-call wrapp
 
 - **Pickers.** The top bar has a data-cutoff picker (latest data, or a past date) and a model picker (the configured provider specs). They are set when a thread starts and are fixed for that thread; changing either starts a new thread. Every run of the thread passes them through the existing run context (`AnalystContext.cutoff`, `.model`), so every chart in a thread comes from one (dataset, cutoff) segment. The thread rail shows each thread's cutoff and model.
 - **Reveal.** In a thread with a past cutoff, a forecast chart offers "Reveal what happened". It draws the real values after the cutoff over the forecast, in ink, with the forecast's error stated (e.g. "actual 3.88M, forecast 3.93M, inside the 80% range").
-- **The agent never sees the reveal.** It is a chart-service endpoint (`GET /charts/{chart_id}/reveal`) that re-runs the history handle's recorded source (the governed metric request or the validated SELECT) on the uncut dataset, limited to the forecast horizon, and returns only those points to the browser. Nothing is written into the thread's messages, state or ResultStore segment, so the agent's later turns stay blind. Only available after the answer has finished. Tested: the reveal's output never reaches a model call.
+- **The agent never sees the reveal.** It is a chart-service endpoint (`GET /charts/{dataset}/{segment}/{chart_id}/reveal`) that re-runs the history handle's recorded source (the governed metric request or the validated SELECT) on the uncut dataset, limited to the forecast horizon, and returns only those points to the browser. Nothing is written into the thread's messages, state or ResultStore segment, so the agent's later turns stay blind. Only available after the answer has finished. Tested: the reveal's output never reaches a model call.
 
 ## 7. The swarm character [owner-approved]
 

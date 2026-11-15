@@ -46,6 +46,7 @@ _PROTOCOL_ERROR = (
     "sandbox restarted, variables were lost"
 )
 BETWEEN_CALLS_NOTE = "sandbox had restarted before this cell; earlier variables were lost"
+_CLOSED_ERROR = "sandbox closed; this thread's sandbox was shut down, no cell was run"
 _STDERR_TAIL = 500
 _LINE_QUEUE = 8
 
@@ -203,6 +204,10 @@ class DockerSandbox:
         self._stop = threading.Event()
         self._name = ""
         self._n = 0
+        # Set once a close begins, before any interruption; never cleared. Checked
+        # before startup, after a new process is published, and before queued work,
+        # so a close that races a cold start (before ``_proc`` exists) is not lost.
+        self._closing = threading.Event()
 
     # -- process management -------------------------------------------------
     def _start(self) -> None:
@@ -275,8 +280,13 @@ class DockerSandbox:
             view = view[n:]
 
     # -- protocol -------------------------------------------------------------
+    def _closed(self) -> ExecResult:
+        return ExecResult(ok=False, stdout="", error=_CLOSED_ERROR)
+
     def run(self, code: str) -> ExecResult:
         with self._lock:
+            if self._closing.is_set():  # queued behind a run while a close began
+                return self._closed()
             notice = ""
             if self._proc is not None and self._proc.poll() is not None:
                 # Died between calls: tell the model its variables are gone.
@@ -284,6 +294,11 @@ class DockerSandbox:
             if self._proc is None or self._proc.poll() is not None:
                 self._kill()
                 self._start()
+                if self._closing.is_set():
+                    # The close may have looked for the process before _start
+                    # published it, so its abort could not reach it: kill it here.
+                    self._kill()
+                    return self._closed()
             try:
                 return self._exchange(code, notice)
             finally:
@@ -421,7 +436,17 @@ class DockerSandbox:
             except OSError:
                 pass
 
+    def request_close(self) -> None:
+        """Begin closing: no new cell or container starts, and the current one is killed.
+
+        Lock-free like ``abort``. The flag is set before the interruption, so a
+        process ``_start`` publishes afterwards is killed by ``run`` itself.
+        """
+        self._closing.set()
+        self.abort()
+
     def close(self) -> None:
+        self._closing.set()  # before the lock: runs queued on it must not start cells
         with self._lock:
             self._kill()
             shutil.rmtree(self.out_dir, ignore_errors=True)
@@ -526,7 +551,7 @@ def get_sandbox(thread_id: str, dataset: str, cutoff: date | None) -> Sandbox:
 def close_sandbox(thread_id: str) -> None:
     """Close every sandbox of ``thread_id`` (all datasets and cutoffs).
 
-    A cell still running is killed first (``abort``): ``close`` would
+    A cell still running is killed first (``request_close``): ``close`` would
     otherwise wait for it, up to the sandbox timeout. Blocking (docker CLI).
     """
     with _registry_lock:
@@ -534,7 +559,7 @@ def close_sandbox(thread_id: str) -> None:
         boxes = [_registry.pop(k) for k in keys]
     for sb in boxes:
         try:
-            sb.abort()
+            sb.request_close()
         except Exception:  # noqa: BLE001, S110 - closing is best effort
             pass
         _close_quietly(sb)

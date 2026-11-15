@@ -480,3 +480,36 @@ def test_old_cached_forecast_not_served(daily_by_area):
         input_card.handle_id, id_col="area", value_col="total_amount", freq="D"
     )
     assert fresh.handle_id == card.handle_id != stale.handle_id
+
+
+def test_fold_handle_differs_by_model_and_windows(synthetic_dataset, tmp_path, monkeypatch):
+    """A partial and a complete run sharing the newest fold cutoff keep separate folds."""
+    svc = DataService(synthetic_dataset, store_root=tmp_path)
+    card = _one_series_handle(svc)
+    fold = pd.DataFrame(
+        {
+            "unique_id": ["series"], "ds": [datetime(2024, 1, 1)], "yhat": [1.0],
+            "lo_80": [0.5], "hi_80": [1.5], "lo_95": [0.2], "hi_95": [1.8], "actual": [1.1],
+        }
+    )
+
+    def make(model, windows_used):
+        def fake(series, **kwargs):
+            run = _fake_run(["series"], beats_baseline=True, adjustments=[])
+            run.model = model
+            run.backtest.windows = 8
+            run.backtest.windows_used = windows_used
+            run.backtest.last_fold = fold.assign(yhat=float(windows_used))
+            run.backtest.last_fold_cutoff = pd.Timestamp("2023-12-31")
+            return run
+        return fake
+
+    handles = []
+    for model, used in (("AutoETS", 4), ("AutoTheta", 8)):
+        monkeypatch.setattr("analyst.data.service.run_forecast", make(model, used))
+        result = svc.forecast(card.handle_id, value_col="total_amount", freq="D", horizon=1)
+        handles.append(result.meta["fold_handle"])
+        fold_card = svc.store.card(result.meta["fold_handle"])
+        assert (fold_card.meta["model"], fold_card.meta["windows_used"]) == (model, used)
+    assert len(set(handles)) == 2
+    assert svc.store.load(handles[0]).column("yhat").to_pylist() == [4.0]

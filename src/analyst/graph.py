@@ -436,6 +436,7 @@ def build_graph(
                     [SystemMessage(PLAN_PROMPT), HumanMessage(_text(question))]
                 ),
                 _raw_message,
+                model=chat,
             )
             if stamped is not None:
                 raw.append(stamped)
@@ -506,6 +507,7 @@ def build_graph(
                 raw_out=raw,
             ),
             lambda _: raw[0] if raw else None,
+            model=chat,
         )
         hidden = [stamped] if stamped is not None else []
         # The run trace reports a compaction only for the run that did it.

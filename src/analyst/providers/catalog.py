@@ -20,13 +20,20 @@ from pydantic import BaseModel, ConfigDict, Field
 from analyst.config import Settings, get_settings
 
 __all__ = [
+    "MODEL_SPEC_KEY",
     "ModelInfo",
     "Prices",
+    "cached_model_info",
     "catalog_path",
     "clear_catalog_cache",
     "load_catalog",
     "model_info",
+    "model_spec_of",
 ]
+
+#: ``BaseChatModel.metadata`` key holding the spec ``get_model`` built a model
+#: from, so the live trace can price its calls with the catalogue entry.
+MODEL_SPEC_KEY = "analyst_model_spec"
 
 
 class Prices(BaseModel):
@@ -77,9 +84,16 @@ def _load(path: Path) -> tuple[ModelInfo, ...]:
     return entries
 
 
+# The catalogue most recently loaded, by spec: read without any I/O.
+_warm: dict[str, ModelInfo] = {}
+
+
 def load_catalog(settings: Settings | None = None) -> tuple[ModelInfo, ...]:
     """Every catalogue entry, in file order."""
-    return _load(catalog_path(settings))
+    global _warm
+    entries = _load(catalog_path(settings))
+    _warm = {e.spec: e for e in entries}
+    return entries
 
 
 def model_info(spec: str, *, settings: Settings | None = None) -> ModelInfo | None:
@@ -87,5 +101,24 @@ def model_info(spec: str, *, settings: Settings | None = None) -> ModelInfo | No
     return next((e for e in load_catalog(settings) if e.spec == spec), None)
 
 
+def cached_model_info(spec: str) -> ModelInfo | None:
+    """The entry for ``spec`` in the catalogue already loaded, never reading it.
+
+    Safe on the event loop: it touches neither settings nor the disk. ``None``
+    when no catalogue has been loaded yet or ``spec`` is not listed.
+    ``get_model`` loads it (off the loop) before any model runs.
+    """
+    return _warm.get(spec)
+
+
+def model_spec_of(model: object) -> str | None:
+    """The spec ``get_model`` built ``model`` from, or ``None`` (e.g. a test double)."""
+    meta = getattr(model, "metadata", None)
+    spec = meta.get(MODEL_SPEC_KEY) if isinstance(meta, dict) else None
+    return spec if isinstance(spec, str) and spec else None
+
+
 def clear_catalog_cache() -> None:
+    global _warm
     _load.cache_clear()
+    _warm = {}

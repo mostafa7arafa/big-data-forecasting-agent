@@ -458,7 +458,13 @@ class DataService:
                 source=source + ":fold",
                 governed=input_card.governed,
                 elapsed_s=elapsed_s,
-                meta={"cutoff": pd.Timestamp(run.backtest.last_fold_cutoff).isoformat()},
+                # Model and evaluated windows are part of the identity: a partial
+                # run can share its newest cutoff with a later complete run.
+                meta={
+                    "cutoff": pd.Timestamp(run.backtest.last_fold_cutoff).isoformat(),
+                    "model": run.model,
+                    "windows_used": int(run.backtest.windows_used),
+                },
                 index=False,
             )
             fold_handle = fold_card.handle_id

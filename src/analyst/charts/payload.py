@@ -448,6 +448,8 @@ def _histogram_data(df: pd.DataFrame, spec: HistogramChart) -> dict:
             f"histogram bin column {spec.bin!r} must be numeric",
             hint="use the numeric lower edge of each bin",
         )
+    if not len(bins):
+        return {"edges": [], "counts": []}
     order = np.argsort(bins.to_numpy(), kind="stable")
     lows = bins.to_numpy(dtype=np.float64)[order]
     counts = pd.to_numeric(df[spec.count], errors="coerce").to_numpy(dtype=np.float64)[order]

@@ -64,3 +64,10 @@ On `make dev`, the question "How many trips should we expect next month by borou
 - `DockerSandbox.abort()` landing during `Popen` (before `_proc` is set) kills nothing; an "aborted" flag checked after Popen would close it. A container left "created" is reaped after the owning process exits.
 - `Answer.charts` validator drops malformed ids from fresh model output silently (valid ids unaffected); consider a debug log.
 - Pre-existing: a cancel between the `cancelled` check and `cursor.sql()` starting is a DuckDB no-op.
+
+## CodeRabbit round (minors, deferred)
+- A container killed during a cold-start close can linger until the label reaper removes it.
+- The "sandbox closed" error text is misleading when the cause is an LRU eviction.
+- `catalog._warm` holds the last-loaded catalogue; a test that switches settings could see a stale entry.
+- `dev.sh`: Ctrl+C before any service starts exits 0 rather than 130 (not a regression).
+- A bare `cancel_thread` that lands before a sandbox publishes its process is not seen by that cell; the run_python cancel path also calls `close_sandbox`, which the closing flag covers.

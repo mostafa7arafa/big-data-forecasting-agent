@@ -121,3 +121,15 @@ def test_meta_lists_models(monkeypatch, tmp_path):
             "reasoning_summary": False,
         },
     ]
+
+
+def test_get_model_tags_spec_and_warms_the_catalogue(monkeypatch):
+    from analyst.providers.catalog import cached_model_info, model_spec_of
+
+    settings = _settings(monkeypatch, OPENROUTER_API_KEY="or-test", OPENAI_API_KEY="sk-test")
+    assert cached_model_info("openai:gpt-6-luna") is None  # nothing loaded: no disk read
+    for spec in ("openrouter:some/model", "openai:gpt-6-luna"):
+        assert model_spec_of(get_model(spec, settings=settings)) == spec
+    info = cached_model_info("openai:gpt-6-luna")
+    assert info is not None and info == model_info("openai:gpt-6-luna", settings=settings)
+    assert model_spec_of(object()) is None

@@ -31,21 +31,23 @@ open_url() {
 }
 
 wait_for() {  # url, name, seconds
-  local url=$1 name=$2 tries=$3
-  for _ in $(seq "$tries"); do
-    curl -fsS -o /dev/null "$url" 2>/dev/null && return 0
+  local url=$1 name=$2 budget=$3
+  local deadline=$((SECONDS + budget))
+  while ((SECONDS < deadline)); do
+    curl -fsS --max-time 2 -o /dev/null "$url" 2>/dev/null && return 0
     for pid in "${PIDS[@]}"; do
       kill -0 "$pid" 2>/dev/null || die "$name exited during startup; see $LOG_DIR/"
     done
     sleep 1
   done
-  die "$name did not come up at $url within ${tries}s; see $LOG_DIR/"
+  die "$name did not come up at $url within ${budget}s; see $LOG_DIR/"
 }
 
 PIDS=()
 cleanup() {
+  local status=$?
   trap - INT TERM EXIT
-  [[ ${#PIDS[@]} -gt 0 ]] || exit 0
+  [[ ${#PIDS[@]} -gt 0 ]] || exit "$status"
   say "stopping…"
   for pid in "${PIDS[@]}"; do
     kill -INT "$pid" 2>/dev/null || true
@@ -67,7 +69,7 @@ if command -v docker >/dev/null && docker info >/dev/null 2>&1; then
 else
   say "warning: Docker is not running — run_python will be unavailable"
 fi
-if curl -fsS -o /dev/null "http://127.0.0.1:$AGENT_PORT/ok" 2>/dev/null; then
+if curl -fsS --max-time 2 -o /dev/null "http://127.0.0.1:$AGENT_PORT/ok" 2>/dev/null; then
   die "something is already serving on :$AGENT_PORT (another ./dev.sh or make dev?)"
 fi
 mkdir -p "$LOG_DIR"

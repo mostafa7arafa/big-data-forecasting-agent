@@ -613,3 +613,49 @@ def test_worker_trace_run_id_from_top_level_config():
         )
     )
     assert RunTrace.model_validate(out["trace"][-1]).run_id == str(run_id)
+
+
+def test_live_step_cost_matches_saved_trace_from_catalogue():
+    """Tokens without a provider cost: the live step is priced like build_trace."""
+    from analyst.providers.catalog import MODEL_SPEC_KEY, load_catalog
+
+    load_catalog()  # get_model warms it off the loop before any model runs
+    model = StreamingModel(replies=_replies(), streaming=True, metadata={MODEL_SPEC_KEY: LUNA})
+    events, state = _collect(model)
+    live = [
+        e["step"]["cost_usd"]
+        for e in events
+        if e.get("type") == "trace" and e["event"] == "step_finished" and e["step"]["kind"] == "model"
+    ]
+    saved = build_trace(
+        [m for m in state["messages"] if not isinstance(m, HumanMessage)],
+        model=LUNA, run_id=None, verification=None, events=[], compaction_trigger=1000,
+    )
+    saved_costs = [s.cost_usd for s in saved.steps if s.kind == "model"]
+    assert live == pytest.approx(saved_costs)
+    assert live == pytest.approx([(100 * 0.10 + 10 * 0.50) / 1e6] * 2)
+
+
+def test_timed_model_call_prices_from_the_model_spec(monkeypatch):
+    from analyst.providers.catalog import MODEL_SPEC_KEY, load_catalog
+    from analyst.trace import middleware
+
+    load_catalog()
+    seen: list = []
+    monkeypatch.setattr(middleware, "emit", lambda event, step: seen.append((event, step)))
+    model = StreamingModel(replies=[], metadata={MODEL_SPEC_KEY: LUNA})
+
+    async def call():
+        return AIMessage("plan", usage_metadata=_usage(1_000, 100))
+
+    asyncio.run(middleware.atimed_model_call("plan", call, model=model))
+    finished = [s for e, s in seen if e == "step_finished"]
+    assert finished[0].cost_usd == pytest.approx((1_000 * 0.10 + 100 * 0.50) / 1e6)
+
+    seen.clear()
+
+    async def reported():
+        return AIMessage("plan", usage_metadata=_usage(1_000, 100, cost=0.5))
+
+    asyncio.run(middleware.atimed_model_call("plan", reported, model=model))
+    assert next(s for e, s in seen if e == "step_finished").cost_usd == 0.5

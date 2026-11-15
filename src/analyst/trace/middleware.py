@@ -50,6 +50,7 @@ from langgraph.runtime import Runtime
 from langgraph.types import Command
 
 from analyst.cancel import cancel_thread, current_thread_id, try_cancel_thread
+from analyst.providers.catalog import ModelInfo, cached_model_info, model_spec_of
 from analyst.trace.build import STAMP_KEY, build_trace, model_step, tool_step
 from analyst.trace.model import StepTrace
 
@@ -146,6 +147,17 @@ def current_run_id() -> str | None:
     return None
 
 
+def _live_info(model: Any) -> ModelInfo | None:
+    """The catalogue entry for a live step's model, without blocking.
+
+    Prices a step whose provider reports tokens but no cost the way
+    ``build_trace`` prices the saved one. ``get_model`` loaded the catalogue
+    off the loop, so this is an in-memory lookup.
+    """
+    spec = model_spec_of(model)
+    return cached_model_info(spec) if spec is not None else None
+
+
 def _model_name(request: ModelRequest) -> str:
     for attr in ("model_name", "model"):
         value = getattr(request.model, attr, None)
@@ -204,6 +216,8 @@ async def atimed_model_call(
     name: str,
     call: Callable[[], Awaitable[Any]],
     raw_of: Callable[[Any], Any] = lambda result: result,
+    *,
+    model: Any = None,
 ) -> tuple[Any, AIMessage | None]:
     """Run a model call outside the agent loop as a traced step.
 
@@ -211,7 +225,8 @@ async def atimed_model_call(
     live events, first-token probe and stamp the middleware gives agent model
     calls. ``raw_of(result)`` picks the call's raw AI message; the stamped
     copy is returned for the node to hand to the run trace (``None`` when the
-    call produced no AI message).
+    call produced no AI message). ``model`` is the chat model the call uses;
+    it prices a step whose provider reports no cost.
     """
     started = _now()
     step = StepTrace(
@@ -246,7 +261,7 @@ async def atimed_model_call(
         "name": name,
     }
     stamped = _stamped(raw, marks)
-    emit("step_finished", model_step(stamped))
+    emit("step_finished", model_step(stamped, _live_info(model)))
     return result, stamped
 
 
@@ -302,7 +317,12 @@ class TraceMiddleware(AgentMiddleware):
         return step, started
 
     def _finish_model(
-        self, step: StepTrace, started: datetime, first: datetime | None, result: Any
+        self,
+        step: StepTrace,
+        started: datetime,
+        first: datetime | None,
+        result: Any,
+        model: Any = None,
     ) -> Any:
         ended = _now()
         marks = {
@@ -313,7 +333,9 @@ class TraceMiddleware(AgentMiddleware):
         }
         result, message = _stamp_model_result(result, marks)
         if message is not None:
-            done = model_step(message).model_copy(update={"name": step.name})
+            done = model_step(message, _live_info(model)).model_copy(
+                update={"name": step.name}
+            )
         else:
             done = step.model_copy(update={"ended_at": ended})
         emit("step_finished", done)
@@ -336,7 +358,7 @@ class TraceMiddleware(AgentMiddleware):
             raise
         finally:
             _first_token.reset(token)
-        return self._finish_model(step, started, probe.at, result)
+        return self._finish_model(step, started, probe.at, result, request.model)
 
     async def awrap_model_call(
         self, request: ModelRequest, handler: Callable[[ModelRequest], Awaitable[Any]]
@@ -351,7 +373,7 @@ class TraceMiddleware(AgentMiddleware):
             raise
         finally:
             _first_token.reset(token)
-        return self._finish_model(step, started, probe.at, result)
+        return self._finish_model(step, started, probe.at, result, request.model)
 
     # --- tool calls
 

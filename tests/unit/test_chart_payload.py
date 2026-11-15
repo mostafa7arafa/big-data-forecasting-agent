@@ -442,3 +442,13 @@ def test_payloads_match_golden_fixtures(tmp_path):
         if os.environ.get("UPDATE_FIXTURES"):
             path.write_text(text, encoding="utf-8")
         assert path.read_text(encoding="utf-8") == text, kind
+
+
+def test_histogram_prebinned_empty(store):
+    h = _save(
+        store,
+        pa.table({"b": pa.array([], type=pa.float64()), "n": pa.array([], type=pa.int64())}),
+        tag="empty",
+    )
+    d = build_payload(_stored(HistogramChart(title="h", handle=h, bin="b", count="n")), store)["data"]
+    assert d == {"edges": [], "counts": []}
