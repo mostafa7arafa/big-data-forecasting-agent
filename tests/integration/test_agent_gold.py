@@ -80,5 +80,10 @@ def test_real_forecast_passes_forecast_shape(tmp_path, row_id, dimensions, grain
         content="", tool_call_id="t", artifact={"handle_id": card.handle_id, "produced_by": "forecast", "governed": True}
     )
     outputs = {"answer": {"narrative": "", "claims": []}, "handles": _handle_entries([message], svc.store)}
-    result = grade_checks(outputs, row)
+    # This test covers forecast_shape only; other gold checks (e.g. chart_kind) need a full answer.
+    shape_only = {
+        **row,
+        "gold_check": [c for c in row["gold_check"] if c.startswith("forecast_shape(")],
+    }
+    result = grade_checks(outputs, shape_only)
     assert result["score"] is True, result["comment"]

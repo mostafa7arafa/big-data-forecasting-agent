@@ -42,6 +42,17 @@ _FORECAST_COLUMNS = (
     "hi_80",
     "lo_95",
     "hi_95",
+    "baseline",
+)
+_FOLD_COLUMNS = (
+    "unique_id",
+    "ds",
+    "yhat",
+    "lo_80",
+    "hi_80",
+    "lo_95",
+    "hi_95",
+    "actual",
 )
 _SCORE_FIELDS = (
     "mae",
@@ -198,6 +209,8 @@ class DataService:
                 "levels": sorted(levels),
                 "candidates": names,
                 "candidates_source": candidates_source,
+                # v2: forecasts now store the baseline column and fold handle.
+                "schema": "v2",
             },
             separators=(",", ":"),
             sort_keys=True,
@@ -433,7 +446,27 @@ class DataService:
             },
             index=complete,
         )
+        fold_handle = None
+        last_fold = run.backtest.last_fold
+        if last_fold is not None and len(last_fold):
+            fold_card = self.store.save(
+                pa.Table.from_pandas(
+                    last_fold.loc[:, list(_FOLD_COLUMNS)], preserve_index=False
+                ),
+                produced_by="backtest_fold",
+                source=source + ":fold",
+                governed=input_card.governed,
+                elapsed_s=elapsed_s,
+                meta={"cutoff": pd.Timestamp(run.backtest.last_fold_cutoff).isoformat()},
+                index=False,
+            )
+            fold_handle = fold_card.handle_id
         meta = {
+            "time_col": time_col,
+            "value_col": value_col,
+            "id_col": id_col,
+            "season_length": run.season_length,
+            "fold_handle": fold_handle,
             "model": run.model,
             "origin": run.origin.isoformat(),
             "horizon": horizon,

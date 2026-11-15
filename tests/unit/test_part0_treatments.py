@@ -184,6 +184,7 @@ def test_headline_excludes_small_ids(synthetic_service, monkeypatch):
                     "hi_80": 1.5,
                     "lo_95": 0.2,
                     "hi_95": 1.8,
+                    "baseline": 0.9,
                 }
                 for uid in ("big", "tiny")
             ]

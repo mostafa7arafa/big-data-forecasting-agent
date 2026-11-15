@@ -91,7 +91,7 @@ def test_monthly_candidates():
 
 def test_interval_ordering(run):
     df = run.forecast
-    assert list(df) == ["unique_id", "ds", "yhat", "lo_80", "hi_80", "lo_95", "hi_95"]
+    assert list(df) == ["unique_id", "ds", "yhat", "lo_80", "hi_80", "lo_95", "hi_95", "baseline"]
     for lower, upper in zip(
         ["lo_95", "lo_80", "yhat", "hi_80"], ["lo_80", "yhat", "hi_80", "hi_95"]
     ):
@@ -643,3 +643,44 @@ def test_unobserved_additive_series_rejected_before_zero_fill(freq, dates):
         id_col=None, time_col="ds", value_col="y", additive=True,
     )
     assert result.df.y.notna().all()
+
+
+def test_forecast_has_baseline_column(run):
+    f = run.forecast
+    assert list(f.columns) == [
+        "unique_id", "ds", "yhat", "lo_80", "hi_80", "lo_95", "hi_95", "baseline",
+    ]
+    naive = fit_predict(
+        daily(), freq="D", horizon=28, models=[SeasonalNaive(season_length=7)]
+    )
+    assert np.allclose(f.baseline.to_numpy(), naive.SeasonalNaive.to_numpy())
+    assert run.season_length == 7
+
+
+def test_baseline_equals_yhat_when_seasonal_naive_wins():
+    result = forecast(
+        daily(noise=True), freq="D", horizon=14, models=[SeasonalNaive(season_length=7)]
+    )
+    assert result.model == "SeasonalNaive"
+    assert np.allclose(result.forecast.baseline, result.forecast.yhat)
+
+
+def test_last_fold_is_latest_window_with_actuals(run):
+    series = daily()
+    fold = run.backtest.last_fold
+    assert list(fold.columns) == [
+        "unique_id", "ds", "yhat", "lo_80", "hi_80", "lo_95", "hi_95", "actual",
+    ]
+    assert len(fold) == 28
+    # Newest window ends at the series end; actuals are the real values.
+    assert fold.ds.max() == series.df.ds.max()
+    truth = series.df.set_index("ds").y
+    assert np.allclose(fold.actual.to_numpy(), truth.loc[fold.ds].to_numpy())
+    assert (fold.lo_95 <= fold.yhat).all() and (fold.yhat <= fold.hi_95).all()
+
+
+def test_last_fold_none_without_cv():
+    from analyst.forecasting.core import BacktestReport
+
+    report = BacktestReport(pd.DataFrame(), "SeasonalNaive", False, 3, 7)
+    assert report.last_fold is None
