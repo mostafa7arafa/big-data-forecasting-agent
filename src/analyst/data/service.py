@@ -106,6 +106,7 @@ class DataService:
     ) -> None:
         if store_root is None:
             store_root = segment_root(dataset.name, cutoff)
+        self.dataset = dataset
         self.engine = Engine(dataset, cutoff=cutoff)
         self.store = ResultStore(store_root)
         self.charts = ChartStore(store_root)

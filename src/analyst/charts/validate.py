@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any
 
 from analyst.charts._inner import InnerArea, InnerBar, InnerFan, InnerLine, InnerSpec
 from analyst.charts.spec import (
@@ -19,6 +18,7 @@ from analyst.charts.spec import (
     SmallMultiplesChart,
     chart_handles,
 )
+from analyst.data.dataset import GeometrySpec
 from analyst.data.results import (
     ResultStore,
     SummaryCard,
@@ -31,7 +31,7 @@ from analyst.errors import InvalidRequestError
 def validate_spec(
     spec: ChartSpec,
     store: ResultStore,
-    geometries: Mapping[str, Any],
+    geometries: Mapping[str, GeometrySpec],
 ) -> None:
     for handle_id in chart_handles(spec):
         card = _require_handle(store, handle_id)
@@ -271,7 +271,7 @@ def _require_numeric(
         )
 
 
-def _require_geometry(name: str, geometries: Mapping[str, Any]) -> None:
+def _require_geometry(name: str, geometries: Mapping[str, GeometrySpec]) -> None:
     if not geometries:
         raise InvalidRequestError(
             "this dataset has no map geometry",

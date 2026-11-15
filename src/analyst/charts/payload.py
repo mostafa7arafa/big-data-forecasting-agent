@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import math
 from collections.abc import Mapping
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -26,6 +28,7 @@ from analyst.charts.spec import (
     SmallMultiplesChart,
 )
 from analyst.charts.store import StoredChart
+from analyst.data.dataset import GeometrySpec
 from analyst.data.results import ResultStore
 from analyst.errors import InvalidRequestError
 
@@ -65,11 +68,12 @@ def build_payload(
     width: int = DEFAULT_WIDTH,
     x_from: datetime | None = None,
     x_to: datetime | None = None,
-    geometries: Mapping[str, Any] | None = None,
+    geometries: Mapping[str, GeometrySpec] | None = None,
+    geometry_dir: Path | None = None,
 ) -> dict:
     ctx = _Ctx(store, max(MIN_WIDTH, min(MAX_WIDTH, int(width))), x_from, x_to)
     spec = stored.spec
-    data = _build_data(spec, ctx, geometries)
+    data = _build_data(spec, ctx, geometries, geometry_dir)
     downsampled = {"from": ctx.n_from, "to": ctx.n_to} if ctx.n_to < ctx.n_from else None
     return {
         "version": PAYLOAD_VERSION,
@@ -85,7 +89,7 @@ def build_payload(
     }
 
 
-def _build_data(spec, ctx: _Ctx, geometries) -> dict:
+def _build_data(spec, ctx: _Ctx, geometries, geometry_dir) -> dict:
     if isinstance(spec, LineChart | AreaChart):
         return _line_data(ctx, ctx.table(spec.handle), spec.x, spec.y, spec.series)
     if isinstance(spec, ForecastFanChart):
@@ -95,10 +99,7 @@ def _build_data(spec, ctx: _Ctx, geometries) -> dict:
     if isinstance(spec, HeatmapChart):
         return _heatmap_data(ctx.table(spec.handle), spec.x, spec.y, spec.value)
     if isinstance(spec, MapChart):
-        raise InvalidRequestError(
-            "map needs dataset geometry",
-            hint="map charts are not available for this dataset yet; use a bar chart",
-        )
+        return _map_data(ctx.table(spec.handle), spec, geometries or {}, geometry_dir)
     if isinstance(spec, HistogramChart):
         return _histogram_data(ctx.table(spec.handle), spec)
     if isinstance(spec, BoxChart):
@@ -331,6 +332,52 @@ def _scorecard(ctx: _Ctx, meta: dict) -> dict:
         "windows_used": meta.get("windows_used"),
         "windows": windows,
         "beats_baseline": meta.get("beats_baseline"),
+    }
+
+
+# ---------------------------------------------------------------- map
+
+
+def _geo_key(k: Any) -> str | None:
+    """One string form for feature and handle keys: 1, 1.0 and "1" all become "1"."""
+    if k is None or (not isinstance(k, str) and pd.isna(k)):
+        return None
+    if isinstance(k, float) and k.is_integer():
+        return str(int(k))
+    if isinstance(k, np.floating) and float(k).is_integer():
+        return str(int(k))
+    return str(k)
+
+
+def _map_data(
+    df: pd.DataFrame,
+    spec: MapChart,
+    geometries: Mapping[str, GeometrySpec],
+    geometry_dir: Path | None,
+) -> dict:
+    geo = geometries.get(spec.geometry)
+    if geo is None or geometry_dir is None:
+        raise InvalidRequestError(
+            f"this dataset has no geometry named {spec.geometry!r}",
+            hint="map charts need a geometry declared by the dataset; use a bar chart",
+        )
+    base = geometry_dir.resolve()
+    path = (base / geo.file).resolve()
+    if not path.is_relative_to(base):
+        raise InvalidRequestError(f"geometry {geo.name!r} resolves outside the dataset folder")
+    feature_keys = {
+        _geo_key(f.get("properties", {}).get(geo.key_property))
+        for f in json.loads(path.read_text(encoding="utf-8")).get("features", [])
+    } - {None}
+    keys = [_geo_key(k) for k in df[spec.key]]
+    values = [_num(v) for v in df[spec.value]]
+    unmatched = sorted({k for k in keys if k is not None and k not in feature_keys})
+    return {
+        "geometry": geo.name,
+        "key_property": geo.key_property,
+        "keys": keys,
+        "values": values,
+        "unmatched": unmatched,
     }
 
 

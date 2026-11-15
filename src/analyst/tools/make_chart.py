@@ -26,7 +26,7 @@ def make_chart(spec: ChartSpec, runtime: ToolRuntime[AnalystContext]) -> Result:
 
     def body() -> Result:
         service = service_for(runtime)
-        validate_spec(spec, service.store, geometries={})
+        validate_spec(spec, service.store, geometries={g.name: g for g in service.dataset.geometries})
         ctx = runtime.context
         stored = service.charts.save(spec, dataset=ctx.dataset, cutoff=ctx.cutoff)
         handles = chart_handles(spec)

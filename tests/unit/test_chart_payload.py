@@ -27,6 +27,7 @@ from analyst.charts.spec import (
     SmallMultiplesChart,
 )
 from analyst.charts.store import StoredChart
+from analyst.data.dataset import GeometrySpec
 from analyst.data.results import ResultStore
 from analyst.errors import InvalidRequestError
 
@@ -360,12 +361,6 @@ def test_small_multiples_caps_facets(store):
     assert len(p["data"]["facets"]) == 12 and p["notes"]
 
 
-def test_map_not_yet_supported(store):
-    h = _save(store, pa.table({"k": ["a"], "v": [1.0]}))
-    with pytest.raises(InvalidRequestError, match="map needs dataset geometry"):
-        build_payload(_stored(MapChart(title="m", handle=h, key="k", value="v", geometry="g")), store)
-
-
 def test_no_nan_in_json(store):
     ds = pd.date_range("2024-01-01", periods=4, freq="D")
     h = _save(store, pa.table({"ds": ds, "v": [1.0, math.nan, 3.0, 4.0]}))
@@ -396,6 +391,30 @@ def test_payloads_match_golden_fixtures(tmp_path):
     sc_h = _save(store, pa.table({"x": [1.0, 2.0, 3.0], "y": [2.0, 1.0, 3.0], "k": ["u", "v", "u"]}), tag="sc")
     kpi_h = _save(store, pa.table({"v": [120.0], "c": [100.0]}), tag="kpi")
     fh = _forecast_pair(store)
+    geo_dir = tmp_path / "geo_ds"
+    (geo_dir / "geo").mkdir(parents=True)
+    (geo_dir / "geo" / "areas.geojson").write_text(
+        json.dumps(
+            {
+                "type": "FeatureCollection",
+                "features": [
+                    {
+                        "type": "Feature",
+                        "properties": {"area": name},
+                        "geometry": {
+                            "type": "Polygon",
+                            "coordinates": [[[x, 0], [x + 1, 0], [x + 1, 1], [x, 0]]],
+                        },
+                    }
+                    for name, x in (("A", 0), ("B", 2))
+                ],
+            }
+        )
+    )
+    geometries = {
+        "areas": GeometrySpec(name="areas", file="geo/areas.geojson", key_property="area")
+    }
+    map_h = _save(store, pa.table({"k": ["A", "B", "Z"], "v": [1.0, 2.0, 3.0]}), tag="map")
     specs = {
         "line": LineChart(title="Line", handle=line_h, x="ds", y="v", series="s"),
         "area": AreaChart(title="Area", handle=line_h, x="ds", y="v", series="s", stacked=True),
@@ -404,6 +423,7 @@ def test_payloads_match_golden_fixtures(tmp_path):
         ),
         "bar": BarChart(title="Bar", handle=bar_h, category="c", value="v", top_n=3),
         "heatmap": HeatmapChart(title="Heat", handle=heat_h, x="x", y="y", value="v"),
+        "map": MapChart(title="Map", handle=map_h, key="k", value="v", geometry="areas"),
         "histogram": HistogramChart(title="Hist", handle=hist_h, value="v"),
         "box": BoxChart(title="Box", handle=box_h, group="g", value="v"),
         "scatter": ScatterChart(title="Scatter", handle=sc_h, x="x", y="y", color="k"),
@@ -414,7 +434,9 @@ def test_payloads_match_golden_fixtures(tmp_path):
     }
     FIXTURES.mkdir(parents=True, exist_ok=True)
     for kind, spec in specs.items():
-        payload = build_payload(_stored(spec), store, width=1200)
+        payload = build_payload(
+            _stored(spec), store, width=1200, geometries=geometries, geometry_dir=geo_dir
+        )
         text = json.dumps(payload, indent=2, sort_keys=True, allow_nan=False) + "\n"
         path = FIXTURES / f"{kind}.json"
         if os.environ.get("UPDATE_FIXTURES"):

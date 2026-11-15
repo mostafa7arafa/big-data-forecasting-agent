@@ -77,7 +77,7 @@ class MapChart(BaseModel):
     handle: str
     key: str
     value: str
-    geometry: str
+    geometry: str = Field(pattern=r"^[a-z0-9_]{1,40}$")
 
 
 class HistogramChart(BaseModel):

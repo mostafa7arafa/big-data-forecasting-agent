@@ -374,3 +374,8 @@ def test_validate_small_multiples_rejects_bad_facet(store_with_handle):
         validate_spec(spec, store, {})
     assert "ds" in exc.value.hint
     assert "cat" in exc.value.hint
+
+@pytest.mark.parametrize("bad", ["Zones", "a-b", "", "x" * 41, "../z"])
+def test_map_chart_geometry_name_pattern_rejected(bad):
+    with pytest.raises(ValidationError):
+        MapChart(kind="map", title="T", handle="H", key="k", value="v", geometry=bad)
