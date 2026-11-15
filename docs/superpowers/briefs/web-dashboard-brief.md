@@ -8,8 +8,9 @@ The product face of the analyst. A senior AI engineer opening it should feel "th
 
 ## Decided
 
-- **Rust + Leptos, compiled to WebAssembly** (owner). Its own Cargo workspace under `web/`.
-- **A small typed Rust client** for the LangGraph Agent Server API: threads, runs and streaming events. Don't use the archived `agent-chat-ui`.
+- **Nuxt + Vue 3 with TypeScript, client-side rendered** (owner, 2026-11-15; replaces Rust + Leptos). Its own pnpm workspace under `web/`.
+- **`@langchain/vue` `useStream`** for the LangGraph Agent Server API: threads, runs and streaming events. Don't use the archived `agent-chat-ui`.
+- **Chart-data endpoints** run inside the Agent Server as custom FastAPI routes (`http.app` in `langgraph.json`).
 - **Large-data charts** follow the spec's three layers:
   1. downsampled payloads (M4/LTTB) from the chart-data service;
   2. level of detail re-queried on zoom;
@@ -42,8 +43,7 @@ The product face of the analyst. A senior AI engineer opening it should feel "th
 
 - The character's name, look and motion.
 - Visual identity: palette, type, tone.
-- Renderer: Rust-native WebGL vs a JS WebGL library bridged through `wasm-bindgen`, decided by a spike against the budgets. Rust-native is preferred.
-- CSR vs SSR in Leptos.
+- Renderer: a fast canvas time-series library (e.g. uPlot) vs a WebGL/WebGPU library, or a mix per chart kind, decided by a spike against the budgets.
 - The demo-video script (~2 min): the hero question end to end, a context-size meter, and the eval results.
 
 ## Out of scope
