@@ -29,20 +29,6 @@ class Claim(BaseModel):
     _lists = _null_lists("values", "handles", "fact_ids")
 
 
-class ChartSpec(BaseModel):
-    kind: Literal["line", "bar"]
-    title: str
-    handle: str
-    x: str
-    y: str
-    series: str | None = None
-    forecast_handle: str | None = None
-    bands: list[int] = Field(default_factory=list)
-    last_year_handle: str | None = None
-
-    _lists = _null_lists("bands")
-
-
 class Verification(BaseModel):
     label: Literal["verified", "verified_off_model", "not_verified"]
     reason: str
@@ -53,7 +39,8 @@ class Verification(BaseModel):
 class Answer(BaseModel):
     narrative: str
     claims: list[Claim]
-    charts: list[ChartSpec] = Field(default_factory=list)
+    #: chart ids returned by ``make_chart``.
+    charts: list[str] = Field(default_factory=list)
     sql: list[str] = Field(default_factory=list)
     verification: Verification | None = None
     background_tasks: list[str] = Field(default_factory=list)

@@ -1,58 +1,39 @@
-from typing import Literal
-
 from langchain.tools import ToolRuntime
 
+from analyst.charts import ChartSpec, chart_handles, validate_spec
+from analyst.charts.spec import ForecastFanChart, SmallMultiplesChart
 from analyst.context import AnalystContext
-from analyst.errors import InvalidRequestError, UnknownNameError
-from analyst.state import ChartSpec
 from analyst.tools._common import Result, data_tool, run_tool, service_for
 
 
+def _facts(spec: ChartSpec, handles: list[str]) -> list[str]:
+    """One line per derived fact the model should know about the stored chart."""
+    if isinstance(spec, ForecastFanChart):
+        series = f"series {spec.series_id}" if spec.series_id else "all series"
+        year = "last year shown" if spec.last_year else "no last-year overlay"
+        return [f"forecast_fan of {spec.forecast_handle} ({series}); {year}"]
+    if isinstance(spec, SmallMultiplesChart):
+        return [f"small_multiples of {spec.inner.kind} faceted by {spec.facet}"]
+    return []
+
+
 @data_tool("make_chart")
-def make_chart(
-    kind: Literal["line", "bar"],
-    title: str,
-    handle: str,
-    x: str,
-    y: str,
-    runtime: ToolRuntime[AnalystContext],
-    series: str | None = None,
-    forecast_handle: str | None = None,
-    bands: list[int] | None = None,
-    last_year_handle: str | None = None,
-) -> Result:
-    """Declare a chart over result handles; the UI renders it. x, y and series
-    are column names of `handle`. Optionally overlay a forecast handle with
-    interval bands (80, 95) or last year's handle."""
+def make_chart(spec: ChartSpec, runtime: ToolRuntime[AnalystContext]) -> Result:
+    """Declare a chart over result handles; the UI renders it. `spec` is one
+    chart kind (its `kind` field picks the shape) whose handles and columns
+    come from data tool results. Returns a chart id to list in the answer's
+    `charts`."""
 
     def body() -> Result:
         service = service_for(runtime)
-        for ref in (handle, forecast_handle, last_year_handle):
-            if ref is not None and not service.store.exists(ref):
-                raise UnknownNameError(
-                    f"unknown handle {ref!r}",
-                    hint="use a handle_id returned by a data tool",
-                )
-        columns = {name for name, _ in service.store.card(handle).columns}
-        for col in (x, y, series):
-            if col is not None and col not in columns:
-                raise InvalidRequestError(
-                    f"column {col!r} not in {handle}; columns: {sorted(columns)}",
-                    hint="pick x, y and series from the handle's columns",
-                )
-        spec = ChartSpec(
-            kind=kind,
-            title=title,
-            handle=handle,
-            x=x,
-            y=y,
-            series=series,
-            forecast_handle=forecast_handle,
-            bands=bands or [],
-            last_year_handle=last_year_handle,
-        )
-        return f"chart queued: {kind} '{title}' of {y} by {x} from {handle}", {
-            "chart": spec.model_dump()
-        }
+        validate_spec(spec, service.store, geometries={})
+        ctx = runtime.context
+        stored = service.charts.save(spec, dataset=ctx.dataset, cutoff=ctx.cutoff)
+        handles = chart_handles(spec)
+        title = spec.title
+        lines = [f"chart {stored.chart_id} queued: {spec.kind} '{title}'"]
+        lines += _facts(spec, handles)
+        artifact = {"chart_id": stored.chart_id, "kind": spec.kind, "handles": handles}
+        return "\n".join(lines), artifact
 
     return run_tool("make_chart", runtime, body)

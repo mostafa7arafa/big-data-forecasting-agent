@@ -105,7 +105,13 @@ def _validate_ids(name: str, minimum: int) -> Callable[[tuple], None]:
     return validate
 
 
+def _validate_chart_kind(args: tuple) -> None:
+    if len(args) != 1 or not isinstance(args[0], str) or not args[0]:
+        raise ValueError("chart_kind takes one chart kind string")
+
+
 _VALIDATORS: dict[str, Callable[[tuple], None]] = {
+    "chart_kind": _validate_chart_kind,
     "forecast_shape": _validate_forecast_shape,
     "declined": _validate_declined,
     "quirk_flagged": _validate_ids("quirk_flagged", 1),
@@ -686,7 +692,22 @@ def _check_no_causal_without(outputs: dict, reference: dict, *ids: str) -> tuple
     return True, "causal claims cite allowed facts" if allowed else "no causal claims"
 
 
+def _check_chart_kind(outputs: dict, reference: dict, kind: str) -> tuple[bool, str]:
+    """Some answer chart is `kind`, or a small_multiples whose inner kind is."""
+    stored = outputs.get("charts") or {}
+    seen = []
+    for chart_id in _answer(outputs).get("charts") or []:
+        spec = (stored.get(chart_id) or {}).get("spec") or {}
+        top = spec.get("kind")
+        inner = (spec.get("inner") or {}).get("kind") if top == "small_multiples" else None
+        seen.append(f"{top}/{inner}" if inner else str(top))
+        if top == kind or inner == kind:
+            return True, f"chart {chart_id} is {kind}" + (" (small_multiples)" if inner else "")
+    return False, f"no {kind} chart (answer charts: {seen or 'none'})"
+
+
 _CHECKS: dict[str, Callable[..., tuple[bool, str]]] = {
+    "chart_kind": _check_chart_kind,
     "forecast_shape": _check_forecast_shape,
     "declined": _check_declined,
     "quirk_flagged": _check_quirk_flagged,

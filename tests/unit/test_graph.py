@@ -540,16 +540,7 @@ def cite_total_json_with_nulls(messages: list[BaseMessage]) -> AIMessage:
                     "fact_ids": None,
                 }
             ],
-            "charts": [
-                {
-                    "kind": "bar",
-                    "title": "Events",
-                    "handle": hid,
-                    "x": "event_count",
-                    "y": "event_count",
-                    "bands": None,
-                }
-            ],
+            "charts": None,
             "sql": None,
             "background_tasks": None,
         }
@@ -561,22 +552,13 @@ def test_answer_schema_coerces_null_lists():
         {
             "narrative": "n",
             "claims": None,
-            "charts": [
-                {
-                    "kind": "line",
-                    "title": "t",
-                    "handle": "r_1",
-                    "x": "a",
-                    "y": "b",
-                    "bands": None,
-                }
-            ],
+            "charts": ["c_0123456789"],
             "sql": None,
             "background_tasks": None,
         }
     )
     assert answer.claims == [] and answer.sql == [] and answer.background_tasks == []
-    assert answer.charts[0].bands == []
+    assert answer.charts == ["c_0123456789"]
     claim = Claim.model_validate(
         {
             "text": "t",
@@ -617,7 +599,7 @@ def test_provider_null_list_fields_do_not_raise():
     out = run(model, [HumanMessage("how many events?")])
     answer = out["answer"]
     assert answer.verification.label == "verified", answer.verification
-    assert answer.charts[0].bands == []
+    assert answer.charts == []
 
 
 def test_unrepairable_structured_output_is_not_verified():

@@ -12,6 +12,7 @@ from typing import Literal
 import pandas as pd
 import pyarrow as pa
 
+from analyst.charts.store import ChartStore
 from analyst.config import get_settings
 from analyst.data.dataset import DatasetConfig
 from analyst.data.engine import Coverage, Engine
@@ -96,6 +97,7 @@ class DataService:
             store_root = segment_root(dataset.name, cutoff)
         self.engine = Engine(dataset, cutoff=cutoff)
         self.store = ResultStore(store_root)
+        self.charts = ChartStore(store_root)
         self.memory: Memory = load_memory(dataset)
 
     def query_metrics(self, q: MetricQuery) -> SummaryCard:

@@ -3,7 +3,9 @@
 import re
 from datetime import date
 
+from analyst.charts import ChartStore, chart_handles
 from analyst.data.results import ResultStore
+from analyst.errors import UnknownNameError
 from analyst.semantic.model import Memory
 from analyst.state import Answer, Verification
 from analyst.verify.numbers import extract_numbers, matches
@@ -102,6 +104,7 @@ def verify_answer(
     memory: Memory,
     cutoff: date | None,
     store: ResultStore,
+    charts: ChartStore | None = None,
 ) -> Verification:
     if not answer.claims and not extract_numbers(answer.narrative, exclude=question):
         # Nothing claimed or stated: not an answer about the data, so the
@@ -130,10 +133,18 @@ def verify_answer(
         if not cited:
             problems.append("claim cites no evidence")
         claim_handles.append(cited)
-    for chart in answer.charts:
-        for handle_id in (chart.handle, chart.forecast_handle, chart.last_year_handle):
-            if handle_id:
-                resolve(handle_id)
+    for chart_id in answer.charts:
+        stored = None
+        try:
+            if charts is not None and charts.exists(chart_id):
+                stored = charts.get(chart_id)
+        except (UnknownNameError, ValueError, OSError):
+            stored = None
+        if stored is None:
+            problems.append(f"unknown chart {chart_id}")
+            continue
+        for handle_id in chart_handles(stored.spec):
+            resolve(handle_id)
 
     fact_ids = allowed_fact_ids(memory, cutoff)
     for claim in answer.claims:

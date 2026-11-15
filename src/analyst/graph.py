@@ -408,6 +408,7 @@ def build_graph(
                 memory=service.memory,
                 cutoff=ctx.cutoff,
                 store=service.store,
+                charts=service.charts,
             )
 
         verification = await asyncio.to_thread(check)

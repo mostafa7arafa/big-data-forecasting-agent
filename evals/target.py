@@ -70,6 +70,17 @@ def _handle_entries(messages: list, store) -> dict[str, dict]:
     return entries
 
 
+def _chart_entries(answer, charts) -> dict[str, dict]:
+    """Each answer chart id as its stored chart dict (ids that do not resolve are left out)."""
+    entries: dict[str, dict] = {}
+    for chart_id in (answer.charts if answer is not None else []):
+        try:
+            entries[chart_id] = charts.get(chart_id).model_dump(mode="json")
+        except Exception:  # noqa: BLE001 - verify already flags an unknown chart id
+            continue
+    return entries
+
+
 def _tools(messages: list) -> list[str]:
     return [
         tc["name"]
@@ -112,7 +123,8 @@ async def run_case(inputs: dict, *, model: str | None, graph=None) -> dict:
             {"messages": [HumanMessage(inputs["question"])]}, context=context, config=config
         )
         messages = list(state.get("messages") or [])
-        store = registry.get_service(context.dataset, context.cutoff).store
+        service = registry.get_service(context.dataset, context.cutoff)
+        store = service.store
         handles = await asyncio.to_thread(_handle_entries, messages, store)
         answer = state.get("answer")
         verification = state.get("verification")
@@ -123,6 +135,7 @@ async def run_case(inputs: dict, *, model: str | None, graph=None) -> dict:
             "verification": verification.model_dump(mode="json") if verification else None,
             "tools": _tools(messages),
             "handles": handles,
+            "charts": _chart_entries(answer, service.charts),
             "latency_s": time.perf_counter() - started,
             "usage": _usage(messages),
             "tool_bytes": sum(len(str(m.content)) for m in messages if isinstance(m, ToolMessage)),

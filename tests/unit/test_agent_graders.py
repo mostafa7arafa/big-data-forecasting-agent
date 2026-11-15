@@ -839,3 +839,31 @@ def test_ratio_stated_as_percent_keeps_the_gold_precision_rule():
 def test_answer_values_fewer_and_reduction_are_decreases(narrative):  # follow-up item 17
     assert grade_answer_values(outputs_with(narrative=narrative), _change_ref(-5.23))["score"] is True
     assert grade_answer_values(outputs_with(narrative=narrative), _change_ref(5.23))["score"] is False
+
+
+def _chart_outputs(charts: dict[str, dict]) -> dict:
+    out = outputs_with()
+    out["answer"]["charts"] = list(charts)
+    out["charts"] = charts
+    return out
+
+
+def test_grade_chart_kind_pass_and_fail():
+    ref = {"gold_check": ["chart_kind('forecast_fan')"]}
+    ok = _chart_outputs({"c_1": {"spec": {"kind": "forecast_fan"}}})
+    assert grade_checks(ok, ref)["score"] is True
+    bad = _chart_outputs({"c_1": {"spec": {"kind": "line"}}})
+    assert grade_checks(bad, ref)["score"] is False
+    assert grade_checks(outputs_with(), ref)["score"] is False
+
+
+def test_grade_chart_kind_accepts_small_multiples_inner():
+    ref = {"gold_check": ["chart_kind('forecast_fan')"]}
+    out = _chart_outputs(
+        {"c_1": {"spec": {"kind": "small_multiples", "inner": {"kind": "forecast_fan"}}}}
+    )
+    assert grade_checks(out, ref)["score"] is True
+    other = _chart_outputs(
+        {"c_1": {"spec": {"kind": "small_multiples", "inner": {"kind": "line"}}}}
+    )
+    assert grade_checks(other, ref)["score"] is False
