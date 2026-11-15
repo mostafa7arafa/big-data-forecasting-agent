@@ -63,7 +63,7 @@ from analyst.providers import get_model
 from analyst.providers.catalog import model_info
 from analyst.state import AnalystState, Answer, Plan, Verification
 from analyst.tools import DATA_TOOLS
-from analyst.trace import build_trace, current_run_id
+from analyst.trace import build_trace, run_id_of
 from analyst.trace.middleware import atimed_model_call
 from analyst.verify import NO_CLAIMS, collect_handles, verify_answer
 
@@ -643,7 +643,7 @@ def build_graph(
         trace = build_trace(
             _run_messages(state),
             model=spec,
-            run_id=current_run_id(),
+            run_id=run_id_of(runtime),
             verification=verification,
             events=[],
             compaction_trigger=trigger,

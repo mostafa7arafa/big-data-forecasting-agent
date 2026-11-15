@@ -49,7 +49,7 @@ from langgraph.prebuilt.tool_node import ToolCallRequest
 from langgraph.runtime import Runtime
 from langgraph.types import Command
 
-from analyst.cancel import cancel_thread, current_thread_id
+from analyst.cancel import cancel_thread, current_thread_id, try_cancel_thread
 from analyst.trace.build import STAMP_KEY, build_trace, model_step, tool_step
 from analyst.trace.model import StepTrace
 
@@ -59,6 +59,7 @@ __all__ = [
     "atimed_model_call",
     "current_run_id",
     "emit",
+    "run_id_of",
 ]
 
 
@@ -118,6 +119,19 @@ def emit(event: str, step: StepTrace | None) -> None:
             "step": step.model_dump(mode="json") if step is not None else None,
         }
     )
+
+
+def run_id_of(runtime: Any) -> str | None:
+    """The run id of the current run: the node runtime's first, then the config.
+
+    The Agent Server passes the run id as top-level ``config["run_id"]``, which
+    LangGraph drops from node configs but keeps in ``runtime.execution_info``.
+    """
+    info = getattr(runtime, "execution_info", None)
+    value = getattr(info, "run_id", None)
+    if value is not None:
+        return str(value)
+    return current_run_id()
 
 
 def current_run_id() -> str | None:
@@ -249,7 +263,12 @@ async def _stop_thread_work(tool_name: str) -> None:
     if thread_id is None:
         return
     try:
-        cancel_thread(thread_id)
+        # Never wait for the registry lock on the loop; on contention retry
+        # off it, shielded, so the cancel is never dropped.
+        if try_cancel_thread(thread_id) is None:
+            await asyncio.shield(asyncio.to_thread(cancel_thread, thread_id))
+    except asyncio.CancelledError:
+        pass  # the shielded retry still runs; the caller re-raises either way
     except Exception:
         logger.warning("cancelling the work of a cancelled run failed", exc_info=True)
     if tool_name != SANDBOX_TOOL:
@@ -447,11 +466,13 @@ class RunTraceRecorder(TraceMiddleware):
 
     state_schema = TraceState
 
-    def _record(self, state: Any, spec: str, trigger: int) -> dict[str, Any]:
+    def _record(
+        self, state: Any, runtime: Runtime, spec: str, trigger: int
+    ) -> dict[str, Any]:
         trace = build_trace(
             _run_messages(list(state.get("messages") or [])),
             model=spec,
-            run_id=current_run_id(),
+            run_id=run_id_of(runtime),
             verification=None,
             events=[],
             compaction_trigger=trigger,
@@ -460,11 +481,11 @@ class RunTraceRecorder(TraceMiddleware):
 
     def after_agent(self, state: Any, runtime: Runtime) -> dict[str, Any] | None:
         spec, trigger = _trace_inputs(getattr(runtime, "context", None), state)
-        return self._record(state, spec, trigger)
+        return self._record(state, runtime, spec, trigger)
 
     async def aafter_agent(self, state: Any, runtime: Runtime) -> dict[str, Any] | None:
         # Settings and the catalogue may touch the disk: keep them off the loop.
         spec, trigger = await asyncio.to_thread(
             _trace_inputs, getattr(runtime, "context", None), state
         )
-        return self._record(state, spec, trigger)
+        return self._record(state, runtime, spec, trigger)

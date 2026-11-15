@@ -26,7 +26,7 @@ On `make dev`, the question "How many trips should we expect next month by borou
 
 ## Deferred minors
 
-**Task 1:** the inner wrap copies fields by hand and validates the inner fan twice (use `model_dump`, one place). `_inner.py` duplicates the outer models' fields (could subclass). `type: ignore` on `trend_x`/`trend_y` in `validate.py`. The `is_numeric`/`is_temporal` type-string helpers are substring matches (`interval`, `list<int64>`). Corrupt chart JSON surfaces as a raw `JSONDecodeError`/`ValidationError`. Two validation tests assert loosely (hint truthy, `or`). The kpi trend has no rejection test; the test file lacks a trailing newline.
+**Task 1:** the inner wrap copies fields by hand and validates the inner fan twice (use `model_dump`, one place). `_inner.py` duplicates the outer models' fields (could subclass). `type: ignore` on `trend_x`/`trend_y` in `validate.py`. ~~The `is_numeric`/`is_temporal` type-string helpers are substring matches (`interval`, `list<int64>`).~~ Fixed in the final fix wave: exact Arrow/DuckDB type families; TIME is not a time axis; an interval column gets an `epoch(...)` hint, and the result store rejects interval columns (Parquet cannot hold them) with the same hint. Corrupt chart JSON surfaces as a raw `JSONDecodeError`/`ValidationError`. Two validation tests assert loosely (hint truthy, `or`). The kpi trend has no rejection test; the test file lacks a trailing newline.
 
 **Task 2:** `_facts` has an unused `handles` param. The success-side 4,096 cap is untested. No test for `verify` with `charts=None` and chart ids. `chart_kind` passes if any chart matches.
 
@@ -38,16 +38,27 @@ On `make dev`, the question "How many trips should we expect next month by borou
 
 **Task 6:** reveal should also clear `limit` and `compare_to`. Reveal is uncached (`run_sql` re-runs the full history and holds a gate slot). Up to four uncut engines times an 8 GB limit. A reveal over 1M rows gives an unhelpful 500. `/meta` retries a failed coverage query on every call. A tz-aware `run_sql` time column gives an all-null reveal.
 
-**Task 7:** `trace_hidden` persists in the checkpoint (including reasoning) until the next turn. Eval usage disagrees with trace totals (switch the eval to `state["trace"][-1]`?). The worker `TraceMiddleware` is not truly outermost (deepagents built-ins and summarization are untraced; fix the docstring). `_trace_inputs` is duplicated. The trace list is unbounded per thread. `run_id` is unverified on a real server. `has_prices` ignores `cached_input`. Plan and compaction steps are named "plan"/"compaction" without the model name (the run-level model is in `trace.model`); `plan_cut` is computed twice.
+**Task 7:** `trace_hidden` persists in the checkpoint (including reasoning) until the next turn. Eval usage disagrees with trace totals (switch the eval to `state["trace"][-1]`?). The worker `TraceMiddleware` is not truly outermost (deepagents built-ins and summarization are untraced; fix the docstring). `_trace_inputs` is duplicated. The trace list is unbounded per thread. `run_id` on a real server: fixed in code in the final fix wave and unit-tested, not yet observed on a live server. langgraph-api sets top-level `config["run_id"]` on a run's first attempt (`langgraph_api/stream.py`); nodes read it from `runtime.execution_info.run_id`. A retried attempt gets no `run_id` there, so its trace may carry None. `has_prices` ignores `cached_input`. Plan and compaction steps are named "plan"/"compaction" without the model name (the run-level model is in `trace.model`); `plan_cut` is computed twice.
 
-**Task 8 (final review to triage):** `abort()` during sandbox cold start is lost (the cell runs to its 30 s timeout); a one-line fix is `proc.kill()` on the local docker client in `abort()`. A late `get_sandbox` from the old run can create an untracked container. Queries waiting for a gate slot are not cancellable. `cancel_thread` lock contention under blockbuster (dev only). Engine register/timer start sit outside the try. `_failed` runs before `_stop_thread_work`. Repair assumes tool results follow their AI message.
+**Task 8 (final review to triage):** ~~`abort()` during sandbox cold start is lost (the cell runs to its 30 s timeout); a one-line fix is `proc.kill()` on the local docker client in `abort()`.~~ Fixed in the final fix wave. A late `get_sandbox` from the old run can create an untracked container. ~~Queries waiting for a gate slot are not cancellable.~~ Fixed in the final fix wave (the cancel is registered before the gate; a waiting query leaves the queue without running). ~~`cancel_thread` lock contention under blockbuster (dev only).~~ Fixed in the final fix wave: the event loop only tries the registry lock and, on contention, retries off the loop (shielded). Engine register/timer start sit outside the try. `_failed` runs before `_stop_thread_work`. Repair assumes tool results follow their AI message.
+
+**Final review:** ~~old checkpoints carry `Answer.charts` as ChartSpec dicts~~ Fixed in the final fix wave: a before-validator keeps only chart ids.
 
 **Task 9 (eval):** the latency median rose to 33.9 s (B2: 21.2 s) with reasoning summaries on; one run cannot separate that from noise. The 20 Not-verified answers include two "untraced number 2026" cases (a year the model wrote as a number).
 
 ## For W2
 
 - Steer is a run with `multitask_strategy: "interrupt"`, queue is `"enqueue"`, stop is a cancel of the run. Interrupted threads are repaired on the next turn and carry an interrupted trace record (R10, R11).
+- A stopped run with no follow-up message has no interruption record yet: the record is written by the next turn's compact. Treat "the last turn has a question and no answer" as interrupted in the UI.
+- Live `step_finished` events carry `cost_usd=None` for catalogue-priced models; take cost from the saved trace (`state["trace"]`).
 - The chart-payload fixtures in `tests/fixtures/charts` (11 files, one per chart kind) are the W2 contract; build the front end against them.
 - GeoJSON ring winding is clockwise (d3-geo friendly, not RFC 7946's counter-clockwise exterior rings). Tools that assume RFC 7946 winding will fill the complement.
 - CORS allows `http://localhost:3000` and `https://smith.langchain.com` only (R8); add the dashboard's origin to `langgraph.json` `http.cors` when it is deployed elsewhere.
 - `make dev` serves `/meta`, `/charts`, `/geo`, `/feedback` next to the LangGraph routes. The thread state key `trace` holds the per-run trace records.
+
+## After the final fix wave (re-review minors, deferred)
+- Query gate: the 0.05 s cancel poll re-queues waiters, so queued queries lose rough FIFO order (accounting is correct). A single Condition notified by release and cancel would restore order without polling.
+- `test_steer.py` loop-stall test asserts `max(gaps) < 0.3` — flake risk on a loaded runner; count ticks while the lock is held instead, and guard `release.join()`.
+- `DockerSandbox.abort()` landing during `Popen` (before `_proc` is set) kills nothing; an "aborted" flag checked after Popen would close it. A container left "created" is reaped after the owning process exits.
+- `Answer.charts` validator drops malformed ids from fresh model output silently (valid ids unaffected); consider a debug log.
+- Pre-existing: a cancel between the `cancelled` check and `cursor.sql()` starting is a DuckDB no-op.

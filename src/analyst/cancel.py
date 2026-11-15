@@ -23,7 +23,7 @@ from collections.abc import Callable
 
 from langgraph.config import get_config
 
-__all__ = ["cancel_thread", "current_thread_id", "register"]
+__all__ = ["cancel_thread", "current_thread_id", "register", "try_cancel_thread"]
 
 logger = logging.getLogger(__name__)
 
@@ -58,10 +58,7 @@ def register(thread_id: str, cancel: Callable[[], None]) -> Callable[[], None]:
     return unregister
 
 
-def cancel_thread(thread_id: str) -> int:
-    """Call every callback registered for ``thread_id``; returns how many ran."""
-    with _lock:
-        callbacks = list((_callbacks.get(thread_id) or {}).values())
+def _fire(callbacks: list[Callable[[], None]]) -> int:
     count = 0
     for cancel in callbacks:  # outside the lock: a callback may unregister
         try:
@@ -70,3 +67,29 @@ def cancel_thread(thread_id: str) -> int:
             logger.warning("cancel callback failed", exc_info=True)
         count += 1
     return count
+
+
+def cancel_thread(thread_id: str) -> int:
+    """Call every callback registered for ``thread_id``; returns how many ran.
+
+    Waits for the registry lock: call it off the event loop (see
+    :func:`try_cancel_thread` for the loop).
+    """
+    with _lock:
+        callbacks = list((_callbacks.get(thread_id) or {}).values())
+    return _fire(callbacks)
+
+
+def try_cancel_thread(thread_id: str) -> int | None:
+    """:func:`cancel_thread` without waiting: ``None`` when the lock is contended.
+
+    Safe on the event loop. On ``None`` nothing was cancelled yet; the caller
+    must retry with :func:`cancel_thread` off the loop, never drop the cancel.
+    """
+    if not _lock.acquire(blocking=False):
+        return None
+    try:
+        callbacks = list((_callbacks.get(thread_id) or {}).values())
+    finally:
+        _lock.release()
+    return _fire(callbacks)

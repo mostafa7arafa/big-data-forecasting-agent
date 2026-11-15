@@ -14,7 +14,7 @@ import pyarrow as pa
 from analyst import cancel
 from analyst.config import get_settings
 from analyst.data.dataset import DatasetConfig
-from analyst.data.gate import get_gate
+from analyst.data.gate import SlotCancelled, get_gate
 from analyst.errors import AnalystError
 
 VIEWS_HINT = "use only the dataset views listed by describe('schema')"
@@ -145,25 +145,45 @@ class Engine:
             raise QueryError(message, hint=VIEWS_HINT) from exc
 
     def execute(self, sql: str) -> pa.Table:
-        with get_gate().slot():
-            return self._execute(sql)
-
-    def _execute(self, sql: str) -> pa.Table:
-        # A cursor per call: it shares the catalog and locked settings, and
-        # interrupting it cancels only this query.
-        cursor = self._con.cursor()
-        timer = Timer(self._timeout_s, cursor.interrupt)
-        timer.daemon = True
         cancelled = threading.Event()
+        cursors: list[duckdb.DuckDBPyConnection] = []
 
         def cancel_query() -> None:
             cancelled.set()
-            cursor.interrupt()
+            for cursor in cursors.copy():  # the query thread may remove it
+                try:
+                    cursor.interrupt()
+                except duckdb.ConnectionException:
+                    pass  # the query already finished and closed its cursor
 
         # A stopped run interrupts this query (analyst.cancel); outside a run
-        # there is no thread id and only the timeout applies.
+        # there is no thread id and only the timeout applies. Registered before
+        # the gate, so a query still waiting for a slot is cancellable too.
         thread_id = cancel.current_thread_id()
         unregister = cancel.register(thread_id, cancel_query) if thread_id else None
+        try:
+            with get_gate().slot(cancelled):
+                if cancelled.is_set():  # cancelled while waiting: do not run it
+                    raise QueryError(CANCELLED_TEXT)
+                return self._execute(sql, cancelled, cursors)
+        except SlotCancelled as exc:
+            raise QueryError(CANCELLED_TEXT) from exc
+        finally:
+            if unregister is not None:
+                unregister()
+
+    def _execute(
+        self,
+        sql: str,
+        cancelled: threading.Event,
+        cursors: list[duckdb.DuckDBPyConnection],
+    ) -> pa.Table:
+        # A cursor per call: it shares the catalog and locked settings, and
+        # interrupting it cancels only this query.
+        cursor = self._con.cursor()
+        cursors.append(cursor)
+        timer = Timer(self._timeout_s, cursor.interrupt)
+        timer.daemon = True
         timer.start()
         try:
             statements = cursor.extract_statements(sql)
@@ -189,8 +209,7 @@ class Engine:
         except duckdb.Error as exc:
             raise QueryError(str(exc).splitlines()[0]) from exc
         finally:
-            if unregister is not None:
-                unregister()
+            cursors.remove(cursor)
             timer.cancel()
             timer.join()
             cursor.close()

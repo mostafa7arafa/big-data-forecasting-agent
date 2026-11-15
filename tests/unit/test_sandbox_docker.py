@@ -195,6 +195,35 @@ def test_timeout_restarts_and_reports_state_loss(tmp_path):
 
 
 @pytest.mark.docker
+def test_abort_during_cold_start_returns_promptly(tmp_path):
+    """Stop while ``docker run`` is still creating the container: no 30 s hang."""
+    import time
+
+    _need_image()
+    sb = DockerSandbox(in_dir=tmp_path / "i", out_dir=tmp_path / "o", image=IMAGE, timeout_s=30)
+    out: dict = {}
+    worker = threading.Thread(target=lambda: out.setdefault("r", sb.run("import time\ntime.sleep(60)")))
+    try:
+        start = time.monotonic()
+        worker.start()
+        while sb._proc is None and time.monotonic() - start < 10:
+            time.sleep(0.001)
+        name = sb._name
+        assert name and sb._proc is not None
+        sb.abort()  # the container is still being created
+        worker.join(timeout=25)
+        assert not worker.is_alive()
+        assert time.monotonic() - start < 15  # well under the 30 s cell timeout
+        assert not out["r"].ok and out["r"].restarted
+    finally:
+        sb.close()
+    time.sleep(1)  # a create the daemon finishes late must not be left running
+    ps = subprocess.run(["docker", "ps", "-q", "--filter", f"name=^{name}$"],
+                        check=False, capture_output=True, text=True).stdout
+    assert ps.strip() == ""
+
+
+@pytest.mark.docker
 def test_container_exit_restarts(tmp_dirs):
     r = tmp_dirs.run("import os\nos._exit(1)")
     assert not r.ok and r.restarted and "variables were lost" in r.error

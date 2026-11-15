@@ -6,6 +6,8 @@ from typing import Annotated, Any, Literal, NotRequired, TypedDict
 from langgraph.graph.message import add_messages
 from pydantic import BaseModel, Field, field_validator
 
+from analyst.charts.store import CHART_ID_RE
+
 
 def _none_to_list(value: object) -> object:
     """Providers may send ``null`` for an optional list; treat it as empty."""
@@ -46,7 +48,17 @@ class Answer(BaseModel):
     verification: Verification | None = None
     background_tasks: list[str] = Field(default_factory=list)
 
-    _lists = _null_lists("claims", "charts", "sql", "background_tasks")
+    _lists = _null_lists("claims", "sql", "background_tasks")
+
+    @field_validator("charts", mode="before")
+    @classmethod
+    def _chart_ids_only(cls, value: object) -> object:
+        """Keep chart ids only; old checkpoints carry ChartSpec dicts here."""
+        if value is None:
+            return []
+        if not isinstance(value, list):
+            return value
+        return [v for v in value if isinstance(v, str) and CHART_ID_RE.fullmatch(v)]
 
 
 class Plan(BaseModel):

@@ -576,3 +576,40 @@ def test_trace_includes_compaction_model_call(monkeypatch):
     assert [s.name for s in trace.steps[:2]] == ["compaction", "plan"]
     assert trace.steps[0].tokens_in == 5_000
     assert trace.tokens_in == 5_600 and trace.tokens_out == 110
+
+
+def test_trace_run_id_from_top_level_config():
+    """The Agent Server passes the run id as top-level ``config["run_id"]``."""
+    import uuid
+
+    from analyst.graph import build_graph
+
+    run_id = uuid.uuid4()
+    model = ScriptedModel(
+        script=[no_plan(), tool_turn(call("query_metrics", COUNT, "c1")), cite_total]
+    )
+    graph = build_graph(model=model)
+    out = asyncio.run(
+        graph.ainvoke(
+            {"messages": [HumanMessage("how many events?")]},
+            config={"run_id": run_id, "configurable": {"thread_id": "t-run-id"}},
+            context=CTX,
+        )
+    )
+    assert RunTrace.model_validate(out["trace"][-1]).run_id == str(run_id)
+
+
+def test_worker_trace_run_id_from_top_level_config():
+    import uuid
+
+    from analyst.worker import build_worker
+
+    run_id = uuid.uuid4()
+    worker = build_worker(model=StreamingModel(replies=[AIMessage("report done")]))
+    out = asyncio.run(
+        worker.ainvoke(
+            {"messages": [HumanMessage("task")]},
+            config={"run_id": run_id, "configurable": {"thread_id": "t-worker"}},
+        )
+    )
+    assert RunTrace.model_validate(out["trace"][-1]).run_id == str(run_id)

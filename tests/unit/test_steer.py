@@ -257,7 +257,7 @@ def _cancel_tool_call(monkeypatch, tool_name: str, thread_id: str | None):
     closed: list[str] = []
     cancelled: list[str] = []
     monkeypatch.setattr("analyst.sandbox.close_sandbox", closed.append)
-    monkeypatch.setattr(mw, "cancel_thread", lambda t: cancelled.append(t) or 0)
+    monkeypatch.setattr(mw, "try_cancel_thread", lambda t: cancelled.append(t) or 0)
     monkeypatch.setattr(mw, "current_thread_id", lambda: thread_id)
 
     async def handler(request):
@@ -289,6 +289,70 @@ def test_cancelled_other_tool_keeps_sandbox(monkeypatch):
 def test_cancel_without_thread_id_cleans_nothing(monkeypatch):
     cancelled, closed = _cancel_tool_call(monkeypatch, "run_python", None)
     assert cancelled == [] and closed == []
+
+
+def test_try_cancel_thread_never_blocks_on_a_held_lock():
+    hits: list[str] = []
+    off = cancel.register("t-held", lambda: hits.append("x"))
+    try:
+        with cancel._lock:  # another thread is (un)registering
+            assert cancel.try_cancel_thread("t-held") is None  # contended: no wait
+        assert hits == []
+        assert cancel.try_cancel_thread("t-held") == 1
+        assert hits == ["x"]
+    finally:
+        off()
+
+
+def test_cancel_is_not_lost_when_the_registry_lock_is_held(monkeypatch):
+    """A contended registry lock neither stalls the loop nor drops the cancel."""
+    import time
+
+    from blockbuster import blockbuster_ctx
+
+    from analyst.trace import middleware as mw
+
+    monkeypatch.setattr("analyst.sandbox.close_sandbox", lambda t: None)
+    monkeypatch.setattr(mw, "current_thread_id", lambda: "t-lock")
+    fired = threading.Event()
+    off = cancel.register("t-lock", fired.set)
+    release = threading.Timer(0.5, cancel._lock.release)
+    gaps: list[float] = []
+
+    async def handler(request):
+        await asyncio.sleep(30)
+
+    async def ticker():
+        last = time.monotonic()
+        while True:
+            await asyncio.sleep(0.01)
+            now = time.monotonic()
+            gaps.append(now - last)
+            last = now
+
+    async def go():
+        task = asyncio.create_task(
+            mw.TraceMiddleware().awrap_tool_call(_request("query_metrics"), handler)
+        )
+        await asyncio.sleep(0.05)
+        tick = asyncio.create_task(ticker())
+        await asyncio.sleep(0.03)  # the ticker is running
+        cancel._lock.acquire()  # held by "another thread" while the stop lands
+        release.start()
+        with blockbuster_ctx():
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        await asyncio.sleep(0.03)
+        tick.cancel()
+
+    try:
+        asyncio.run(go())
+    finally:
+        release.join()
+        off()
+    assert fired.is_set()  # retried off the loop once the lock came free
+    assert max(gaps) < 0.3  # the loop kept running while the lock was held
 
 
 def test_cancel_cleanup_failure_still_reraises(monkeypatch):

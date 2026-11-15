@@ -379,3 +379,106 @@ def test_validate_small_multiples_rejects_bad_facet(store_with_handle):
 def test_map_chart_geometry_name_pattern_rejected(bad):
     with pytest.raises(ValidationError):
         MapChart(kind="map", title="T", handle="H", key="k", value="v", geometry=bad)
+
+
+# --- exact column type families (no substring matches)
+
+_NUMERIC = [
+    "int8", "int16", "int32", "int64", "uint8", "uint64", "halffloat", "float", "double",
+    "decimal128(10, 2)", "decimal256(40, 3)",
+    "TINYINT", "SMALLINT", "INTEGER", "BIGINT", "HUGEINT", "UBIGINT", "FLOAT", "REAL",
+    "DOUBLE", "DECIMAL(18,3)", "NUMERIC(10, 2)",
+]
+_TEMPORAL = [
+    "date32[day]", "date64[ms]", "timestamp[us]", "timestamp[ns, tz=UTC]",
+    "timestamp[us, tz=America/New_York]",
+    "DATE", "TIMESTAMP", "TIMESTAMP WITH TIME ZONE", "TIMESTAMPTZ", "TIMESTAMP_NS",
+]
+_NEITHER = [
+    "month_day_nano_interval", "INTERVAL", "duration[us]",  # intervals
+    "time64[us]", "time32[ms]", "TIME", "TIME WITH TIME ZONE",  # clock times
+    "list<item: int64>", "large_list<item: double>", "INTEGER[]", "struct<a: int64>",
+    "dictionary<values=string, indices=int32, ordered=0>",
+    "dictionary<values=int64, indices=int8, ordered=0>",
+    "string", "bool", "VARCHAR", "BOOLEAN", "binary", "map<string, int64>",
+]
+
+
+@pytest.mark.parametrize("typ", _NUMERIC)
+def test_numeric_type_families(typ):
+    from analyst.data.results import is_numeric_type_str, is_temporal_type_str
+
+    assert is_numeric_type_str(typ) and not is_temporal_type_str(typ)
+
+
+@pytest.mark.parametrize("typ", _TEMPORAL)
+def test_temporal_type_families(typ):
+    from analyst.data.results import is_numeric_type_str, is_temporal_type_str
+
+    assert is_temporal_type_str(typ) and not is_numeric_type_str(typ)
+
+
+@pytest.mark.parametrize("typ", _NEITHER)
+def test_interval_time_list_dictionary_are_neither(typ):
+    from analyst.data.results import is_numeric_type_str, is_temporal_type_str
+
+    assert not is_numeric_type_str(typ) and not is_temporal_type_str(typ)
+
+
+@pytest.fixture
+def odd_types_handle(tmp_path):
+    from datetime import time, timedelta
+
+    table = pa.table(
+        {
+            "ds": pa.array([datetime(2024, 1, 1), datetime(2024, 1, 2)], type=pa.timestamp("us")),
+            "clock": pa.array([time(1, 0), time(2, 0)], type=pa.time64("us")),
+            "took": pa.array([timedelta(seconds=1), timedelta(seconds=2)], type=pa.duration("us")),
+            "tags": pa.array([[1], [2]], type=pa.list_(pa.int64())),
+            "zone": pa.array(["a", "b"]).dictionary_encode(),
+            "v": pa.array([1.0, 2.0]),
+        }
+    )
+    store = ResultStore(tmp_path)
+    card = store.save(table, produced_by="run_sql", source="select", governed=True, elapsed_s=0.01)
+    return store, card.handle_id
+
+
+@pytest.mark.parametrize("y", ["took", "tags", "zone"])
+def test_validate_rejects_non_numeric_y(odd_types_handle, y):
+    store, handle = odd_types_handle
+    with pytest.raises(InvalidRequestError, match="not numeric"):
+        validate_spec(LineChart(kind="line", title="T", handle=handle, x="ds", y=y), store, {})
+
+
+def test_validate_rejects_clock_time_as_time_axis(odd_types_handle):
+    store, handle = odd_types_handle
+    with pytest.raises(InvalidRequestError, match="not a time axis"):
+        validate_spec(LineChart(kind="line", title="T", handle=handle, x="clock", y="v"), store, {})
+
+
+def test_interval_column_gets_epoch_hint(odd_types_handle):
+    column = "took"
+    store, handle = odd_types_handle
+    with pytest.raises(InvalidRequestError) as exc:
+        validate_spec(
+            BarChart(kind="bar", title="T", handle=handle, category="zone", value=column),
+            store,
+            {},
+        )
+    assert "convert the duration to seconds (e.g. epoch(...)) before charting" in exc.value.hint
+    with pytest.raises(InvalidRequestError) as exc:
+        validate_spec(LineChart(kind="line", title="T", handle=handle, x=column, y="v"), store, {})
+    assert "epoch(" in exc.value.hint
+
+
+def test_store_rejects_interval_result_with_epoch_hint(tmp_path):
+    """DuckDB INTERVAL arrives as month_day_nano_interval, which Parquet cannot hold."""
+    import duckdb
+
+    table = duckdb.sql("select interval 5 minute as wait, 1 as n").to_arrow_table()
+    with pytest.raises(InvalidRequestError) as exc:
+        ResultStore(tmp_path).save(
+            table, produced_by="run_sql", source="q", governed=True, elapsed_s=0.01
+        )
+    assert "epoch(" in exc.value.hint and "wait" in exc.value.message

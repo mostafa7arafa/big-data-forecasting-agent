@@ -245,6 +245,23 @@ def test_answer_schema_defaults():
     assert a.verification is None and a.charts == [] and a.claims[0].values == []
 
 
+def test_answer_drops_legacy_chart_specs_from_old_checkpoints():
+    """Old checkpoints stored ``Answer.charts`` as ChartSpec dicts: keep only ids."""
+    legacy = {
+        "narrative": "n",
+        "claims": [],
+        "charts": [
+            {"kind": "line", "title": "T", "handle": "h_0123456789", "x": "ds", "y": "v"},
+            "c_0123456789",
+            "not-a-chart-id",
+            "c_0123456789abc",
+            42,
+        ],
+    }
+    assert Answer.model_validate(legacy).charts == ["c_0123456789"]
+    assert Answer.model_validate({**legacy, "charts": None}).charts == []
+
+
 def _array_nodes(node):
     if isinstance(node, dict):
         if node.get("type") == "array" or "prefixItems" in node:

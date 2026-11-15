@@ -406,10 +406,20 @@ class DockerSandbox:
         Lock-free on purpose: ``run`` holds the lock while it waits for the
         cell. The killed container's stdout closes, so that ``run`` returns
         a restarted result promptly instead of at the timeout.
+
+        During a cold start ``docker kill`` fails (the container is still
+        being created), so the local ``docker run`` client is killed too: its
+        stdout hits EOF, ``run`` restarts and ``_kill`` cleans up by name; the
+        label reaper covers anything the daemon finishes creating later.
         """
-        name = self._name
-        if name and self._proc is not None:
+        name, proc = self._name, self._proc
+        if name and proc is not None:
             _docker("kill", name)
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.kill()
+            except OSError:
+                pass
 
     def close(self) -> None:
         with self._lock:

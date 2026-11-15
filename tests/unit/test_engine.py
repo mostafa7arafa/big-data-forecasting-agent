@@ -267,3 +267,62 @@ def test_query_registers_only_inside_a_run(synthetic_dataset, monkeypatch):
     assert registered == []
     _in_run("t-r", lambda: engine.execute("select 1"))
     assert registered == ["t-r"]
+
+
+def test_cancel_while_waiting_for_a_gate_slot(synthetic_dataset, monkeypatch):
+    """A query queued behind the gate is cancellable and never runs."""
+    import analyst.data.engine as engine_module
+    from analyst.data.gate import QueryGate
+
+    gate = QueryGate(1)
+    monkeypatch.setattr(engine_module, "get_gate", lambda: gate)
+    engine = Engine(synthetic_dataset, timeout_s=60)
+    cursors: list[str] = []
+    real_con = engine._con
+
+    class Con:
+        def cursor(self):
+            cursors.append("cursor")
+            return real_con.cursor()
+
+    engine._con = Con()
+    outcome: dict = {}
+
+    def query():
+        try:
+            _in_run("t-gate", lambda: engine.execute("select 1"))
+        except QueryError as exc:
+            outcome["error"] = str(exc)
+
+    with gate.slot():  # every slot busy
+        worker = threading.Thread(target=query)
+        worker.start()
+        deadline = time.monotonic() + 10
+        while not cancel._callbacks.get("t-gate") and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert cancel.cancel_thread("t-gate") == 1
+        worker.join(timeout=5)
+        assert not worker.is_alive()  # returned while the slot is still held
+    assert "cancelled" in outcome["error"]
+    assert cursors == []  # the query never ran
+    assert gate.in_use == 0 and "t-gate" not in cancel._callbacks
+
+
+def test_cancel_before_slot_acquired_does_not_run(synthetic_dataset, monkeypatch):
+    """Cancelled between the wait and the run: the cancelled flag is checked first."""
+    from contextlib import contextmanager
+
+    import analyst.data.engine as engine_module
+
+    engine = Engine(synthetic_dataset)
+
+    class Gate:
+        @contextmanager
+        def slot(self, cancelled=None):
+            cancel.cancel_thread("t-late")  # the stop lands as the slot comes free
+            yield
+
+    monkeypatch.setattr(engine_module, "get_gate", lambda: Gate())
+    monkeypatch.setattr(engine, "_execute", Mock(side_effect=AssertionError("ran")))
+    with pytest.raises(QueryError, match="cancelled"):
+        _in_run("t-late", lambda: engine.execute("select 1"))

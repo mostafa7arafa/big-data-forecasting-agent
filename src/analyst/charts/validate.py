@@ -20,8 +20,10 @@ from analyst.charts.spec import (
 )
 from analyst.data.dataset import GeometrySpec
 from analyst.data.results import (
+    INTERVAL_HINT,
     ResultStore,
     SummaryCard,
+    is_interval_type_str,
     is_numeric_type_str,
     is_temporal_type_str,
 )
@@ -252,7 +254,9 @@ def _require_temporal(
     if not is_temporal_type_str(typ):
         raise InvalidRequestError(
             f"column {column!r} on handle {handle_id} is not a time axis ({role})",
-            hint="pick a date or timestamp column for the time axis",
+            hint=INTERVAL_HINT
+            if is_interval_type_str(typ)
+            else "pick a date or timestamp column for the time axis",
         )
 
 
@@ -267,7 +271,7 @@ def _require_numeric(
     if not is_numeric_type_str(typ):
         raise InvalidRequestError(
             f"column {column!r} on handle {handle_id} is not numeric ({role})",
-            hint="pick a numeric column",
+            hint=INTERVAL_HINT if is_interval_type_str(typ) else "pick a numeric column",
         )
 
 
