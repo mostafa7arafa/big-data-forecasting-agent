@@ -3,6 +3,7 @@
 import json
 import os
 import re
+import threading
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from threading import Timer
@@ -10,12 +11,14 @@ from threading import Timer
 import duckdb
 import pyarrow as pa
 
+from analyst import cancel
 from analyst.config import get_settings
 from analyst.data.dataset import DatasetConfig
 from analyst.data.gate import get_gate
 from analyst.errors import AnalystError
 
 VIEWS_HINT = "use only the dataset views listed by describe('schema')"
+CANCELLED_TEXT = "query cancelled: the run was stopped"
 
 
 class QueryError(AnalystError):
@@ -151,6 +154,16 @@ class Engine:
         cursor = self._con.cursor()
         timer = Timer(self._timeout_s, cursor.interrupt)
         timer.daemon = True
+        cancelled = threading.Event()
+
+        def cancel_query() -> None:
+            cancelled.set()
+            cursor.interrupt()
+
+        # A stopped run interrupts this query (analyst.cancel); outside a run
+        # there is no thread id and only the timeout applies.
+        thread_id = cancel.current_thread_id()
+        unregister = cancel.register(thread_id, cancel_query) if thread_id else None
         timer.start()
         try:
             statements = cursor.extract_statements(sql)
@@ -160,6 +173,9 @@ class Engine:
                     hint="send exactly one SELECT statement",
                 )
             self._validate_sql(sql, cursor)
+            # An interrupt before the query starts is a no-op in DuckDB.
+            if cancelled.is_set():
+                raise QueryError(CANCELLED_TEXT)
             result = cursor.sql(sql).limit(self._max_rows + 1).to_arrow_table()
             if result.num_rows > self._max_rows:
                 raise QueryError(
@@ -167,10 +183,14 @@ class Engine:
                 )
             return result
         except duckdb.InterruptException as exc:
+            if cancelled.is_set():
+                raise QueryError(CANCELLED_TEXT) from exc
             raise QueryError(f"query exceeded {self._timeout_s:g}s timeout") from exc
         except duckdb.Error as exc:
             raise QueryError(str(exc).splitlines()[0]) from exc
         finally:
+            if unregister is not None:
+                unregister()
             timer.cancel()
             timer.join()
             cursor.close()

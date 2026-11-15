@@ -3,11 +3,13 @@
 import hashlib
 import json
 import re
+import threading
 import time
 
 import pyarrow.parquet as pq
 from langchain.tools import ToolRuntime
 
+from analyst import cancel
 from analyst.config import get_settings
 from analyst.context import AnalystContext
 from analyst.errors import AnalystError, InvalidRequestError
@@ -42,10 +44,11 @@ class SandboxError(AnalystError):
     """The sandbox session failed (timeout, crash); its state is gone."""
 
 
-def _thread_id(runtime: ToolRuntime[AnalystContext]) -> str:
+def _run_thread_id(runtime: ToolRuntime[AnalystContext]) -> str | None:
     config = getattr(runtime, "config", None) or {}
     configurable = config.get("configurable") or {}
-    return str(configurable.get("thread_id") or "default")
+    thread_id = configurable.get("thread_id")
+    return str(thread_id) if thread_id else None
 
 
 def _columns(names: list[str]) -> str:
@@ -199,10 +202,27 @@ def _run(code: str, runtime: ToolRuntime[AnalystContext]) -> Result:
         )
     check_code(code)
     ctx = runtime.context
-    sandbox = get_sandbox(_thread_id(runtime), ctx.dataset, ctx.cutoff)
+    run_thread = _run_thread_id(runtime)
+    sandbox = get_sandbox(run_thread or "default", ctx.dataset, ctx.cutoff)
     progress(runtime, "run_python", "running Python in the sandbox")
     start = time.monotonic()
-    res: ExecResult = sandbox.run(code)
+    # A stopped run kills the cell now (analyst.cancel), not at the timeout.
+    # The kill runs the docker CLI and the cancel fires on the event loop:
+    # hand it to a daemon thread so the callback itself never blocks.
+    abort = getattr(sandbox, "abort", None)
+    unregister = (
+        cancel.register(
+            run_thread,
+            lambda: threading.Thread(target=abort, daemon=True).start(),
+        )
+        if callable(abort) and run_thread
+        else None
+    )
+    try:
+        res: ExecResult = sandbox.run(code)
+    finally:
+        if unregister is not None:
+            unregister()
     elapsed = time.monotonic() - start
     # restarted + ok: the container had died BEFORE this cell, which then ran
     # fine in a fresh one. Keep the result and say earlier variables are gone.

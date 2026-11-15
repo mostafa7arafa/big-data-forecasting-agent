@@ -400,6 +400,17 @@ class DockerSandbox:
             pass
         return dest, copied
 
+    def abort(self) -> None:
+        """Kill the container now, without waiting for an in-flight cell.
+
+        Lock-free on purpose: ``run`` holds the lock while it waits for the
+        cell. The killed container's stdout closes, so that ``run`` returns
+        a restarted result promptly instead of at the timeout.
+        """
+        name = self._name
+        if name and self._proc is not None:
+            _docker("kill", name)
+
     def close(self) -> None:
         with self._lock:
             self._kill()
@@ -503,11 +514,19 @@ def get_sandbox(thread_id: str, dataset: str, cutoff: date | None) -> Sandbox:
 
 
 def close_sandbox(thread_id: str) -> None:
-    """Close every sandbox of ``thread_id`` (all datasets and cutoffs)."""
+    """Close every sandbox of ``thread_id`` (all datasets and cutoffs).
+
+    A cell still running is killed first (``abort``): ``close`` would
+    otherwise wait for it, up to the sandbox timeout. Blocking (docker CLI).
+    """
     with _registry_lock:
         keys = [k for k in _registry if k[0] == thread_id]
         boxes = [_registry.pop(k) for k in keys]
     for sb in boxes:
+        try:
+            sb.abort()
+        except Exception:  # noqa: BLE001, S110 - closing is best effort
+            pass
         _close_quietly(sb)
 
 

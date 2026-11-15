@@ -1,10 +1,14 @@
 import json
+import threading
+import time
 from datetime import date, datetime
 from unittest.mock import Mock
 
 import pyarrow as pa
 import pytest
+from langchain_core.runnables import RunnableConfig, RunnableLambda
 
+from analyst import cancel
 from analyst.data.engine import Coverage, Engine, QueryError
 
 
@@ -208,3 +212,58 @@ def test_columns_runs_on_a_cursor_inside_the_gate(synthetic_dataset, monkeypatch
     engine._con = Con(engine._con)
     assert ("note", "VARCHAR") in engine.columns()
     assert entered == ["slot", "cursor"]
+
+
+# --- cancellation (analyst.cancel)
+
+SLOW_SQL = "select count(*) from range(10_000_000_000) a"
+
+
+
+def _in_run(thread_id: str, fn):
+    """Run ``fn`` with a LangGraph run config, as a tool thread would."""
+    config: RunnableConfig = {"configurable": {"thread_id": thread_id}}
+    return RunnableLambda(lambda _: fn()).invoke(None, config)
+
+
+def test_cancel_interrupts_running_query(synthetic_dataset):
+    engine = Engine(synthetic_dataset, timeout_s=60)
+    outcome: dict = {}
+
+    def query():
+        start = time.monotonic()
+        try:
+            _in_run("t-q", lambda: engine.execute(SLOW_SQL))
+        except QueryError as exc:
+            outcome["error"] = str(exc)
+        outcome["elapsed"] = time.monotonic() - start
+
+    worker = threading.Thread(target=query)
+    worker.start()
+    deadline = time.monotonic() + 10
+    while not cancel._callbacks.get("t-q") and time.monotonic() < deadline:
+        time.sleep(0.01)
+    time.sleep(0.2)  # let the query itself start
+    assert cancel.cancel_thread("t-q") == 1
+    worker.join(timeout=15)
+    assert not worker.is_alive()
+    assert "cancelled" in outcome["error"] and "timeout" not in outcome["error"]
+    assert outcome["elapsed"] < 10
+    assert "t-q" not in cancel._callbacks  # unregistered when the query ended
+    assert engine.execute("select 1")[0][0].as_py() == 1
+
+
+def test_query_registers_only_inside_a_run(synthetic_dataset, monkeypatch):
+    registered: list[str] = []
+    real = cancel.register
+
+    def spy(thread_id, fn):
+        registered.append(thread_id)
+        return real(thread_id, fn)
+
+    monkeypatch.setattr(cancel, "register", spy)
+    engine = Engine(synthetic_dataset)
+    engine.execute("select 1")
+    assert registered == []
+    _in_run("t-r", lambda: engine.execute("select 1"))
+    assert registered == ["t-r"]

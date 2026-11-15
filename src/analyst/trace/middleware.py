@@ -25,6 +25,7 @@ model does not stream, ``first_token_at`` stays ``None``.
 from __future__ import annotations
 
 import asyncio
+import logging
 import operator
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
@@ -48,6 +49,7 @@ from langgraph.prebuilt.tool_node import ToolCallRequest
 from langgraph.runtime import Runtime
 from langgraph.types import Command
 
+from analyst.cancel import cancel_thread, current_thread_id
 from analyst.trace.build import STAMP_KEY, build_trace, model_step, tool_step
 from analyst.trace.model import StepTrace
 
@@ -58,6 +60,12 @@ __all__ = [
     "current_run_id",
     "emit",
 ]
+
+
+logger = logging.getLogger(__name__)
+
+#: the tool whose cancellation also closes the thread's sandbox.
+SANDBOX_TOOL = "run_python"
 
 
 def _now() -> datetime:
@@ -228,6 +236,34 @@ async def atimed_model_call(
     return result, stamped
 
 
+async def _stop_thread_work(tool_name: str) -> None:
+    """A cancelled tool call: stop its thread's in-flight work.
+
+    The awaited sync tool keeps running in its executor thread after the
+    task is cancelled; interrupt its queries (``analyst.cancel``) and, for
+    the sandbox tool, kill the thread's sandbox. Closing a sandbox runs the
+    docker CLI, so it goes off the loop, shielded so a second cancel cannot
+    abandon it half done. Cleanup errors are logged, never raised.
+    """
+    thread_id = current_thread_id()
+    if thread_id is None:
+        return
+    try:
+        cancel_thread(thread_id)
+    except Exception:
+        logger.warning("cancelling the work of a cancelled run failed", exc_info=True)
+    if tool_name != SANDBOX_TOOL:
+        return
+    from analyst.sandbox import close_sandbox
+
+    try:
+        await asyncio.shield(asyncio.to_thread(close_sandbox, thread_id))
+    except asyncio.CancelledError:
+        pass  # the caller re-raises the cancellation either way
+    except Exception:
+        logger.warning("closing the sandbox of a cancelled run failed", exc_info=True)
+
+
 class TraceMiddleware(AgentMiddleware):
     """Wall-clock stamps on model and tool calls, plus live trace events."""
 
@@ -347,6 +383,10 @@ class TraceMiddleware(AgentMiddleware):
         step, started = self._start_tool(request)
         try:
             result = await handler(request)
+        except asyncio.CancelledError as exc:
+            self._failed(step, exc)
+            await _stop_thread_work(step.name)
+            raise  # never swallow the cancellation
         except BaseException as exc:
             self._failed(step, exc)
             raise

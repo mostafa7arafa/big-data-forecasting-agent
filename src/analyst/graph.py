@@ -29,11 +29,13 @@ from langchain_core.messages import (
     AIMessage,
     BaseMessage,
     HumanMessage,
+    RemoveMessage,
     SystemMessage,
     ToolMessage,
 )
 from langchain_core.messages.utils import count_tokens_approximately
 from langgraph.graph import END, START, StateGraph
+from langgraph.graph.message import REMOVE_ALL_MESSAGES
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.runtime import Runtime
 from langgraph.types import Command
@@ -283,6 +285,76 @@ def _run_messages(state: AnalystState) -> list[BaseMessage]:
     return [*run, *(state.get("trace_hidden") or [])]
 
 
+#: the result given to a tool call that a steered or stopped run left unanswered.
+CANCELLED_TOOL_TEXT = "cancelled: the user interrupted this run"
+
+
+def repair_tool_calls(messages: list[BaseMessage]) -> tuple[list[BaseMessage], bool]:
+    """``messages`` with every unanswered tool call given a cancelled result.
+
+    Providers reject a history where an AI tool call has no tool result. Each
+    missing ``ToolMessage`` is inserted after the AI message's existing tool
+    results, so all of its results stay contiguous with it. Returns the list
+    and whether anything was inserted.
+    """
+    answered = {m.tool_call_id for m in messages if isinstance(m, ToolMessage)}
+    out: list[BaseMessage] = []
+    changed = False
+    i = 0
+    while i < len(messages):
+        message = messages[i]
+        out.append(message)
+        i += 1
+        if not isinstance(message, AIMessage) or not message.tool_calls:
+            continue
+        while i < len(messages) and isinstance(messages[i], ToolMessage):
+            out.append(messages[i])
+            i += 1
+        for tc in message.tool_calls:
+            if tc.get("id") and tc["id"] not in answered:
+                out.append(
+                    ToolMessage(
+                        content=CANCELLED_TOOL_TEXT,
+                        status="error",
+                        tool_call_id=tc["id"],
+                        name=tc.get("name"),
+                    )
+                )
+                answered.add(tc["id"])
+                changed = True
+    return out, changed
+
+
+def _turn_starts(messages: Sequence[BaseMessage]) -> list[int]:
+    """Indices of the messages that start a run: real questions and worker notes."""
+    question_like = (_VERIFY_SOURCE, _PLAN_SOURCE)
+    return [
+        i
+        for i, m in enumerate(messages)
+        if isinstance(m, HumanMessage)
+        and not is_compaction_summary(m)
+        and (is_background_notification(m) or _source(m) not in question_like)
+    ]
+
+
+def interrupted_turn(messages: Sequence[BaseMessage]) -> list[BaseMessage] | None:
+    """The previous run's messages when it never answered (steered or stopped).
+
+    The latest run start is this run's input; the run before it ended with
+    the answer node's reply (an AI message with no tool calls) unless it was
+    interrupted. An interrupted run's own steps live inside the analyst node
+    and are lost with it, so the list is often empty (a trace with no steps).
+    """
+    starts = _turn_starts(messages)
+    if len(starts) < 2:
+        return None
+    previous = list(messages[starts[-2] + 1 : starts[-1]])
+    last = previous[-1] if previous else None
+    if isinstance(last, AIMessage) and not last.tool_calls:
+        return None
+    return previous
+
+
 def _trace_inputs(runtime: Runtime[AnalystContext], state: AnalystState) -> tuple[str, int]:
     """Model spec and compaction trigger for the trace; warms the catalogue.
 
@@ -384,11 +456,28 @@ def build_graph(
     ) -> dict | None:
         # A turn-start node (not agent middleware): the update lands in the
         # thread state, so the thread itself shrinks and later turns reuse it.
-        messages = list(state["messages"])
+        # A steered or stopped run first: repair its dangling tool calls and
+        # record its trace; compaction then works on the repaired list.
+        messages, repaired = repair_tool_calls(list(state["messages"]))
+        base: dict[str, Any] = {}
+        if repaired:
+            base["messages"] = [RemoveMessage(id=REMOVE_ALL_MESSAGES), *messages]
+        interrupted = interrupted_turn(messages)
+        if interrupted is not None:
+            spec, trigger = await asyncio.to_thread(_trace_inputs, runtime, state)
+            record = build_trace(
+                interrupted,
+                model=spec,
+                run_id=None,  # the interrupted run's id is not in the thread
+                verification=None,
+                events=[],
+                compaction_trigger=trigger,
+            ).model_copy(update={"interrupted": True})
+            base["trace"] = [record.model_dump(mode="json")]
         settings = await asyncio.to_thread(get_settings)
         # Each turn starts its hidden trace messages here (compact runs first).
         if count_tokens_approximately(messages) <= settings.compaction_trigger_tokens:
-            return {"compacted": False, "trace_hidden": []}
+            return {**base, "compacted": False, "trace_hidden": []}
         question = _question(messages)
         protect = (
             next(i for i, m in enumerate(messages) if m is question)
@@ -402,7 +491,7 @@ def build_graph(
             protect,
         )
         if cut <= 0:  # nothing to drop: no digest call, no trace step
-            return {"compacted": False, "trace_hidden": []}
+            return {**base, "compacted": False, "trace_hidden": []}
         ctx = await asyncio.to_thread(_context, runtime, None)
         chat = await asyncio.to_thread(resolve_model, ctx.model)
         raw: list[AIMessage] = []
@@ -421,8 +510,9 @@ def build_graph(
         hidden = [stamped] if stamped is not None else []
         # The run trace reports a compaction only for the run that did it.
         if update is None:
-            return {"compacted": False, "trace_hidden": hidden}
-        return {**update, "compacted": True, "trace_hidden": hidden}
+            return {**base, "compacted": False, "trace_hidden": hidden}
+        # Compaction rebuilt the repaired list: its own REMOVE_ALL replaces ours.
+        return {**base, **update, "compacted": True, "trace_hidden": hidden}
 
     async def analyst(state: AnalystState, runtime: Runtime[AnalystContext]) -> dict:
         ctx = await asyncio.to_thread(_context, runtime, state.get("wake_context"))
