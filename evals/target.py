@@ -16,12 +16,13 @@ from collections import Counter, defaultdict
 from collections.abc import Callable
 from datetime import date, datetime
 from typing import Any
-from uuid import NAMESPACE_URL, UUID, uuid5
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from analyst.context import AnalystContext
 from analyst.data import registry
+from analyst.sandbox import close_sandbox
 from analyst.verify.trace import collect_handles
 from evals.graders.agent import GATES, GRADERS, LABELS, passed
 
@@ -97,6 +98,9 @@ async def run_case(inputs: dict, *, model: str | None, graph=None) -> dict:
 
         graph = default_graph
     started = time.perf_counter()
+    # One thread (and so one Python kernel) per row: rows never share sandbox state.
+    thread_id = f"eval-{inputs['id']}-{uuid4().hex[:8]}"
+    config = {"configurable": {"thread_id": thread_id}}
     try:
         context = AnalystContext.from_settings(
             cutoff=inputs.get("cutoff"),
@@ -105,7 +109,7 @@ async def run_case(inputs: dict, *, model: str | None, graph=None) -> dict:
             question_id=inputs["id"],
         )
         state = await graph.ainvoke(
-            {"messages": [HumanMessage(inputs["question"])]}, context=context
+            {"messages": [HumanMessage(inputs["question"])]}, context=context, config=config
         )
         messages = list(state.get("messages") or [])
         store = registry.get_service(context.dataset, context.cutoff).store
@@ -125,6 +129,8 @@ async def run_case(inputs: dict, *, model: str | None, graph=None) -> dict:
         }
     except Exception as exc:  # noqa: BLE001 - every failure is a failed case
         return {"error": repr(exc)}
+    finally:
+        await asyncio.to_thread(close_sandbox, thread_id)
 
 
 # --- LangSmith dataset sync ------------------------------------------------------

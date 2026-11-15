@@ -20,6 +20,7 @@ dependencies = [
     "pyarrow>=26.0.1",
     "pydantic>=2.14.3",
     "pydantic-settings>=2.16.2",
+    "python-dotenv>=1.2.4",
     "pyyaml>=6.0.3",
     "statsforecast>=2.0.1",
     "utilsforecast>=0.2.17",
@@ -45,5 +46,6 @@ filterwarnings = [
 markers = [
     "taxi: tests that require data/raw NYC taxi files",
     "slow: long-running tests",
+    "docker: needs a Docker daemon and the analyst-sandbox image (make sandbox-image)",
     "live: needs API keys and starts langgraph dev (uv run pytest -m live tests/live)",
 ]

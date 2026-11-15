@@ -61,6 +61,7 @@ def test_tool_names():
     assert [t.name for t in DATA_TOOLS] == [
         "query_metrics",
         "run_sql",
+        "run_python",
         "describe",
         "forecast",
         "make_chart",

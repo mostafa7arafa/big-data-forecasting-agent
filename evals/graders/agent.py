@@ -51,7 +51,7 @@ DATASET_DIR = ROOT / "datasets/nyc_taxi"
 SERIES_FILE = DATASET_DIR / "memory/series.yaml"
 SEMANTIC_FILE = DATASET_DIR / "memory/semantic.yaml"
 
-CATEGORIES = ("lookup", "comparison", "forecast", "off_model", "trap", "safe")
+CATEGORIES = ("lookup", "comparison", "forecast", "off_model", "python", "trap", "safe")
 LABELS = ("verified", "verified_off_model", "not_verified")
 GATES = ("answer_values", "label", "grounding", "checks")
 UNITS = ("value", "percent", "ratio")

@@ -289,3 +289,46 @@ def test_dry_run_repeats_reps_times(monkeypatch, capsys):
     calls.clear()
     script.main(["--dry-run", "--reps", "2"])
     assert len(calls) == 2
+
+
+def test_run_case_uses_a_fresh_thread_per_row_and_closes_its_sandbox(monkeypatch):
+    from evals import target
+
+    seen, closed = [], []
+
+    class Capture:
+        async def ainvoke(self, state, *, context=None, config=None):
+            seen.append(config["configurable"]["thread_id"])
+            raise RuntimeError("stop")
+
+    monkeypatch.setattr(target, "close_sandbox", closed.append)
+    asyncio.run(run_case(ROW, model=None, graph=Capture()))
+    asyncio.run(run_case(ROW, model=None, graph=Capture()))
+    assert len(set(seen)) == 2 and all(t.startswith("eval-x001-") for t in seen)
+    assert closed == seen
+
+
+def test_run_case_thread_id_reaches_run_python_sandbox(monkeypatch):
+    from analyst.sandbox.base import ExecResult
+    from evals import target
+
+    rp = __import__("analyst.tools.run_python", fromlist=["x"])
+    got, closed = [], []
+
+    class Box:
+        def run(self, code):
+            return ExecResult(True, "1\n", None)
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(rp, "get_sandbox", lambda t, d, c: (got.append(t), Box())[1])
+    monkeypatch.setattr(target, "close_sandbox", closed.append)
+    from langchain_core.messages import AIMessage
+
+    graph = scripted_graph(
+        no_plan(), tool_turn(call("run_python", {"code": "print(1)"}, "p1")),
+        AIMessage("Nothing to compute."),
+    )
+    asyncio.run(run_case(ROW, model=None, graph=graph))
+    assert got and got[0].startswith("eval-x001-") and closed == [got[0]]

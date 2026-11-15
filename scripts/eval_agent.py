@@ -11,6 +11,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from dotenv import load_dotenv
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "src"))
@@ -148,6 +150,9 @@ async def run_experiment(rows: list[dict], args: argparse.Namespace) -> None:
 
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
+    # The LangSmith and OpenAI clients read the process environment, not
+    # Settings; load the repo's .env (never overriding variables already set).
+    load_dotenv(ROOT / ".env", override=False)
     rows = select(load_rows(DATASET_FILE), args.ids, args.limit)
     if args.dry_run:
         run_dry(rows, args.model, reps=args.reps)

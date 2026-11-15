@@ -78,6 +78,12 @@ _DESCRIBE_TARGETS = (
 )
 
 
+def segment_root(dataset_name: str, cutoff: date | None) -> Path:
+    """Result-store directory for one (dataset, cutoff) segment."""
+    segment = cutoff.isoformat() if cutoff is not None else "full"
+    return get_settings().artifacts_dir / dataset_name / segment
+
+
 class DataService:
     def __init__(
         self,
@@ -86,10 +92,8 @@ class DataService:
         cutoff: date | None = None,
         store_root: Path | None = None,
     ) -> None:
-        settings = get_settings()
         if store_root is None:
-            segment = cutoff.isoformat() if cutoff is not None else "full"
-            store_root = settings.artifacts_dir / dataset.name / segment
+            store_root = segment_root(dataset.name, cutoff)
         self.engine = Engine(dataset, cutoff=cutoff)
         self.store = ResultStore(store_root)
         self.memory: Memory = load_memory(dataset)
